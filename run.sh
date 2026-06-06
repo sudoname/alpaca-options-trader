@@ -6,30 +6,37 @@
 # PID file, and tees their output to ./logs. This is a thin supervisor: it
 # does NOT change what the bot trades. Scope stays shadow + paper.
 #
-# Two daemons are managed:
-#   1. telegram_bot.py            — interactive control plane. This process
-#                                   OWNS the RL advisor, the shadow recorder,
+# Daemon managed by default:
+#   1. telegram_bot.py            — interactive control plane. This is the
+#                                   working Alpaca-paper auto-trade surface and
+#                                   it OWNS the RL advisor, the shadow recorder,
 #                                   and the risk engine (all env-driven), so
 #                                   "RL" is not a separate process to start.
-#   2. <SCHEDULER>.py             — the auto-trade daily scheduler
-#                                   (default run_spy_qqq_hybrid_daily.py).
+#
+# Legacy (opt-in, OFF by default):
+#   run_spy_*_daily.py            — the old daily strategy schedulers. These
+#                                   import the dead Schwab OAuth stack
+#                                   (`from schwab import auth`) and trade via
+#                                   Schwab, NOT Alpaca. They need schwab-py +
+#                                   live schwab_tokens.json to even import.
+#                                   Enable explicitly with ENABLE_SCHEDULER=1.
 #
 # The screener (stock_screener.py) is NOT a daemon; run it on demand with
 # `./run.sh screen`. It is standalone and is not auto-wired into live trades.
 #
 # Usage:
-#   ./run.sh start            # start both daemons (default if no arg)
-#   ./run.sh stop             # stop both daemons
+#   ./run.sh start            # start the Telegram bot (default if no arg)
+#   ./run.sh stop             # stop managed daemons
 #   ./run.sh restart          # stop then start
-#   ./run.sh status           # show PID / running state / last log lines
+#   ./run.sh status           # show PID / running state
 #   ./run.sh screen           # run the screener once (writes tickers file)
 #
 # Env overrides:
 #   PYTHON=python3            # interpreter (a ./venv or ./.venv is preferred)
 #   VENV=venv                 # explicit virtualenv dir
-#   SCHEDULER=run_spy_1dte_daily.py   # swap the auto-trade scheduler
-#   NO_SCHEDULER=1            # start only the Telegram bot
-#   NO_BOT=1                  # start only the scheduler
+#   NO_BOT=1                  # do not start the Telegram bot
+#   ENABLE_SCHEDULER=1        # also start the legacy (Schwab) daily scheduler
+#   SCHEDULER=run_spy_1dte_daily.py   # which legacy scheduler to start
 #
 set -euo pipefail
 
@@ -156,7 +163,10 @@ cmd_start() {
     if [ "${NO_BOT:-0}" != "1" ]; then
         start_one "$BOT_NAME" "telegram_bot.py"
     fi
-    if [ "${NO_SCHEDULER:-0}" != "1" ]; then
+    # Legacy Schwab scheduler is OFF unless explicitly enabled.
+    if [ "${ENABLE_SCHEDULER:-0}" = "1" ]; then
+        echo "==> ENABLE_SCHEDULER=1: starting legacy scheduler ($SCHEDULER)"
+        echo "    NOTE: this is the dead Schwab path; needs schwab-py + tokens."
         start_one "$SCHED_NAME" "$SCHEDULER"
     fi
     echo "==> Done. Use './run.sh status' to check, './run.sh stop' to stop."
@@ -170,7 +180,9 @@ cmd_stop() {
 cmd_status() {
     echo "==> Services:"
     status_one "$BOT_NAME"
-    status_one "$SCHED_NAME"
+    if [ "${ENABLE_SCHEDULER:-0}" = "1" ] || is_running "$SCHED_NAME"; then
+        status_one "$SCHED_NAME"
+    fi
     echo "==> Logs in: $LOG_DIR"
 }
 
