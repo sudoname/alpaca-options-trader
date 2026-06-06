@@ -247,7 +247,7 @@ class TelegramTradingBot:
             return 'CALL'
 
     def analyze_ticker(self, ticker, chat_id):
-        """Analyze ticker and show comprehensive option details - Uses Schwab for options data"""
+        """Analyze ticker and show comprehensive option details - Uses Alpaca for options data"""
         try:
             # Get comprehensive market data from Alpaca
             market_data = self.get_comprehensive_market_data(ticker)
@@ -260,26 +260,24 @@ class TelegramTradingBot:
             recommended_type = self.determine_option_type(market_data)
             print(f"[ANALYSIS] Market Analysis for {ticker}: Recommending {recommended_type} options")
 
-            # Use Schwab for options data (primary source)
-            from schwab_trader import SchwabOptionsTrader
-            schwab_trader = SchwabOptionsTrader(dry_run=False)
+            # Use Alpaca for options data (primary source). The same trader is
+            # reused for the market-hours check and later for execution.
+            from smart_trader import SmartOptionsTrader
+            alpaca_trader = SmartOptionsTrader(ticker=ticker)
 
-            print(f"[TELEGRAM] Fetching {recommended_type} option contracts from Schwab for {ticker}")
-            best_option = schwab_trader.find_best_trade(
-                tickers=[ticker],
-                option_type=recommended_type,
-                budget=schwab_trader.max_budget,
-                min_days=schwab_trader.min_days,
-                max_days=schwab_trader.max_days,
-                min_delta=schwab_trader.min_delta,
-                max_delta=schwab_trader.max_delta,
-                max_iv=schwab_trader.max_iv
+            print(f"[TELEGRAM] Fetching {recommended_type} option contracts from Alpaca for {ticker}")
+            contracts = alpaca_trader.get_option_contracts(ticker)
+            if not contracts:
+                return f"❌ No option contracts found for {ticker}"
+
+            best_option = alpaca_trader.select_best_option(
+                contracts, current_price, strategy=recommended_type.lower()
             )
 
             if not best_option:
                 return f"❌ No suitable options found for {ticker}"
 
-            print(f"[TELEGRAM] Best option from Schwab: {best_option['symbol']} - Score: {best_option['score']:.1f}")
+            print(f"[TELEGRAM] Best option from Alpaca: {best_option['symbol']} - Score: {best_option['score']:.1f}")
 
             # Enhanced option pricing and Greeks
             option_metrics = self.calculate_enhanced_option_metrics(best_option, current_price, market_data)
@@ -287,9 +285,7 @@ class TelegramTradingBot:
             if not option_metrics:
                 return f"❌ Error calculating option metrics for {ticker}"
 
-            # Check market status - use Alpaca for market hours check
-            from smart_trader import SmartOptionsTrader
-            alpaca_trader = SmartOptionsTrader(ticker=ticker)
+            # Market-hours check (reuse the Alpaca trader)
             market = alpaca_trader.get_market_status()
             market_status = "🟢 OPEN" if market.get('is_open') else "🔴 CLOSED"
 
@@ -355,7 +351,7 @@ Based on: {market_data['trend']} trend, {market_data['market_sentiment']} sentim
 
 💡 **Recommendation:** {option_metrics['recommendation']}
 
-💼 *Execution:* Alpaca paper (no real money) · Schwab used for analysis only
+💼 *Execution:* Alpaca paper (no real money) · Alpaca options data for analysis
 
 Reply:
 • `YES {ticker}` - {('Execute when market opens' if not market.get('is_open') else 'Execute on Alpaca paper')}

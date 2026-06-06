@@ -457,10 +457,18 @@ class SmartOptionsTrader:
 
         return strategy
 
-    def select_best_option(self, contracts, current_price):
-        """Select best option using enhanced ML scoring with call/put intelligence"""
+    def select_best_option(self, contracts, current_price, strategy=None):
+        """Select best option using enhanced ML scoring with call/put intelligence.
+
+        Args:
+            strategy: force 'call' or 'put'. If None, auto-detect via
+                determine_option_strategy() (preserves existing behavior).
+        """
         # Determine optimal strategy (call or put)
-        strategy = self.determine_option_strategy()
+        if strategy:
+            strategy = strategy.lower()
+        else:
+            strategy = self.determine_option_strategy()
 
         print(f"[STRATEGY] Selected strategy: {strategy.upper()}")
         print(f"[CONTRACTS] Analyzing {len(contracts)} contracts")
