@@ -49,6 +49,9 @@ DEFAULT_MOVED_DAYS = 5
 ALLOWED_EXCHANGES = {'NYSE', 'NASDAQ'}
 
 VALID_STRATEGIES = ('moved', 'lowtomarket', 'lowtohigh')
+# Optional EV-aware ranking. Off by default; when selected it enriches each
+# pick with a point-in-time regime label and an `ev_score`, and ranks by it.
+VALID_SCORES = ('ev',)
 
 
 class StockScreener:
@@ -204,9 +207,46 @@ class StockScreener:
     # ------------------------------------------------------------------ #
     # Screening
     # ------------------------------------------------------------------ #
-    def _evaluate(self, symbol: str, name: str) -> Optional[Dict]:
-        """Compute ranking metrics for one candidate, or None to skip."""
-        bars = self.get_daily_bars(symbol, self.moved_days)
+    def _bars_as_dicts(self, symbol: str, market_view=None) -> List[Dict]:
+        """Source OHLCV bars either from Alpaca (live) or a MarketView (tests).
+
+        When `market_view` is provided, bars come from its point-in-time
+        `daily_bars` (no network, deterministic) and are normalized to the same
+        dict shape the live path returns.
+        """
+        if market_view is not None:
+            out = []
+            for b in market_view.daily_bars(symbol, self.moved_days):
+                out.append({'o': b.o, 'h': b.h, 'l': b.l, 'c': b.c, 'v': b.v})
+            return out
+        return self.get_daily_bars(symbol, self.moved_days)
+
+    @staticmethod
+    def _ev_score(info: Dict, regime_label: Dict) -> float:
+        """Heuristic EV-aware ranking score (reports/ranking only).
+
+        Rewards an upward open->close move confirmed by an up trend in a
+        non-volatile regime, scaled by where price sits in its recent range.
+        This is a transparent ranking heuristic; it never sizes or places a
+        trade and is only used when `--score ev` is explicitly chosen.
+        """
+        moved = info['moved']
+        rng = info['change_low_to_high'] or 1e-9
+        pos_in_range = max(0.0, min(1.0, info['change_low_to_market'] / rng))
+        regime_mult = {'trending': 1.25, 'ranging': 1.0, 'volatile': 0.6}.get(
+            regime_label.get('regime'), 1.0)
+        trend = regime_label.get('trend')
+        trend_mult = 1.15 if trend == 'up' else (0.85 if trend == 'down' else 1.0)
+        return round(moved * regime_mult * trend_mult * (0.5 + 0.5 * pos_in_range), 3)
+
+    def _evaluate(self, symbol: str, name: str,
+                  score: Optional[str] = None, market_view=None) -> Optional[Dict]:
+        """Compute ranking metrics for one candidate, or None to skip.
+
+        With `score='ev'` the result is enriched with a point-in-time `regime`
+        label and an `ev_score`; otherwise the output is unchanged.
+        """
+        bars = self._bars_as_dicts(symbol, market_view)
         if len(bars) < 2:
             return None
 
@@ -224,7 +264,8 @@ class StockScreener:
             return None
 
         # Exchange filter (NYSE / Nasdaq only), matching stockbot's NYQ/NMS rule.
-        exchange = self.get_exchange(symbol)
+        # Skipped in MarketView (offline/test) mode where there is no asset API.
+        exchange = None if market_view is not None else self.get_exchange(symbol)
         if exchange is not None and exchange not in ALLOWED_EXCHANGES:
             return None
 
@@ -236,7 +277,7 @@ class StockScreener:
         change_low_to_market = round(market_price - period_low, 3)
         change_low_to_high = round(period_high - period_low, 3)
 
-        return {
+        info = {
             'symbol': symbol,
             'company': name,
             'market_price': round(market_price, 2),
@@ -249,40 +290,80 @@ class StockScreener:
             'exchange': exchange,
         }
 
+        if score == 'ev':
+            from datetime import datetime, time as _time
+            from regime import detect_regime
+            from market_view import HistoricalMarketView, make_bar
+            mv = market_view
+            if mv is None:
+                # Build a point-in-time view from the fetched bars (as_of = last
+                # known session close) so the regime label cannot peek ahead.
+                today = datetime.now().date()
+                mv_bars = []
+                for i, b in enumerate(bars):
+                    d = (today - timedelta(days=len(bars) - 1 - i)).strftime('%Y-%m-%d')
+                    mv_bars.append(make_bar(d, b['o'], b['h'], b['l'], b['c'],
+                                            b.get('v', 0)))
+                as_of = datetime.combine(today, _time(16, 0))
+                mv = HistoricalMarketView(as_of, daily={symbol: mv_bars})
+            regime_label = detect_regime(mv, symbol, vol_lookback=self.moved_days)
+            info['regime'] = regime_label['regime']
+            info['trend'] = regime_label['trend']
+            info['realized_vol'] = regime_label['realized_vol']
+            info['ev_score'] = self._ev_score(info, regime_label)
+
+        return info
+
     def screen(self, strategy: Optional[str] = None,
-               limit: Optional[int] = None) -> List[Dict]:
+               limit: Optional[int] = None,
+               score: Optional[str] = None,
+               universe: Optional[List[Dict]] = None) -> List[Dict]:
         """Run the full screen and return ranked picks.
 
         Args:
             strategy: 'moved' | 'lowtomarket' | 'lowtohigh' (defaults to .env).
             limit: max picks to return (defaults to MAX_NUM_STOCKS).
+            score: optional 'ev' to enrich picks with regime + ev_score and rank
+                by ev_score instead of the base strategy. Default (None) leaves
+                rankings byte-identical to the original behavior.
+            universe: optional pre-supplied candidate list (used by tests to
+                avoid the Nasdaq network call).
         """
         strategy = (strategy or self.default_strategy).lower()
         if strategy not in VALID_STRATEGIES:
             raise ValueError(
                 f"Unknown strategy '{strategy}'. Choose from {VALID_STRATEGIES}."
             )
+        if score is not None and score not in VALID_SCORES:
+            raise ValueError(
+                f"Unknown score '{score}'. Choose from {VALID_SCORES}."
+            )
         limit = limit or self.max_num_stocks
 
-        universe = self.get_nasdaq_buystocks()
+        if universe is None:
+            universe = self.get_nasdaq_buystocks()
         if not universe:
             print("[SCREENER] No candidates returned from Nasdaq screener.")
             return []
 
+        rank_label = score or strategy
         print(f"[SCREENER] Evaluating {len(universe)} Buy/Strong-Buy candidates "
-              f"(strategy={strategy}, price ${self.min_price:.0f}-${self.max_price:.0f})...")
+              f"(rank={rank_label}, price ${self.min_price:.0f}-${self.max_price:.0f})...")
 
         evaluated = []
         for stock in universe:
-            info = self._evaluate(stock['symbol'], stock['name'])
+            info = self._evaluate(stock['symbol'], stock['name'], score=score)
             if info:
                 evaluated.append(info)
 
-        sort_key = {
-            'moved': 'moved',
-            'lowtomarket': 'change_low_to_market',
-            'lowtohigh': 'change_low_to_high',
-        }[strategy]
+        if score == 'ev':
+            sort_key = 'ev_score'
+        else:
+            sort_key = {
+                'moved': 'moved',
+                'lowtomarket': 'change_low_to_market',
+                'lowtohigh': 'change_low_to_high',
+            }[strategy]
         ranked = sorted(evaluated, key=lambda i: i[sort_key], reverse=True)
 
         print(f"[SCREENER] {len(ranked)} passed filters; returning top {limit}.")
@@ -316,16 +397,79 @@ def screen_tickers(strategy: Optional[str] = None,
 def _format_table(picks: List[Dict]) -> str:
     if not picks:
         return "No stocks passed the screen."
+    has_ev = 'ev_score' in picks[0]
     header = (f"{'#':>2}  {'SYMBOL':<8}{'PRICE':>9}{'MOVED%':>9}"
-              f"{'LOW>MKT':>9}{'LOW>HIGH':>10}  EXCH")
+              f"{'LOW>MKT':>9}{'LOW>HIGH':>10}")
+    if has_ev:
+        header += f"{'REGIME':>10}{'TREND':>6}{'EV':>9}"
+    header += "  EXCH"
     lines = [header, '-' * len(header)]
     for i, p in enumerate(picks, 1):
-        lines.append(
+        row = (
             f"{i:>2}  {p['symbol']:<8}{p['market_price']:>9.2f}{p['moved']:>9.2f}"
             f"{p['change_low_to_market']:>9.2f}{p['change_low_to_high']:>10.2f}"
-            f"  {p['exchange'] or '?'}"
         )
+        if has_ev:
+            row += f"{p['regime']:>10}{p['trend']:>6}{p['ev_score']:>9.2f}"
+        row += f"  {p['exchange'] or '?'}"
+        lines.append(row)
     return '\n'.join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# Self-test (no creds, no network)
+# --------------------------------------------------------------------------- #
+def _self_test() -> int:
+    from datetime import datetime as _dt
+    from market_view import HistoricalMarketView, make_bar
+
+    ok = True
+    sc = StockScreener()
+    sc.min_price, sc.max_price = 1.0, 10_000.0  # don't price-filter the fixtures
+    sc.moved_days = 5
+
+    # Fixture: a steady riser (UP) and a choppy/volatile name (CHOP).
+    up_bars = [make_bar(f"2026-01-{i+1:02d}", 100 + i, 100.6 + i, 99.5 + i, 100.6 + i)
+               for i in range(6)]
+    chop_bars = []
+    base = 100.0
+    for i in range(6):
+        c = base * (1.08 if i % 2 == 0 else 0.93)
+        chop_bars.append(make_bar(f"2026-01-{i+1:02d}", base, max(base, c), min(base, c), c))
+        base = c
+    mv_up = HistoricalMarketView(_dt(2026, 1, 6, 16, 0), daily={"UP": up_bars})
+    mv_chop = HistoricalMarketView(_dt(2026, 1, 6, 16, 0), daily={"CHOP": chop_bars})
+
+    # Default (no score) output keeps the original keys exactly — no ev fields.
+    base_info = sc._evaluate("UP", "Up Co", market_view=mv_up)
+    expected_keys = {'symbol', 'company', 'market_price', 'low', 'high', 'volume',
+                     'moved', 'change_low_to_market', 'change_low_to_high', 'exchange'}
+    if base_info is None or set(base_info.keys()) != expected_keys:
+        print("FAIL: default _evaluate keys changed", base_info); ok = False
+
+    # EV scoring enriches with regime/trend/ev_score.
+    ev_up = sc._evaluate("UP", "Up Co", score="ev", market_view=mv_up)
+    for k in ("regime", "trend", "ev_score"):
+        if k not in ev_up:
+            print(f"FAIL: ev score missing '{k}'", ev_up); ok = False
+    if ev_up and ev_up["trend"] != "up":
+        print("FAIL: steady riser should be trend=up", ev_up); ok = False
+
+    ev_chop = sc._evaluate("CHOP", "Chop Co", score="ev", market_view=mv_chop)
+    if ev_chop and ev_chop["regime"] != "volatile":
+        print("FAIL: choppy name should be volatile", ev_chop); ok = False
+
+    # A clean up-trend should out-score a volatile chop with similar gross move.
+    if ev_up and ev_chop and not (ev_up["ev_score"] > ev_chop["ev_score"]):
+        print("FAIL: trending name should out-score volatile",
+              ev_up["ev_score"], ev_chop["ev_score"]); ok = False
+
+    # Point-in-time: bars sourced through the MarketView never exceed as_of.
+    if any(rec["ts"] > mv_up.as_of for rec in mv_up.audit):
+        print("FAIL: screener read a bar stamped after as_of"); ok = False
+
+    print("stock_screener self-test:", "PASS" if ok else "FAIL")
+    return 0 if ok else 1
 
 
 def main():
@@ -337,18 +481,26 @@ def main():
                         help="ranking strategy (default from .env SCREEN_STRATEGY or 'moved')")
     parser.add_argument('-n', '--limit', type=int, default=None,
                         help="max number of picks (default from .env MAX_NUM_STOCKS)")
+    parser.add_argument('--score', default=None, choices=VALID_SCORES,
+                        help="optional EV-aware scoring; enriches picks with regime + ev_score "
+                             "and ranks by it (default off -> rankings unchanged)")
     parser.add_argument('--write-tickers', action='store_true',
                         help="write the picks into supported_tickers.json (used by the Telegram bot)")
     parser.add_argument('--json', action='store_true',
                         help="output full pick details as JSON")
+    parser.add_argument('--selftest', action='store_true',
+                        help="run the no-creds self-test and exit")
     args = parser.parse_args()
+
+    if args.selftest:
+        sys.exit(_self_test())
 
     screener = StockScreener()
     if not screener.api_key or not screener.secret_key:
         print("ERROR: ALPACA_API_KEY / ALPACA_SECRET_KEY missing from .env")
         sys.exit(1)
 
-    picks = screener.screen(strategy=args.strategy, limit=args.limit)
+    picks = screener.screen(strategy=args.strategy, limit=args.limit, score=args.score)
 
     if args.json:
         print(json.dumps(picks, indent=2))

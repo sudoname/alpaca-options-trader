@@ -132,10 +132,8 @@ def build_experiences() -> Dict:
     }
 
 
-def replay(agent: QLearningAgent, epochs: int = 1) -> Dict:
-    data = build_experiences()
-    experiences = data["experiences"]
-
+def replay_experiences(agent: QLearningAgent, experiences: List[Dict], epochs: int = 1) -> int:
+    """Train the agent over a list of experiences. Returns total updates applied."""
     for _ in range(max(1, epochs)):
         for i, exp in enumerate(experiences):
             # Bootstrap from the next experience of the same strategy (weak
@@ -163,7 +161,30 @@ def replay(agent: QLearningAgent, epochs: int = 1) -> Dict:
             )
 
     agent.save()
-    data["trained"] = len(experiences) * max(1, epochs)
+    return len(experiences) * max(1, epochs)
+
+
+def build_episode_experiences(db_path: str = "episodes.db") -> Dict:
+    """Load experiences from the SQLite episode store (net-of-cost P/L)."""
+    from episode_store import EpisodeStore
+
+    store = EpisodeStore(db_path)
+    try:
+        experiences = store.to_rl_experiences()
+    finally:
+        store.close()
+    return {
+        "experiences": experiences,
+        "total": len(experiences),
+        "skipped_no_outcome": 0,
+        "skipped_no_analysis": 0,
+    }
+
+
+def replay(agent: QLearningAgent, epochs: int = 1, source: str = "logs",
+           db_path: str = "episodes.db") -> Dict:
+    data = build_episode_experiences(db_path) if source == "episodes" else build_experiences()
+    data["trained"] = replay_experiences(agent, data["experiences"], epochs)
     return data
 
 
@@ -199,6 +220,13 @@ def main() -> int:
     parser.add_argument(
         "--qtable", default="rl_qtable.json", help="Q-table file path"
     )
+    parser.add_argument(
+        "--source", choices=["logs", "episodes"], default="logs",
+        help="training source: JSON trade logs (default) or the SQLite episode store",
+    )
+    parser.add_argument(
+        "--db", default="episodes.db", help="episode store path (when --source episodes)"
+    )
     args = parser.parse_args()
 
     if not (args.replay or args.report or args.reset):
@@ -212,8 +240,8 @@ def main() -> int:
         print(f"[RESET] Q-table cleared: {args.qtable}")
 
     if args.replay:
-        print(f"[REPLAY] Training (epochs={args.epochs})...")
-        data = replay(agent, epochs=args.epochs)
+        print(f"[REPLAY] Training (epochs={args.epochs}, source={args.source})...")
+        data = replay(agent, epochs=args.epochs, source=args.source, db_path=args.db)
         print(f"[REPLAY] Trade records scanned : {data['total']}")
         print(f"[REPLAY] Usable experiences    : {len(data['experiences'])}")
         print(f"[REPLAY] Skipped (no outcome)  : {data['skipped_no_outcome']}")

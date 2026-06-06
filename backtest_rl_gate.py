@@ -37,10 +37,15 @@ import requests
 from rl_agent import QLearningAgent
 from rl_wrapper import RLAdvisor, _gate_config
 from rl_env import extract_features, state_key, compute_reward
+from features import compute_features
+from market_view import HistoricalMarketView, make_bar
+from cost_model import CostModel, load_cost_config_from_env
 
 MIN_CONFIDENCE = 70.0          # rule confidence floor (matches enhanced backtest)
 PROFIT_TARGET_PCT = 20.0
 ANNUALIZER = math.sqrt(252.0)  # daily -> annualized vol
+SPREAD_FRAC = 0.06             # synthesized bid/ask spread as a fraction of premium
+HOLD_DAYS = 1                  # decide at close of T, exit on T+1
 
 
 # --------------------------------------------------------------------------- #
@@ -186,24 +191,22 @@ def build_vix_series(bars, source):
 # --------------------------------------------------------------------------- #
 # Strategy logic (Schwab-free reimplementation of the enhanced 1DTE rules)
 # --------------------------------------------------------------------------- #
-def analyze_day(bar, prev_bar, vix_level, vix_prev):
-    """Replicate analyze_market_direction_enhanced with REAL vix_change and
-    intraday_position. Returns an `analysis` dict consumable by the RL layer."""
-    current_open = bar["o"]
-    prev_close = prev_bar["c"]
+def analyze_features(raw):
+    """Rule scoring on the shared NO-LOOKAHEAD feature block (replaces the old
+    analyze_day).
 
-    # First-30-min proxy (same as enhanced backtest).
-    if bar["c"] >= current_open:
-        first_30min_move = (bar["h"] - current_open) / current_open * 100
-    else:
-        first_30min_move = (bar["l"] - current_open) / current_open * 100
-
-    gap = ((current_open - prev_close) / prev_close) * 100 if prev_close else 0.0
-    vix_change = ((vix_level - vix_prev) / vix_prev) * 100 if vix_prev else 0.0
-
-    rng = bar["h"] - bar["l"]
-    intraday_position = (bar["c"] - bar["l"]) / rng if rng > 0 else 0.5
-    spy_change = ((bar["c"] - current_open) / current_open) * 100 if current_open else 0.0
+    The momentum signal is `spy_change` (the COMPLETED day's close-vs-open move,
+    legitimately known at that session's close) instead of the old
+    `first_30min_move`, which read the day's high/low and was therefore
+    lookahead. The decision is made at the close of day T; the trade outcome
+    belongs to the next session T+1. `raw` is the `compute_features(...)["raw"]`
+    block, so backtest and live share one feature path (train-serve skew = 0).
+    """
+    spy_change = raw.get("spy_change", 0.0)
+    gap = raw.get("gap", 0.0)
+    vix_level = raw.get("vix_level", 15.0)
+    vix_change = raw.get("vix_change", 0.0)
+    intraday_position = raw.get("intraday_position", 0.5)
 
     bullish = 0
     bearish = 0
@@ -214,14 +217,14 @@ def analyze_day(bar, prev_bar, vix_level, vix_prev):
     if abs(gap) > 1.0:
         skip_reasons.append(f"Large gap ({gap:+.2f}%)")
 
-    # Signal 1: intraday momentum
-    if first_30min_move > 0.3:
+    # Signal 1: completed-day momentum (no lookahead)
+    if spy_change > 0.3:
         bullish += 2
-    elif first_30min_move > 0.1:
+    elif spy_change > 0.1:
         bullish += 1
-    elif first_30min_move < -0.3:
+    elif spy_change < -0.3:
         bearish += 2
-    elif first_30min_move < -0.1:
+    elif spy_change < -0.1:
         bearish += 1
 
     # Signal 2: VIX level
@@ -236,7 +239,7 @@ def analyze_day(bar, prev_bar, vix_level, vix_prev):
     elif -1.0 < gap < -0.3:
         bearish += 1
 
-    # Signal 4: VIX direction (now REAL, not random)
+    # Signal 4: VIX direction (REAL, not random)
     if vix_change < -5:
         bullish += 1
     elif vix_change > 5:
@@ -250,7 +253,7 @@ def analyze_day(bar, prev_bar, vix_level, vix_prev):
     elif bearish > bullish:
         direction, confidence = "PUT", (bearish / total) * 100
     else:
-        direction = "CALL" if first_30min_move >= 0 else "PUT"
+        direction = "CALL" if spy_change >= 0 else "PUT"
         confidence = 50.0
 
     should_trade = not skip_reasons and confidence >= MIN_CONFIDENCE
@@ -270,7 +273,11 @@ def analyze_day(bar, prev_bar, vix_level, vix_prev):
 
 def simulate_trade(direction, bar, rng):
     """Seeded reimplementation of simulate_option_trade_enhanced.
-    Returns realized profit_pct for a 1DTE option intraday trade."""
+
+    Returns (gross_profit_pct, entry_premium). The gross figure is the option's
+    premium move before costs; the entry premium is returned so the shared cost
+    model can convert it to a NET number against a synthesized bid/ask spread.
+    """
     entry_premium = rng.uniform(0.60, 1.20)
     spy_open, spy_close = bar["o"], bar["c"]
 
@@ -300,20 +307,48 @@ def simulate_trade(direction, bar, rng):
         max_profit_pct = max(max_profit_pct, profit_pct)
 
         if profit_pct >= 20:
-            return 20.0
+            return 20.0, entry_premium
         if max_profit_pct >= 15 and profit_pct <= max_profit_pct - 10:
-            return profit_pct
+            return profit_pct, entry_premium
         if hour < 11 and profit_pct <= -20:
-            return -20.0
+            return -20.0, entry_premium
         if profit_pct <= -30:
-            return -30.0
+            return -30.0, entry_premium
 
-    return ((current_premium - entry_premium) / entry_premium) * 100
+    return ((current_premium - entry_premium) / entry_premium) * 100, entry_premium
 
 
 def _seeded_rng(date_str):
     """Deterministic RNG per trading day so baseline & gated see identical P/L."""
     return random.Random(int.from_bytes(date_str.encode(), "big") % (2 ** 31))
+
+
+def realized_net_detail(direction, outcome_bar, date_str, cost_model):
+    """Gross simulation on the OUTCOME bar (T+1) converted to NET via a
+    synthesized bid/ask spread (SPREAD_FRAC of premium) run through the shared
+    cost model. Returns a dict carrying both gross and net plus the fills used
+    so an episode row can be written."""
+    gross, entry_premium = simulate_trade(direction, outcome_bar, _seeded_rng(date_str))
+    half = max(entry_premium * SPREAD_FRAC / 2.0, 0.0)
+    entry_bid, entry_ask = max(0.0, entry_premium - half), entry_premium + half
+    exit_mid = max(entry_premium * (1 + gross / 100.0), 0.0)
+    exit_bid, exit_ask = max(0.0, exit_mid - half), exit_mid + half
+    res = cost_model.net_pnl(entry_bid, entry_ask, exit_bid, exit_ask,
+                             qty=1, hold_days=HOLD_DAYS)
+    return {
+        "gross_pct": gross,
+        "net_pct": res["net_pnl_pct"],
+        "net_dollars": res["net_pnl_dollars"],
+        "entry_bid": entry_bid,
+        "entry_ask": entry_ask,
+        "entry_price": res["entry_price"],
+        "exit_price": res["exit_price"],
+    }
+
+
+def realized_net(direction, outcome_bar, date_str, cost_model):
+    """NET P/L % for the trade (costs included). See realized_net_detail."""
+    return realized_net_detail(direction, outcome_bar, date_str, cost_model)["net_pct"]
 
 
 # --------------------------------------------------------------------------- #
@@ -335,12 +370,16 @@ def _summarize(label, pnls, start_equity=500.0):
         # P/L% is on premium; scale to a notional $100 contract for an equity curve.
         equity.append(equity[-1] + p)
     total = sum(pnls)
-    win_rate = (len(wins) / len(pnls) * 100) if pnls else 0.0
+    n = len(pnls)
+    win_rate = (len(wins) / n * 100) if n else 0.0
+    expectancy = (total / n) if n else 0.0
     return {
         "label": label,
-        "trades": len(pnls),
+        "trades": n,
         "win_rate": win_rate,
         "total_pnl_pct": total,
+        "expectancy_pct": expectancy,
+        "effective_sample_size": float(n),
         "final_equity": equity[-1],
         "max_drawdown": _max_drawdown(equity),
     }
@@ -349,29 +388,88 @@ def _summarize(label, pnls, start_equity=500.0):
 # --------------------------------------------------------------------------- #
 # Walk-forward engine
 # --------------------------------------------------------------------------- #
+def _build_view(bars, vix, idx):
+    """HistoricalMarketView pinned to the CLOSE of bars[idx], carrying only data
+    knowable by then (bars[:idx+1]). Used so features carry no lookahead."""
+    decision_bar = bars[idx]
+    as_of = datetime.strptime(decision_bar["date"], "%Y-%m-%d").replace(hour=16, minute=0)
+    daily = {
+        "SPY": [make_bar(b["date"], b["o"], b["h"], b["l"], b["c"]) for b in bars[: idx + 1]]
+    }
+    vbars = []
+    for b in bars[: idx + 1]:
+        v = vix.get(b["date"], 15.0)
+        vbars.append(make_bar(b["date"], v, v, v, v))
+    mv = HistoricalMarketView(as_of, daily=daily, vix_series={"^VIX": vbars})
+    return mv, as_of
+
+
 def _tradeable_days(bars, vix):
-    """Yield (bar, prev_bar, analysis) for weekday rows with a previous day."""
-    for i in range(1, len(bars)):
-        bar, prev = bars[i], bars[i - 1]
+    """Yield (decision_bar, outcome_bar, analysis, features) with no lookahead.
+
+    Decide at the CLOSE of day T (all of day T's OHLC is legitimately known by
+    then); the trade outcome belongs to the NEXT session T+1. Features come from
+    the shared `compute_features` path over a HistoricalMarketView pinned to
+    close(T), so there is no high/low lookahead and no train-serve skew.
+    """
+    for i in range(1, len(bars) - 1):
+        decision_bar = bars[i]
+        outcome_bar = bars[i + 1]
         try:
-            dow = datetime.strptime(bar["date"], "%Y-%m-%d").weekday()
+            dow = datetime.strptime(decision_bar["date"], "%Y-%m-%d").weekday()
         except ValueError:
             continue
         if dow >= 5:
             continue
-        v_today = vix.get(bar["date"], 15.0)
-        v_prev = vix.get(prev["date"], v_today)
-        analysis = analyze_day(bar, prev, v_today, v_prev)
-        yield bar, prev, analysis
+        mv, as_of = _build_view(bars, vix, i)
+        feats = compute_features(as_of, mv, symbol="SPY", strat_name="spy_1dte")
+        analysis = analyze_features(feats["raw"])
+        yield decision_bar, outcome_bar, analysis, feats
 
 
-def run_walkforward(bars, vix, overrides, learn=True, use_partial_table=True):
+def _write_episode(store, decision_bar, outcome_bar, analysis, feats, gate, detail):
+    """Persist one decision+outcome under a single decision_id (NET P/L)."""
+    did = store.log_decision(
+        symbol="SPY",
+        underlying="SPY",
+        strat="spy_1dte",
+        features=feats,
+        quote={"bid": detail["entry_bid"], "ask": detail["entry_ask"],
+               "ts": decision_bar["date"]},
+        modeled_cost={"spread_frac": SPREAD_FRAC, "hold_days": HOLD_DAYS},
+        rule_action=analysis["direction"] or "SKIP",
+        rule_confidence=analysis["confidence"],
+        gate=gate,
+        chosen_action=analysis["direction"] or "SKIP",
+        qty=1,
+        mode="1DTE",
+        as_of=feats.get("as_of"),
+    )
+    store.record_outcome(
+        did,
+        fill_price=detail["entry_price"],
+        exit_price=detail["exit_price"],
+        gross_pnl_pct=detail["gross_pct"],
+        net_pnl_pct=detail["net_pct"],
+        net_pnl_dollars=detail["net_dollars"],
+        hold_days=HOLD_DAYS,
+        outcome="closed",
+        closed_at=outcome_bar["date"],
+    )
+    return did
+
+
+def run_walkforward(bars, vix, overrides, learn=True, use_partial_table=True,
+                    cost_model=None, episode_store=None):
     """One sequential pass.
 
-    Returns (baseline_pnls, gated_pnls, vetoed_states). When use_partial_table
-    is True (honest walk-forward) gate decisions use only what was learned from
-    earlier days, because learning happens AFTER each day's decision.
+    Returns (baseline_pnls, gated_pnls, vetoed_states) as NET-of-cost P/L. When
+    use_partial_table is True (honest walk-forward) gate decisions use only what
+    was learned from earlier days, because learning happens AFTER each day's
+    decision. If `episode_store` is given, each decision+outcome is persisted
+    under one decision_id.
     """
+    cost_model = cost_model or CostModel(load_cost_config_from_env())
     os.environ["RL_MODE"] = "gate"  # backtest forces gate evaluation
     tmp = tempfile.NamedTemporaryFile(
         prefix="rl_qtable_bt_", suffix=".json", delete=False
@@ -386,34 +484,38 @@ def run_walkforward(bars, vix, overrides, learn=True, use_partial_table=True):
 
     baseline_pnls, gated_pnls, vetoed = [], [], []
 
-    for bar, prev, analysis in _tradeable_days(bars, vix):
+    for decision_bar, outcome_bar, analysis, feats in _tradeable_days(bars, vix):
         direction = analysis["direction"]
         wants_trade = analysis["should_trade"] and direction in ("CALL", "PUT")
 
         if not wants_trade:
             continue  # both baseline and gated skip; nothing to compare/learn
 
-        pnl = simulate_trade(direction, bar, _seeded_rng(bar["date"]))
-        baseline_pnls.append(pnl)
+        detail = realized_net_detail(direction, outcome_bar, outcome_bar["date"], cost_model)
+        net = detail["net_pct"]
+        baseline_pnls.append(net)
 
         gate = advisor.gate_decision(analysis, overrides=overrides)
         if gate["veto"]:
             vetoed.append(
                 {
-                    "date": bar["date"],
+                    "date": decision_bar["date"],
                     "state_key": gate["state_key"],
                     "direction": direction,
                     "q": gate["q"],
                     "visits": gate["visits"],
-                    "baseline_pnl": pnl,
+                    "baseline_pnl": net,
                 }
             )
             # gated skips -> realizes 0
         else:
-            gated_pnls.append(pnl)
+            gated_pnls.append(net)
+
+        if episode_store is not None:
+            _write_episode(episode_store, decision_bar, outcome_bar, analysis, feats, gate, detail)
 
         if learn:
-            reward = compute_reward(pnl, direction)
+            reward = compute_reward(net, direction)
             skey = state_key(extract_features(analysis, None, None, "spy_1dte"))
             advisor.agent.update(skey, direction, reward, done=True)
 
@@ -426,9 +528,11 @@ def run_walkforward(bars, vix, overrides, learn=True, use_partial_table=True):
     return baseline_pnls, gated_pnls, vetoed
 
 
-def train_then_eval(bars, vix, overrides, epochs):
+def train_then_eval(bars, vix, overrides, epochs, cost_model=None):
     """Thicken the Q-table over `epochs` passes, then evaluate the gate in a
-    final no-learning pass (in-sample demonstration when data is thin)."""
+    final no-learning pass (in-sample demonstration when data is thin). NET P/L.
+    """
+    cost_model = cost_model or CostModel(load_cost_config_from_env())
     os.environ["RL_MODE"] = "gate"
     tmp = tempfile.NamedTemporaryFile(
         prefix="rl_qtable_bt_", suffix=".json", delete=False
@@ -443,36 +547,36 @@ def train_then_eval(bars, vix, overrides, epochs):
 
     days = list(_tradeable_days(bars, vix))
     trade_days = [
-        (bar, a) for (bar, _p, a) in days
+        (outcome_bar, a) for (_d, outcome_bar, a, _f) in days
         if a["should_trade"] and a["direction"] in ("CALL", "PUT")
     ]
 
     for _ in range(max(1, epochs)):
-        for bar, analysis in trade_days:
-            pnl = simulate_trade(analysis["direction"], bar, _seeded_rng(bar["date"]))
-            reward = compute_reward(pnl, analysis["direction"])
+        for outcome_bar, analysis in trade_days:
+            net = realized_net(analysis["direction"], outcome_bar, outcome_bar["date"], cost_model)
+            reward = compute_reward(net, analysis["direction"])
             skey = state_key(extract_features(analysis, None, None, "spy_1dte"))
             advisor.agent.update(skey, analysis["direction"], reward, done=True)
 
     baseline_pnls, gated_pnls, vetoed = [], [], []
-    for bar, analysis in trade_days:
+    for outcome_bar, analysis in trade_days:
         direction = analysis["direction"]
-        pnl = simulate_trade(direction, bar, _seeded_rng(bar["date"]))
-        baseline_pnls.append(pnl)
+        net = realized_net(direction, outcome_bar, outcome_bar["date"], cost_model)
+        baseline_pnls.append(net)
         gate = advisor.gate_decision(analysis, overrides=overrides)
         if gate["veto"]:
             vetoed.append(
                 {
-                    "date": bar["date"],
+                    "date": outcome_bar["date"],
                     "state_key": gate["state_key"],
                     "direction": direction,
                     "q": gate["q"],
                     "visits": gate["visits"],
-                    "baseline_pnl": pnl,
+                    "baseline_pnl": net,
                 }
             )
         else:
-            gated_pnls.append(pnl)
+            gated_pnls.append(net)
 
     try:
         os.remove(tmp.name)
@@ -498,8 +602,12 @@ def _print_comparison(title, baseline_pnls, gated_pnls, vetoed):
     print(f"{'trades':<18}{base['trades']:>14d}{gated['trades']:>14d}")
     print(f"{'vetoed':<18}{'-':>14}{len(vetoed):>14d}")
     print(f"{'win_rate %':<18}{base['win_rate']:>14.1f}{gated['win_rate']:>14.1f}")
-    print(f"{'total P/L %':<18}{base['total_pnl_pct']:>14.1f}"
+    print(f"{'net total P/L %':<18}{base['total_pnl_pct']:>14.1f}"
           f"{gated['total_pnl_pct']:>14.1f}")
+    print(f"{'net expectancy %':<18}{base['expectancy_pct']:>14.2f}"
+          f"{gated['expectancy_pct']:>14.2f}")
+    print(f"{'eff sample size':<18}{base['effective_sample_size']:>14.1f}"
+          f"{gated['effective_sample_size']:>14.1f}")
     print(f"{'final equity':<18}{base['final_equity']:>14.1f}"
           f"{gated['final_equity']:>14.1f}")
     print(f"{'max drawdown':<18}{base['max_drawdown']:>14.1f}"
@@ -514,20 +622,24 @@ def _print_comparison(title, baseline_pnls, gated_pnls, vetoed):
         print("\nNo vetoes fired (insufficient negative evidence under thresholds).")
 
 
-def run_for_source(bars, source, overrides, epochs):
+def run_for_source(bars, source, overrides, epochs, cost_model=None, episode_store=None):
     vix = build_vix_series(bars, source)
     print(f"\n########## VIX SOURCE: {source.upper()} "
           f"({len([d for d in vix])} days) ##########")
 
-    b, g, vetoed = run_walkforward(bars, vix, overrides, learn=True)
+    b, g, vetoed = run_walkforward(
+        bars, vix, overrides, learn=True,
+        cost_model=cost_model, episode_store=episode_store,
+    )
     _print_comparison(
-        f"HONEST WALK-FORWARD (decide-then-learn)  [vix={source}]", b, g, vetoed
+        f"HONEST WALK-FORWARD (decide-then-learn, NET of cost)  [vix={source}]",
+        b, g, vetoed,
     )
 
     if epochs > 1:
-        b2, g2, vetoed2 = train_then_eval(bars, vix, overrides, epochs)
+        b2, g2, vetoed2 = train_then_eval(bars, vix, overrides, epochs, cost_model=cost_model)
         _print_comparison(
-            f"IN-SAMPLE DEMO (table trained {epochs} epochs)  [vix={source}]",
+            f"IN-SAMPLE DEMO (table trained {epochs} epochs, NET)  [vix={source}]",
             b2, g2, vetoed2,
         )
 
@@ -551,9 +663,24 @@ def run_backtest(args):
         print("[ERROR] Not enough SPY data to backtest.")
         return 1
 
-    sources = ["stooq", "proxy"] if args.vix_source == "both" else [args.vix_source]
-    for src in sources:
-        run_for_source(bars, src, overrides, args.epochs)
+    cost_model = CostModel(load_cost_config_from_env())
+
+    episode_store = None
+    if getattr(args, "write_episodes", False):
+        from episode_store import EpisodeStore
+        # Separate DB so backtest rows never collide with shadow/live episodes.
+        episode_store = EpisodeStore("episodes_backtest.db")
+        print("[EPISODES] Writing decision+outcome rows to episodes_backtest.db")
+
+    try:
+        sources = ["stooq", "proxy"] if args.vix_source == "both" else [args.vix_source]
+        for src in sources:
+            run_for_source(bars, src, overrides, args.epochs,
+                           cost_model=cost_model, episode_store=episode_store)
+    finally:
+        if episode_store is not None:
+            print(f"[EPISODES] stats: {episode_store.stats()}")
+            episode_store.close()
     return 0
 
 
@@ -634,6 +761,44 @@ def _self_test():
     return 0 if ok else 1
 
 
+def _self_test_costs():
+    """No-cred check that NET < gross and that the feature path is no-lookahead."""
+    print("=" * 50)
+    print("COST + POINT-IN-TIME SELF-TEST")
+    print("=" * 50)
+    cm = CostModel(load_cost_config_from_env())
+
+    # NET must be strictly below gross (spread + slippage + fees always cost).
+    outcome_bar = {"o": 470.0, "h": 474.0, "l": 469.0, "c": 473.0}
+    detail = realized_net_detail("CALL", outcome_bar, "2026-01-07", cm)
+    cost1 = detail["net_pct"] < detail["gross_pct"]
+    print(f"[1] gross={detail['gross_pct']:+.2f}% net={detail['net_pct']:+.2f}% "
+          f"(expect net<gross)  {'PASS' if cost1 else 'FAIL'}")
+
+    # A flat move (gross 0) must still be net-negative after costs.
+    flat_bar = {"o": 470.0, "h": 470.0, "l": 470.0, "c": 470.0}
+    flat = realized_net_detail("CALL", flat_bar, "2026-01-08", cm)
+    cost2 = flat["net_pct"] < 0
+    print(f"[2] flat move -> net={flat['net_pct']:+.2f}% (expect <0)  "
+          f"{'PASS' if cost2 else 'FAIL'}")
+
+    # Point-in-time: a bar whose close is after as_of must never be returned.
+    daily = {
+        "SPY": [
+            make_bar("2026-01-06", 470, 472, 469, 471),
+            make_bar("2026-01-07", 471, 475, 470, 474),  # the future bar
+        ]
+    }
+    mv = HistoricalMarketView(datetime(2026, 1, 6, 16, 0), daily=daily)
+    seen = mv.daily_bars("SPY", 30)
+    pit = all(b.date <= "2026-01-06" for b in seen) and len(seen) == 1
+    print(f"[3] only bars<=as_of returned ({len(seen)})  {'PASS' if pit else 'FAIL'}")
+
+    ok = cost1 and cost2 and pit
+    print("RESULT:", "PASS" if ok else "FAIL")
+    return 0 if ok else 1
+
+
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
@@ -651,10 +816,16 @@ def main():
     parser.add_argument("--min-confidence", type=float, default=cfg["min_confidence"])
     parser.add_argument("--report", action="store_true")
     parser.add_argument("--selftest", action="store_true")
+    parser.add_argument("--selftest-costs", action="store_true",
+                        help="no-cred cost/point-in-time checks (net<gross)")
+    parser.add_argument("--write-episodes", action="store_true",
+                        help="persist decision+outcome rows to episodes_backtest.db")
     args = parser.parse_args()
 
     if args.selftest:
         return _self_test()
+    if args.selftest_costs:
+        return _self_test_costs()
     return run_backtest(args)
 
 

@@ -39,6 +39,41 @@ class SmartOptionsTrader:
         except Exception as e:
             print(f"[RL] Advisor unavailable: {e}")
 
+        # Shadow recorder (additive, fail-open, behind SHADOW_RECORDER_ENABLED).
+        # Records every decision+outcome under ONE decision_id with NET-of-cost
+        # P/L; never changes what is traded. This is the fix for the dead RL
+        # loop (gross P/L logged under mismatched keys that never fired).
+        self.shadow_recorder = None
+        self._episode_store = None
+        try:
+            from rl_wrapper import _env as _rl_env
+            if _rl_env('SHADOW_RECORDER_ENABLED', 'false').lower() in ('1', 'true', 'yes', 'on'):
+                from shadow_recorder import ShadowRecorder
+                from episode_store import EpisodeStore
+                from cost_model import CostModel, load_cost_config_from_env
+                self._episode_store = EpisodeStore('episodes.db')
+                self.shadow_recorder = ShadowRecorder(
+                    self._episode_store,
+                    CostModel(load_cost_config_from_env()),
+                    advisor=self.rl_advisor,
+                    strat_name='smart_trader',
+                )
+                print("[SHADOW] Recorder active -> episodes.db")
+        except Exception as e:
+            print(f"[SHADOW] Recorder unavailable: {e}")
+
+        # Risk engine: hard caps that live OUTSIDE the learner (per-trade budget,
+        # daily loss, max concurrent, PDT, kill-switch). It is the last line of
+        # capital protection and runs BEFORE every order is sent. Fail-closed: if
+        # it can't be built, _risk_check blocks. Always on; not feature-flagged.
+        self.risk_engine = None
+        try:
+            from risk_engine import RiskEngine, load_risk_limits_from_env
+            self.risk_engine = RiskEngine(load_risk_limits_from_env())
+            print("[RISK] Engine active (fail-closed hard caps)")
+        except Exception as e:
+            print(f"[RISK] Engine unavailable (trades will be blocked): {e}")
+
         # Sentiment (Fear & Greed) risk filter. Fail-open. Uses an Alpaca-backed
         # market data provider so the custom score (PRIMARY) can be computed here
         # too; falls back to CNN if Alpaca data is unavailable. Used to scale
@@ -77,6 +112,11 @@ class SmartOptionsTrader:
         self.max_stop_loss = float(env_vars.get('MAX_STOP_LOSS', '0.25'))
         self.max_take_profit = float(env_vars.get('MAX_TAKE_PROFIT', '0.50'))
         self.trailing_stop_distance = float(env_vars.get('TRAILING_STOP_DISTANCE', '0.05'))
+
+        # Operational safety controls (duplicate guard / stale-quote / fill readback).
+        self.quote_max_age_sec = float(env_vars.get('QUOTE_MAX_AGE_SEC', '30'))
+        self.fill_wait_sec = float(env_vars.get('FILL_WAIT_SEC', '5'))
+        self.fill_poll_sec = float(env_vars.get('FILL_POLL_SEC', '0.5'))
 
     def load_trading_history(self):
         """Load historical trades for learning"""
@@ -136,6 +176,265 @@ class SmartOptionsTrader:
         """Get current orders"""
         response = requests.get(f"{self.base_url}/v2/orders", headers=self.headers)
         return response.json() if response.status_code == 200 else []
+
+    def _risk_check(self, trade_cost, qty: int = 1, may_day_trade: bool = True):
+        """Run the fail-closed risk engine before an order is placed.
+
+        Gathers live inputs:
+          * open_positions     = len(get_positions())
+          * realized_pnl_today = account equity - last_equity (today's P/L)
+          * pdt_remaining      = PDTTracker day-trade headroom
+        Fail-closed: if the engine is missing or any required input can't be
+        fetched, the trade is BLOCKED (RiskEngine.check already returns
+        allowed=False on a None input). Entries are treated as potential day
+        trades (may_day_trade=True) so PDT headroom is enforced conservatively.
+        Returns the engine verdict dict {allowed, reason, breaches}.
+        """
+        if self.risk_engine is None:
+            return {"allowed": False, "reason": "risk_engine_unavailable",
+                    "breaches": ["risk_engine_unavailable"]}
+        try:
+            positions = self.get_positions()
+            open_positions = len(positions) if isinstance(positions, list) else None
+
+            acct = self.get_account() or {}
+            equity = acct.get('equity')
+            last_equity = acct.get('last_equity')
+            realized_pnl_today = None
+            if equity is not None and last_equity is not None:
+                realized_pnl_today = float(equity) - float(last_equity)
+
+            pdt_remaining = None
+            try:
+                from pdt_tracker import PDTTracker
+                pdt_remaining = PDTTracker().get_remaining_day_trades()
+            except Exception:
+                pdt_remaining = None
+
+            return self.risk_engine.check(
+                trade_cost=trade_cost,
+                realized_pnl_today=realized_pnl_today,
+                open_positions=open_positions,
+                pdt_remaining=pdt_remaining,
+                may_day_trade=may_day_trade,
+            )
+        except Exception as e:
+            return {"allowed": False,
+                    "reason": f"risk_input_error:{type(e).__name__}",
+                    "breaches": ["risk_input_error"]}
+
+    def _record_blocked_decision(self, option, underlying_symbol, dynamic_levels,
+                                 quote, qty, risk_verdict):
+        """Record a risk-blocked entry as a SKIP decision (verdict in risk_json).
+
+        Observational only; never raises into the trading path. No-op unless the
+        shadow recorder is active. This ensures blocked trades are not silently
+        dropped from the episode record.
+        """
+        if not getattr(self, 'shadow_recorder', None):
+            return
+        try:
+            analysis_ctx = {
+                'direction': (option.get('type') or 'call').upper(),
+                'momentum': dynamic_levels.get('momentum', 0),
+                'confidence': option.get('score', 0),
+                'should_trade': False,
+            }
+            self.shadow_recorder.on_decision(
+                symbol=option['symbol'],
+                underlying=underlying_symbol,
+                analysis=analysis_ctx,
+                quote=quote,
+                entry_premium=(quote or {}).get('ask'),
+                qty=qty,
+                mode='live-paper-blocked',
+                as_of=datetime.now().isoformat(),
+                day_of_week=datetime.now().weekday(),
+                risk=risk_verdict,
+            )
+            print("[RISK] Blocked decision recorded to episodes.db")
+        except Exception as e:
+            print(f"[RISK] block-record failed: {e}")
+
+    # ----------------------------------------------------------------------- #
+    # Operational safety: duplicate guard / stale quote / fill readback /
+    # restart reconciliation. All additive; the trading path calls these.
+    # ----------------------------------------------------------------------- #
+    @staticmethod
+    def _parse_alpaca_ts(ts_str):
+        """Parse an Alpaca RFC3339 timestamp to an aware UTC datetime.
+
+        Handles a trailing 'Z' and nanosecond precision (truncated to micros).
+        Returns None if it cannot be parsed.
+        """
+        if not ts_str:
+            return None
+        try:
+            from datetime import timezone
+            s = str(ts_str).strip()
+            if s.endswith('Z'):
+                s = s[:-1] + '+00:00'
+            if '.' in s:
+                head, frac = s.split('.', 1)
+                tz = ''
+                for sign in ('+', '-'):
+                    idx = frac.find(sign)
+                    if idx != -1:
+                        tz, frac = frac[idx:], frac[:idx]
+                        break
+                s = f"{head}.{frac[:6]}{tz}"
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except Exception:
+            return None
+
+    def _quote_is_fresh(self, quote):
+        """True if the quote timestamp is within quote_max_age_sec of now.
+
+        Fail-closed: a missing/unparseable timestamp is treated as STALE so a
+        trade is never placed on an unverifiable quote.
+        """
+        from datetime import timezone
+        ts = self._parse_alpaca_ts((quote or {}).get('ts'))
+        if ts is None:
+            return False
+        age = (datetime.now(timezone.utc) - ts).total_seconds()
+        return abs(age) <= self.quote_max_age_sec
+
+    def _has_open_or_pending(self, option_symbol):
+        """Duplicate-order guard.
+
+        True if there is already a live position, a pending/open order, or a
+        tracked active trade for this exact option symbol. Fail-closed on the
+        broker checks: if positions or orders cannot be fetched, return True
+        (treat as duplicate) so an unguarded re-entry can never slip through.
+        A corrupt local tracker is ignored (broker state is authoritative).
+        """
+        try:
+            positions = self.get_positions()
+            if not isinstance(positions, list):
+                return True
+            for p in positions:
+                if p.get('symbol') == option_symbol and float(p.get('qty', 0) or 0) != 0:
+                    return True
+        except Exception:
+            return True
+
+        try:
+            open_states = {'new', 'accepted', 'pending_new', 'partially_filled',
+                           'accepted_for_bidding', 'held', 'pending_replace'}
+            for o in (self.get_orders() or []):
+                if o.get('symbol') == option_symbol and o.get('status') in open_states:
+                    return True
+        except Exception:
+            return True
+
+        try:
+            if os.path.exists('active_trades.json'):
+                with open('active_trades.json', 'r') as f:
+                    for t in json.load(f):
+                        if t.get('symbol') == option_symbol:
+                            return True
+        except Exception:
+            pass
+
+        return False
+
+    def _await_fill(self, order_id):
+        """Poll an order until it reaches a terminal state or the wait expires.
+
+        Returns the latest order dict (or None). Lets the caller read the REAL
+        filled_avg_price / filled_qty instead of assuming the quote ask, and
+        detect rejected / canceled / partial fills.
+        """
+        import time
+        terminal = {'filled', 'canceled', 'rejected', 'expired', 'done_for_day'}
+        latest = None
+        deadline = time.time() + self.fill_wait_sec
+        while True:
+            try:
+                resp = requests.get(f"{self.base_url}/v2/orders/{order_id}",
+                                    headers=self.headers)
+                if resp.status_code == 200:
+                    latest = resp.json()
+                    if latest.get('status') in terminal:
+                        return latest
+            except Exception:
+                pass
+            if time.time() >= deadline:
+                return latest
+            time.sleep(self.fill_poll_sec)
+
+    def reconcile_open_trades(self):
+        """Re-sync tracked active trades against live Alpaca positions on startup.
+
+        * Tracked trade with NO live position -> it closed while the bot was
+          down: record the outcome (net via the close path) and drop it.
+        * Live position with NO tracked trade -> surfaced as untracked (external
+          / manual entry); left in place, only logged.
+        Rewrites active_trades.json with the still-open tracked trades. Skips
+        safely (no destructive change) if positions cannot be fetched.
+        """
+        active_file = 'active_trades.json'
+        if not os.path.exists(active_file):
+            return
+        try:
+            with open(active_file, 'r') as f:
+                active_trades = json.load(f)
+        except Exception as e:
+            print(f"[RECONCILE] Could not read {active_file}: {e}")
+            return
+
+        try:
+            positions = self.get_positions()
+        except Exception as e:
+            print(f"[RECONCILE] Could not fetch positions (skipping): {e}")
+            return
+        if not isinstance(positions, list):
+            print("[RECONCILE] Positions unavailable (skipping).")
+            return
+
+        pos_by_symbol = {p.get('symbol'): p for p in positions}
+        still_open = []
+        closed = 0
+        for trade in active_trades:
+            sym = trade.get('symbol')
+            if sym in pos_by_symbol:
+                still_open.append(trade)
+                continue
+            closed_pnl = 0
+            try:
+                last = self.get_option_price(sym)
+                entry_price = trade.get('entry_price')
+                if last and entry_price:
+                    exit_px = last.get('mid') or last.get('ask') or last.get('bid') or 0
+                    if exit_px and entry_price:
+                        closed_pnl = ((exit_px - entry_price) / entry_price) * 100
+            except Exception:
+                closed_pnl = 0
+            print(f"[RECONCILE] {sym} no longer held; recording close "
+                  f"(~{closed_pnl:+.1f}%).")
+            try:
+                self.record_trade_outcome(trade, 'reconciled_closed', closed_pnl)
+            except Exception as e:
+                print(f"[RECONCILE] record_trade_outcome failed for {sym}: {e}")
+            closed += 1
+
+        tracked = {t.get('symbol') for t in active_trades}
+        for sym, p in pos_by_symbol.items():
+            if sym not in tracked:
+                print(f"[RECONCILE] Untracked live position: {sym} "
+                      f"(qty {p.get('qty')}). Not monitored.")
+
+        try:
+            with open(active_file, 'w') as f:
+                json.dump(still_open, f, indent=2, default=str)
+        except Exception as e:
+            print(f"[RECONCILE] Could not write {active_file}: {e}")
+
+        print(f"[RECONCILE] {len(still_open)} open / {closed} closed-out reconciled.")
 
     def get_market_status(self):
         """Check if market is open"""
@@ -311,7 +610,8 @@ class SmartOptionsTrader:
                         return {
                             'bid': bid,
                             'ask': ask,
-                            'mid': (bid + ask) / 2 if (bid > 0 and ask > 0) else (ask if ask > 0 else bid)
+                            'mid': (bid + ask) / 2 if (bid > 0 and ask > 0) else (ask if ask > 0 else bid),
+                            'ts': quote.get('t'),
                         }
 
             print(f"[OPTION PRICE] No quote data for {symbol}, status: {response.status_code}")
@@ -624,6 +924,13 @@ class SmartOptionsTrader:
         """Place order with dynamic stop loss and take profit"""
         order_quantity = quantity or self.quantity
 
+        # Duplicate-order guard: never stack a second position/order on the same
+        # contract. Fail-closed if broker positions/orders can't be verified.
+        option_symbol = option['symbol']
+        if self._has_open_or_pending(option_symbol):
+            print(f"[DUP] Open position/order already exists for {option_symbol}; skipping.")
+            return None
+
         # Calculate dynamic levels based on market conditions
         underlying_symbol = option.get('underlying', self.ticker)
         dynamic_levels = self.calculate_dynamic_levels(underlying_symbol)
@@ -650,6 +957,14 @@ class SmartOptionsTrader:
         # Validate price is reasonable
         if entry_price <= 0:
             print(f"[ERROR] Invalid option price: ${entry_price}")
+            return None
+
+        # Stale-quote guard: never trade on an out-of-date quote. Fail-closed:
+        # a missing/unparseable timestamp is treated as stale.
+        if not self._quote_is_fresh(current_option_price):
+            print(f"[STALE] Entry quote for {option_symbol} is stale/unverifiable "
+                  f"(ts={current_option_price.get('ts')}, "
+                  f"max_age={self.quote_max_age_sec}s); skipping.")
             return None
 
         # Calculate total cost
@@ -692,6 +1007,20 @@ class SmartOptionsTrader:
             except Exception as e:
                 print(f"[SENTIMENT] filter error (ignored): {e}")
 
+        # ---- Hard risk gate (fail-closed; last line of capital protection) ----
+        # Runs AFTER budget/sentiment sizing so trade_cost is final, and BEFORE
+        # the order is sent. On any breach the trade is blocked and the verdict
+        # is recorded; the verdict is also attached to the placed decision below.
+        risk_verdict = self._risk_check(total_cost, qty=order_quantity)
+        if not risk_verdict.get('allowed', False):
+            print(f"[RISK] BLOCKED: {risk_verdict.get('reason')}")
+            self._record_blocked_decision(
+                option, underlying_symbol, dynamic_levels,
+                current_option_price, order_quantity, risk_verdict,
+            )
+            return None
+        print(f"[RISK] OK ({risk_verdict.get('reason')})")
+
         # Place main order
         order_data = {
             'symbol': option['symbol'],
@@ -702,21 +1031,69 @@ class SmartOptionsTrader:
             'asset_class': 'us_option'
         }
 
-        response = requests.post(
-            f"{self.base_url}/v2/orders",
-            headers=self.headers,
-            json=order_data
-        )
+        # Network/API failures must never crash the caller (fail-safe to None).
+        try:
+            response = requests.post(
+                f"{self.base_url}/v2/orders",
+                headers=self.headers,
+                json=order_data,
+                timeout=10,
+            )
+        except Exception as e:
+            print(f"[ORDER ERROR] Network/API failure placing "
+                  f"{option['symbol']}: {e}")
+            return None
 
         if response.status_code in [200, 201]:
-            order = response.json()
+            try:
+                order = response.json()
+            except Exception as e:
+                print(f"[ORDER ERROR] Order accepted (HTTP "
+                      f"{response.status_code}) but response unparseable: {e}")
+                return None
+            order_id = order.get('id')
+
+            # Confirm the fill instead of assuming the quote ask: read the REAL
+            # filled_avg_price / filled_qty, and handle rejected/partial fills.
+            filled = self._await_fill(order_id) or order
+            status = filled.get('status')
+            try:
+                filled_qty = float(filled.get('filled_qty', 0) or 0)
+            except (TypeError, ValueError):
+                filled_qty = 0.0
+
+            if status in ('rejected', 'canceled', 'expired') and filled_qty <= 0:
+                print(f"[FILL] Order {order_id} {status} with no fill; no position opened.")
+                return None
+
+            entry_ask = current_option_price['ask']  # quote ask drives cost model
+            fill_price = None
+            try:
+                fap = filled.get('filled_avg_price')
+                if fap:
+                    fill_price = float(fap)
+            except (TypeError, ValueError):
+                fill_price = None
+
+            if fill_price and fill_price > 0:
+                entry_price = fill_price  # realized buy fill -> stop/take/triggers
+                print(f"[FILL] {order_id} {status}: {filled_qty:g} @ ${fill_price:.2f}")
+            else:
+                print(f"[FILL] {order_id} {status}: no fill price yet; "
+                      f"using quote ask ${entry_price:.2f}")
+
+            if filled_qty > 0 and int(filled_qty) != order_quantity:
+                print(f"[FILL] Partial/adjusted fill: {filled_qty:g} of {order_quantity}")
+                order_quantity = int(filled_qty)
 
             # Store trade info with dynamic levels
             trade_info = {
-                'order_id': order['id'],
+                'order_id': order_id,
                 'symbol': option['symbol'],
                 'underlying_symbol': underlying_symbol,
                 'entry_price': entry_price,
+                'entry_bid': bid_price,
+                'entry_ask': entry_ask,
                 'quantity': order_quantity,
                 'dynamic_stop_loss_percent': dynamic_levels['stop_loss_percent'],
                 'dynamic_take_profit_percent': dynamic_levels['take_profit_percent'],
@@ -734,18 +1111,37 @@ class SmartOptionsTrader:
                 }
             }
 
-            # Save to active trades file
-            self.save_active_trade(trade_info)
+            action = (option.get('type') or 'call').upper()  # CALL/PUT
+            analysis_ctx = {
+                'direction': action,
+                'momentum': dynamic_levels.get('momentum', 0),
+                'confidence': option.get('score', 0),
+            }
 
-            # RL shadow: log the decision so we can learn from its outcome
-            if self.rl_advisor:
+            # Shadow recorder owns the RL loop: log the decision under ONE
+            # decision_id (episode row + pending RL experience). It never blocks
+            # the trade. When it is disabled, fall back to the legacy RL hook.
+            if getattr(self, 'shadow_recorder', None):
                 try:
-                    action = (option.get('type') or 'call').upper()  # CALL/PUT
-                    analysis_ctx = {
-                        'direction': action,
-                        'momentum': dynamic_levels.get('momentum', 0),
-                        'confidence': option.get('score', 0),
-                    }
+                    quote = self.get_option_price(option['symbol'])
+                    decision_id = self.shadow_recorder.on_decision(
+                        symbol=option['symbol'],
+                        underlying=underlying_symbol,
+                        analysis=analysis_ctx,
+                        quote=quote,
+                        entry_premium=entry_price,
+                        qty=order_quantity,
+                        mode='live-paper',
+                        as_of=datetime.now().isoformat(),
+                        day_of_week=datetime.now().weekday(),
+                        risk=risk_verdict,
+                    )
+                    if decision_id:
+                        trade_info['decision_id'] = decision_id
+                except Exception as e:
+                    print(f"[SHADOW] on_decision failed: {e}")
+            elif self.rl_advisor:
+                try:
                     advice = self.rl_advisor.observe_and_log(
                         analysis_ctx, order['id'], action,
                         day_of_week=datetime.now().weekday()
@@ -756,8 +1152,17 @@ class SmartOptionsTrader:
                 except Exception as e:
                     print(f"[RL] observe failed: {e}")
 
+            # Save to active trades file (after decision_id is attached).
+            self.save_active_trade(trade_info)
+
             return order
 
+        # Non-2xx: surface the broker's rejection reason then fail.
+        try:
+            print(f"[ORDER ERROR] Order rejected for {option['symbol']} "
+                  f"(HTTP {response.status_code}): {response.text[:300]}")
+        except Exception:
+            print(f"[ORDER ERROR] Order rejected (HTTP {response.status_code})")
         return None
 
     def save_active_trade(self, trade_info: Dict):
@@ -792,8 +1197,21 @@ class SmartOptionsTrader:
             position = next((p for p in positions if p['symbol'] == trade['symbol']), None)
 
             if not position:
-                # Position closed, record outcome
-                self.record_trade_outcome(trade, 'closed')
+                # Position closed externally. Estimate realized P/L from the last
+                # known option quote so the learning loop sees a real number
+                # instead of the old default 0 (which silently killed the RL
+                # update). Fail-open: fall back to 0 if no quote is available.
+                closed_pnl = 0
+                try:
+                    last = self.get_option_price(trade['symbol'])
+                    entry_price = trade.get('entry_price')
+                    if last and entry_price:
+                        exit_px = last.get('mid') or last.get('ask') or last.get('bid') or 0
+                        if exit_px and entry_price:
+                            closed_pnl = ((exit_px - entry_price) / entry_price) * 100
+                except Exception:
+                    closed_pnl = 0
+                self.record_trade_outcome(trade, 'closed', closed_pnl)
                 continue
 
             current_price = float(position['current_price']) if position['current_price'] else 0
@@ -996,8 +1414,50 @@ class SmartOptionsTrader:
         self.save_trading_history()
         self.save_ml_model()
 
-        # RL shadow: feed realized outcome back to the agent
-        if getattr(self, 'rl_advisor', None) and pnl_percent:
+        # Shadow recorder owns the close when a decision_id is present: attach
+        # the NET-of-cost outcome to the same id and update the agent. No-op for
+        # legacy trades without a decision_id.
+        if getattr(self, 'shadow_recorder', None) and trade.get('decision_id'):
+            try:
+                entry_price = trade.get('entry_price')
+                entry_bid = trade.get('entry_bid')
+                entry_ask = trade.get('entry_ask')
+
+                # Pull the REAL exit quote so net P/L reflects the true
+                # round-trip spread instead of a price synthesized from
+                # pnl_percent. Only a two-sided quote is used as bid/ask; a
+                # one-sided or missing quote degrades to a mid fallback.
+                exit_bid = exit_ask = exit_mid = None
+                exit_quote = self.get_option_price(trade['symbol'])
+                if exit_quote:
+                    eb_q = exit_quote.get('bid') or 0
+                    ea_q = exit_quote.get('ask') or 0
+                    if eb_q > 0 and ea_q > 0:
+                        exit_bid, exit_ask = eb_q, ea_q
+                    exit_mid = exit_quote.get('mid')
+
+                # Last-resort mid if no quote at all (keeps the loop closing).
+                if exit_mid is None and entry_price:
+                    exit_mid = entry_price * (1 + pnl_percent / 100.0)
+
+                self.shadow_recorder.on_close(
+                    trade['decision_id'],
+                    entry_bid=entry_bid,
+                    entry_ask=entry_ask,
+                    exit_bid=exit_bid,
+                    exit_ask=exit_ask,
+                    entry_price=entry_price,
+                    exit_price=exit_mid,
+                    qty=trade.get('quantity', 1),
+                    gross_pnl_pct=pnl_percent,
+                    outcome=outcome,
+                    closed_at=datetime.now().isoformat(),
+                )
+                print(f"[SHADOW] Outcome recorded (gross {pnl_percent:+.1f}%)")
+            except Exception as e:
+                print(f"[SHADOW] on_close failed: {e}")
+        # Legacy RL hook (only when the shadow recorder is not handling the loop).
+        elif getattr(self, 'rl_advisor', None) and pnl_percent:
             try:
                 self.rl_advisor.record_outcome(trade.get('order_id'), pnl_percent)
                 print(f"[RL] Outcome recorded: {pnl_percent:+.1f}%")
@@ -1262,6 +1722,10 @@ def main():
 
     # Initialize trader
     trader = SmartOptionsTrader(ticker=symbol, quantity=quantity)
+
+    # Reconcile any open positions / pending trades left over from a prior run
+    # before doing anything else (trade, monitor, or status).
+    trader.reconcile_open_trades()
 
     if args.status:
         report = trader.generate_performance_report()
