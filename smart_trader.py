@@ -548,6 +548,14 @@ class SmartOptionsTrader:
                     print(f"[SKIP] Spread too wide: {spread_pct:.1f}%")
                     continue
 
+            # Budget filter: skip contracts whose per-contract cost exceeds the
+            # max budget for a single trade. Keeps selection consistent with the
+            # budget enforced later in place_order_with_stops (smart_trader.py).
+            contract_cost = ask_price * 100
+            if ask_price > 0 and contract_cost > self.max_budget_per_trade:
+                print(f"[SKIP] ${strike:.2f} {contract_type.upper()} exp {expiration} - cost ${contract_cost:.2f} exceeds budget ${self.max_budget_per_trade:.2f}")
+                continue
+
             # Calculate option metrics
             option_data = {
                 'symbol': contract['symbol'],
