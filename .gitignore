@@ -1,0 +1,58 @@
+# ---------------------------------------------------------------------------
+# Secrets & credentials — NEVER commit these
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*token*.json
+*tokens*.json
+schwab_tokens.json
+schwab_tokens_backup.json
+get_account_hash.py
+
+# ---------------------------------------------------------------------------
+# Runtime / generated trade data & logs
+# ---------------------------------------------------------------------------
+*.log
+bot.log
+rl_qtable.json
+rl_experience.json
+sentiment_cache.json
+day_trades_log.json
+pending_order.json
+scheduler_status.json
+trading_history.json
+schwab_trades.json
+spy_qqq_hybrid_trades.json
+spy_1dte_trades.json
+spy_hybrid_trades.json
+telegram_trades.json
+trade_*.json
+option_scan_*.json
+option_scan_*.txt
+option_analysis_*.json
+option_chain.json
+backtest_report.json
+backtest_*_*.json
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# ---------------------------------------------------------------------------
+# OS / editor cruft
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+nul
+.vscode/
+.idea/
+.claude/
