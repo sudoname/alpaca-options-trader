@@ -49,6 +49,17 @@ else
     git pull --ff-only "$REMOTE" "$BRANCH"
 fi
 
+# --- 1b. re-exec if the pull changed this script --------------------------
+# bash reads a script by byte offset, so a deploy.sh that rewrites itself
+# mid-run can mis-execute. If HEAD moved (i.e. we just pulled new code) and we
+# have not already re-exec'd, hand off to the freshly-pulled script exactly
+# once. The guard env var prevents any loop.
+if [ "$LOCAL_REF" != "$TARGET_REF" ] && [ -z "${_DEPLOY_REEXEC:-}" ]; then
+    echo "==> deploy.sh updated by pull; re-exec'ing the new version"
+    export _DEPLOY_REEXEC=1
+    exec "${BASH:-bash}" "$0" "$@"
+fi
+
 # --- 2. dependencies ------------------------------------------------------
 # Prefer a project virtualenv if one exists (venvs are not PEP 668 managed).
 for _venv in "${VENV:-}" .venv venv; do
