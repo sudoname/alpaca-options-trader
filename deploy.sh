@@ -49,10 +49,31 @@ else
     git pull --ff-only "$REMOTE" "$BRANCH"
 fi
 
-# --- 2. dependencies (no new deps today, but keep the env honest) ---------
-if [ -f requirements.txt ]; then
+# --- 2. dependencies ------------------------------------------------------
+# Prefer a project virtualenv if one exists (venvs are not PEP 668 managed).
+for _venv in "${VENV:-}" .venv venv; do
+    if [ -n "$_venv" ] && [ -x "$_venv/bin/python" ]; then
+        PYTHON="$_venv/bin/python"
+        echo "==> Using virtualenv: $_venv"
+        break
+    fi
+done
+
+# Best-effort install: on an externally-managed system python (PEP 668) a
+# system-wide install is refused. Since a release may add no new deps, a
+# failure here only WARNS — the self-test gate below is the real check and
+# will abort if anything is actually unimportable.
+if [ "${SKIP_DEPS:-0}" = "1" ]; then
+    echo "==> Skipping dependency install (SKIP_DEPS=1)"
+elif [ -f requirements.txt ]; then
     echo "==> Installing dependencies"
-    "$PYTHON" -m pip install --quiet -r requirements.txt
+    if ! "$PYTHON" -m pip install --quiet ${PIP_FLAGS:-} -r requirements.txt; then
+        echo "==> WARN: pip install failed (externally-managed env / PEP 668?)."
+        echo "    Continuing to the self-test gate (it verifies imports)."
+        echo "    To force a system install:  PIP_FLAGS=--break-system-packages ./deploy.sh"
+        echo "    Or use a venv:  python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"
+        echo "    Or skip deps:   SKIP_DEPS=1 ./deploy.sh"
+    fi
 fi
 
 # --- 3. self-test gate (no creds, no network) -----------------------------
