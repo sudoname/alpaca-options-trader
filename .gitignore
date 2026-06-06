@@ -15,6 +15,9 @@ get_account_hash.py
 # ---------------------------------------------------------------------------
 *.log
 bot.log
+# run.sh launcher runtime dirs (PID files + per-service logs)
+logs/
+run/
 rl_qtable.json
 rl_qtable_backtest.json
 rl_experience.json
