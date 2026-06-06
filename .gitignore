@@ -25,6 +25,7 @@ sentiment_cache.json
 day_trades_log.json
 pending_order.json
 scheduler_status.json
+active_trades.json
 trading_history.json
 schwab_trades.json
 spy_qqq_hybrid_trades.json

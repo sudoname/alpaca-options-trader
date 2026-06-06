@@ -13,13 +13,17 @@
 #                                   and the risk engine (all env-driven), so
 #                                   "RL" is not a separate process to start.
 #
-# Legacy (opt-in, OFF by default):
-#   run_spy_*_daily.py            — the old daily strategy schedulers. These
-#                                   import the dead Schwab OAuth stack
-#                                   (`from schwab import auth`) and trade via
-#                                   Schwab, NOT Alpaca. They need schwab-py +
-#                                   live schwab_tokens.json to even import.
-#                                   Enable explicitly with ENABLE_SCHEDULER=1.
+# Auto-trade scheduler (opt-in, OFF by default):
+#   run_alpaca_intraday.py        — Alpaca-native intraday auto-entry scheduler
+#                                   for SPY/QQQ. It reuses smart_trader's full
+#                                   pipeline (risk engine, PDT, shadow/RL) and is
+#                                   DRY-RUN BY DEFAULT (logs trades it would place,
+#                                   places nothing). Enable the daemon with
+#                                   ENABLE_SCHEDULER=1; actually place paper orders
+#                                   only with SCHEDULER_ARMED=1.
+#   run_spy_*_daily.py            — LEGACY Schwab schedulers (dead OAuth stack,
+#                                   trade via Schwab not Alpaca). Selectable via
+#                                   SCHEDULER=run_spy_1dte_daily.py but unsupported.
 #
 # The screener (stock_screener.py) is NOT a daemon; run it on demand with
 # `./run.sh screen`. It is standalone and is not auto-wired into live trades.
@@ -35,14 +39,15 @@
 #   PYTHON=python3            # interpreter (a ./venv or ./.venv is preferred)
 #   VENV=venv                 # explicit virtualenv dir
 #   NO_BOT=1                  # do not start the Telegram bot
-#   ENABLE_SCHEDULER=1        # also start the legacy (Schwab) daily scheduler
-#   SCHEDULER=run_spy_1dte_daily.py   # which legacy scheduler to start
+#   ENABLE_SCHEDULER=1        # also start the Alpaca intraday scheduler (dry-run)
+#   SCHEDULER_ARMED=1         # let the scheduler place paper orders (else dry-run)
+#   SCHEDULER=run_alpaca_intraday.py  # which scheduler script to start
 #
 set -euo pipefail
 
 # --- config (override via env) --------------------------------------------
 PYTHON="${PYTHON:-python3}"
-SCHEDULER="${SCHEDULER:-run_spy_qqq_hybrid_daily.py}"
+SCHEDULER="${SCHEDULER:-run_alpaca_intraday.py}"
 
 # Run from the repo root regardless of the caller's cwd.
 cd "$(dirname "$0")"
@@ -163,10 +168,14 @@ cmd_start() {
     if [ "${NO_BOT:-0}" != "1" ]; then
         start_one "$BOT_NAME" "telegram_bot.py"
     fi
-    # Legacy Schwab scheduler is OFF unless explicitly enabled.
+    # Auto-trade scheduler is OFF unless explicitly enabled.
     if [ "${ENABLE_SCHEDULER:-0}" = "1" ]; then
-        echo "==> ENABLE_SCHEDULER=1: starting legacy scheduler ($SCHEDULER)"
-        echo "    NOTE: this is the dead Schwab path; needs schwab-py + tokens."
+        if [ "${SCHEDULER_ARMED:-0}" = "1" ]; then
+            echo "==> ENABLE_SCHEDULER=1 SCHEDULER_ARMED=1: scheduler will PLACE paper orders ($SCHEDULER)"
+        else
+            echo "==> ENABLE_SCHEDULER=1: starting scheduler in DRY-RUN ($SCHEDULER)"
+            echo "    NOTE: set SCHEDULER_ARMED=1 to actually place paper orders."
+        fi
         start_one "$SCHED_NAME" "$SCHEDULER"
     fi
     echo "==> Done. Use './run.sh status' to check, './run.sh stop' to stop."

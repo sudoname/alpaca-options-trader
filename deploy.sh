@@ -101,6 +101,7 @@ echo "==> Running self-test gate"
 "$PYTHON" walk_forward.py --selftest
 "$PYTHON" regime.py --selftest
 "$PYTHON" backtest_rl_gate.py --selftest
+"$PYTHON" run_alpaca_intraday.py --selftest
 echo "==> All self-tests passed."
 
 # --- 4. optional restart (you own the supervisor) -------------------------
