@@ -120,6 +120,10 @@ class QLearningAgent:
         candidates = valid if valid else self.actions
         return {a: self.get_q(state_key, a) for a in candidates}
 
+    def visits(self, state_key: str, action: str) -> int:
+        """Read-only: how many times (state, action) has been updated."""
+        return self.counts.get(self._qk(state_key, action), 0)
+
     # ---------------------------------------------------------------- update
     def update(
         self,

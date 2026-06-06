@@ -61,6 +61,22 @@ def rl_mode() -> str:
     return _env("RL_MODE", "shadow").lower()
 
 
+def _gate_config() -> Dict:
+    """Conservative veto-only gate thresholds (env-overridable)."""
+
+    def _f(name, default):
+        try:
+            return float(_env(name, str(default)))
+        except (TypeError, ValueError):
+            return default
+
+    return {
+        "min_visits": int(_f("RL_GATE_MIN_VISITS", 8)),
+        "max_q": _f("RL_GATE_MAX_Q", -0.10),
+        "min_confidence": _f("RL_GATE_MIN_CONFIDENCE", 0.75),
+    }
+
+
 class RLAdvisor:
     def __init__(
         self,
@@ -113,6 +129,96 @@ class RLAdvisor:
             "agreement": recommended == rule_action,
             "mode": self.mode,
         }
+
+    # ----------------------------------------------------------------- gating
+    def gate_decision(
+        self,
+        analysis: Dict,
+        pdt_remaining: Optional[int] = None,
+        day_of_week: Optional[int] = None,
+        overrides: Optional[Dict] = None,
+    ) -> Dict:
+        """
+        Conservative, veto-only gate. Pure / read-only / fail-open.
+
+        Returns a dict describing whether the agent would VETO the rule's
+        directional trade (turn CALL/PUT into SKIP). It NEVER flips direction,
+        never chooses CALL vs PUT, and never mutates the Q-table.
+
+        A veto fires only when ALL hold:
+          1. RL_MODE == 'gate'
+          2. the rule wants to trade a direction (CALL/PUT, not SKIP)
+          3. visits(state, rule_action) >= min_visits
+          4. Q(state, rule_action) <= max_q  (materially negative)
+          5. confidence (= min(1, visits/min_visits)) >= min_confidence
+
+        Any exception results in veto=False so a live trade is never blocked.
+        """
+        result = {
+            "veto": False,
+            "rule_action": SKIP,
+            "q": 0.0,
+            "visits": 0,
+            "confidence": 0.0,
+            "reason": "",
+            "state_key": "",
+        }
+        try:
+            cfg = dict(_gate_config())
+            if overrides:
+                cfg.update(overrides)
+            min_visits = max(1, int(cfg["min_visits"]))
+            max_q = float(cfg["max_q"])
+            min_confidence = float(cfg["min_confidence"])
+
+            features = extract_features(
+                analysis, pdt_remaining, day_of_week, self.strat_name
+            )
+            skey = state_key(features)
+            result["state_key"] = skey
+
+            rule_action = (
+                (analysis.get("direction") or SKIP).upper()
+                if analysis.get("should_trade", True)
+                else SKIP
+            )
+            result["rule_action"] = rule_action
+
+            q = self.agent.get_q(skey, rule_action)
+            visits = self.agent.visits(skey, rule_action)
+            confidence = min(1.0, visits / float(min_visits))
+            result["q"] = q
+            result["visits"] = visits
+            result["confidence"] = confidence
+
+            if rl_mode() != "gate":
+                result["reason"] = "mode!=gate"
+                return result
+            if rule_action not in ("CALL", "PUT"):
+                result["reason"] = "no directional trade to veto"
+                return result
+            if visits < min_visits:
+                result["reason"] = f"insufficient visits ({visits}<{min_visits})"
+                return result
+            if q > max_q:
+                result["reason"] = f"q {q:.4f} not <= {max_q:.4f}"
+                return result
+            if confidence < min_confidence:
+                result["reason"] = (
+                    f"confidence {confidence:.2f}<{min_confidence:.2f}"
+                )
+                return result
+
+            result["veto"] = True
+            result["reason"] = (
+                f"VETO {rule_action}: q={q:.4f} visits={visits} "
+                f"conf={confidence:.2f}"
+            )
+            return result
+        except Exception as exc:  # fail-open: never block a trade
+            result["veto"] = False
+            result["reason"] = f"gate error (fail-open): {exc}"
+            return result
 
     # ----------------------------------------------------------- experiences
     def _load_experiences(self) -> List[Dict]:
