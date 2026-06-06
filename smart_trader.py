@@ -21,7 +21,6 @@ class SmartOptionsTrader:
             'APCA-API-KEY-ID': self.api_key,
             'APCA-API-SECRET-KEY': self.secret_key
         }
-        self.max_budget_per_trade = 500
         self.ticker = ticker
         self.quantity = quantity
 
@@ -68,6 +67,9 @@ class SmartOptionsTrader:
         self.api_key = env_vars.get('ALPACA_API_KEY', '')
         self.secret_key = env_vars.get('ALPACA_SECRET_KEY', '')
         self.paper = env_vars.get('ALPACA_PAPER', 'true').lower() == 'true'
+
+        # Budget per trade (dollars) from .env with default
+        self.max_budget_per_trade = float(env_vars.get('MAX_BUDGET_PER_TRADE', '500'))
 
         # Load profit/loss thresholds from .env with defaults
         self.base_stop_loss = float(env_vars.get('BASE_STOP_LOSS', '0.10'))
@@ -292,7 +294,7 @@ class SmartOptionsTrader:
         """Get current option price using latest quotes endpoint"""
         try:
             response = requests.get(
-                f"{self.data_url}/v1/options/quotes/latest",
+                f"{self.data_url}/v1beta1/options/quotes/latest",
                 headers=self.headers,
                 params={'symbols': symbol, 'feed': 'indicative'}
             )
@@ -502,8 +504,14 @@ class SmartOptionsTrader:
             ask_price = 0
             bid_price = 0
             spread = 0
-            volume = contract.get('volume', 0)
-            open_interest = contract.get('open_interest', 0)
+            try:
+                volume = float(contract.get('volume', 0) or 0)
+            except (TypeError, ValueError):
+                volume = 0
+            try:
+                open_interest = float(contract.get('open_interest', 0) or 0)
+            except (TypeError, ValueError):
+                open_interest = 0
 
             if contract.get('mock', False):
                 # Use mock Black-Scholes prices
@@ -525,7 +533,7 @@ class SmartOptionsTrader:
                 spread_pct = (spread / ask_price * 100) if ask_price > 0 else 100
 
                 validated_count += 1
-                print(f"[VALIDATED] ${strike:.2f} {contract_type.UPPER()} exp {expiration} - Bid: ${bid_price:.2f}, Ask: ${ask_price:.2f}, Vol: {volume}, OI: {open_interest}")
+                print(f"[VALIDATED] ${strike:.2f} {contract_type.upper()} exp {expiration} - Bid: ${bid_price:.2f}, Ask: ${ask_price:.2f}, Vol: {volume}, OI: {open_interest}")
 
                 # Skip options with very wide spreads (>20%) or no liquidity
                 if spread_pct > 20:
@@ -1087,9 +1095,9 @@ class SmartOptionsTrader:
         """Check if account has options trading access"""
         try:
             response = requests.get(
-                f"{self.data_url}/v2/options/contracts/AAPL",
+                f"{self.base_url}/v2/options/contracts",
                 headers=self.headers,
-                params={'limit': 1}
+                params={'underlying_symbols': 'AAPL', 'limit': 1}
             )
             return response.status_code == 200
         except:
@@ -1111,9 +1119,10 @@ class SmartOptionsTrader:
 
         for option_type in ['call', 'put']:
             response = requests.get(
-                f"{self.data_url}/v2/options/contracts/{ticker}",
+                f"{self.base_url}/v2/options/contracts",
                 headers=self.headers,
                 params={
+                    'underlying_symbols': ticker,
                     'expiration_date_gte': expiration_start,
                     'expiration_date_lte': expiration_end,
                     'type': option_type
