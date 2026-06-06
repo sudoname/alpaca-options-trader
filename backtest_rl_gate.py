@@ -274,12 +274,28 @@ def analyze_features(raw):
 def simulate_trade(direction, bar, rng):
     """Seeded reimplementation of simulate_option_trade_enhanced.
 
+    Models a near-ATM short-dated (0-1 DTE) SPY option by its ELASTICITY: the
+    premium's percent move equals the underlying's percent move times an omega
+    in the realistic 15-40x band, plus long-option convexity (gamma amplifies
+    favorable moves and cushions adverse ones) and theta decay accrued through
+    the session. The previous version applied a flat 0.525 multiple of the
+    underlying percent move, which produced sub-1% premium swings that could
+    never clear a realistic bid/ask spread (every trade lost net of cost).
+
     Returns (gross_profit_pct, entry_premium). The gross figure is the option's
     premium move before costs; the entry premium is returned so the shared cost
     model can convert it to a NET number against a synthesized bid/ask spread.
     """
-    entry_premium = rng.uniform(0.60, 1.20)
     spy_open, spy_close = bar["o"], bar["c"]
+
+    # Realistic near-ATM premium for 0-1 DTE: ~0.3-0.5% of spot (e.g. ~$1.5-3
+    # on a ~$500 underlying), not a flat sub-dollar lottery ticket.
+    entry_premium = max(spy_open * rng.uniform(0.003, 0.005), 0.05) if spy_open \
+        else rng.uniform(1.50, 3.00)
+
+    elasticity = rng.uniform(15.0, 40.0)  # omega: premium %% per 1% underlying
+    curvature = rng.uniform(1.0, 3.0)     # gamma convexity (always premium-positive)
+    theta_day = rng.uniform(0.08, 0.18)   # fraction of premium decayed over a session
 
     total_checks = 6 * 4  # 10:00-16:00, every 15 min
     intraday = []
@@ -289,7 +305,7 @@ def simulate_trade(direction, bar, rng):
         noise = rng.uniform(-0.001, 0.001) * spy_open
         intraday.append(target + noise)
 
-    delta_effect, gamma_effect = 0.375, 0.15
+    sign = 1.0 if direction == "CALL" else -1.0
     max_profit_pct = 0.0
     current_premium = entry_premium
 
@@ -297,11 +313,11 @@ def simulate_trade(direction, bar, rng):
         minutes = i * 15
         hour = 10 + (minutes // 60)
         spy_move_pct = ((spy_price - spy_open) / spy_open) * 100 if spy_open else 0.0
-        if direction == "CALL":
-            opt_move = spy_move_pct * (delta_effect + gamma_effect)
-        else:
-            opt_move = -spy_move_pct * (delta_effect + gamma_effect)
-        opt_move += -0.02 * (minutes / 60)  # theta decay
+        directional = sign * spy_move_pct  # +ve when the underlying moves our way
+        # Long-option payoff: linear elasticity + positive convexity (gamma),
+        # then theta accrued linearly through the session.
+        opt_move = elasticity * directional + curvature * (directional ** 2)
+        opt_move -= 100.0 * theta_day * (minutes / (total_checks * 15.0))
         current_premium = max(entry_premium * (1 + opt_move / 100), 0.01)
         profit_pct = ((current_premium - entry_premium) / entry_premium) * 100
         max_profit_pct = max(max_profit_pct, profit_pct)
