@@ -33,6 +33,15 @@ class TelegramTradingBot:
         self.bot_token = env_vars.get('TELEGRAM_BOT_TOKEN', '')
         self.chat_id = env_vars.get('TELEGRAM_CHAT_ID', '')
 
+        # Allow-list of chat IDs permitted to use the bot. Defaults to the
+        # owner's TELEGRAM_CHAT_ID; add more (comma-separated) via
+        # TELEGRAM_ALLOWED_CHAT_IDS to authorize other people.
+        allowed_raw = env_vars.get('TELEGRAM_ALLOWED_CHAT_IDS', '')
+        allowed = {c.strip() for c in allowed_raw.split(',') if c.strip()}
+        if self.chat_id:
+            allowed.add(str(self.chat_id).strip())
+        self.allowed_chat_ids = allowed
+
         if not self.bot_token:
             print("\n❌ Missing TELEGRAM_BOT_TOKEN in .env file")
             print("1. Create bot with @BotFather on Telegram")
@@ -109,6 +118,16 @@ class TelegramTradingBot:
 
         return {"ok": False}
 
+    def is_authorized(self, chat_id):
+        """Check whether a chat ID is allowed to use the bot.
+
+        If no allow-list is configured at all, fall back to open access so the
+        bot still works for a fresh setup.
+        """
+        if not self.allowed_chat_ids:
+            return True
+        return str(chat_id).strip() in self.allowed_chat_ids
+
     def process_command(self, message_text, chat_id):
         """Process trading commands"""
         text = message_text.upper().strip()
@@ -143,6 +162,12 @@ class TelegramTradingBot:
 
         elif text == 'LIST_SYMBOLS':
             return self.get_supported_symbols()
+
+        elif text == 'SCREEN' or text.startswith('SCREEN '):
+            parts = text.split()
+            strategy = parts[1].lower() if len(parts) > 1 else None
+            add_to_tickers = any(p == 'ADD' for p in parts[2:])
+            return self.run_screen(strategy, add_to_tickers)
 
         elif text.startswith('ADD_SYMBOL '):
             symbol = text.replace('ADD_SYMBOL ', '').strip().upper()
@@ -326,12 +351,14 @@ Based on: {market_data['trend']} trend, {market_data['market_sentiment']} sentim
 • Vol Expansion: Monitor for 20%+ IV spike
 • Strategy: {best_option.get('type', 'CALL')} options based on market analysis
 
-{'🕐 *Market closed - Will queue for next open: ' + market.get('next_open', 'Unknown') + '*' if not market.get('is_open') else '🟢 *Market OPEN - Ready to execute immediately*'}
+{'🕐 *Market closed - Alpaca paper orders only execute during market hours (next open: ' + market.get('next_open', 'Unknown') + ')*' if not market.get('is_open') else '🟢 *Market OPEN - Ready to execute on Alpaca paper*'}
 
 💡 **Recommendation:** {option_metrics['recommendation']}
 
+💼 *Execution:* Alpaca paper (no real money) · Schwab used for analysis only
+
 Reply:
-• `YES {ticker}` - {('Queue' if not market.get('is_open') else 'Execute')} trade
+• `YES {ticker}` - {('Execute when market opens' if not market.get('is_open') else 'Execute on Alpaca paper')}
 • `NO` - Cancel analysis"""
 
             # Store enhanced analysis for confirmation
@@ -354,104 +381,68 @@ Reply:
             current_price = analysis['current_price']
             market_open = analysis['market_open']
 
-            # Initialize both traders
+            # Execute on Alpaca paper only, placing the same contract Schwab
+            # selected during analysis. Routing through place_order_with_stops
+            # means the fixed Alpaca endpoints and the Fear & Greed sentiment
+            # sizing filter both apply. No live Schwab order is sent.
             from smart_trader import SmartOptionsTrader
-            from schwab_trader import SchwabOptionsTrader
 
             alpaca_trader = SmartOptionsTrader(ticker=ticker, quantity=1)
-            schwab_trader = SchwabOptionsTrader(dry_run=False)
 
-            # Check if market is open for immediate execution
-            if market_open:
-                print(f"[DUAL TRADE] Executing {ticker} on BOTH Alpaca & Schwab...")
+            # Alpaca options market orders are only accepted during market hours.
+            if not market_open:
+                option_type = best_option.get('type', 'CALL')
+                return f"""🕐 *Market Closed: {ticker}*
 
-                # Execute on Alpaca (paper trading)
-                alpaca_success = alpaca_trader.trade_symbol(ticker, quantity=1)
-                alpaca_status = "Success" if alpaca_success else "Failed"
+📊 Stock Price: `${current_price:.2f}`
+🎯 Option: `${best_option['strike']:.0f}` {option_type}
+📅 Expires: `{best_option['expiration'][:10]}`
 
-                # Execute on Schwab (live trading)
-                schwab_result = schwab_trader.execute_trade(best_option, quantity=1)
-                schwab_success = schwab_result is not None
-                schwab_status = "Success" if schwab_success else "Failed"
+Alpaca paper options orders are only accepted during US market hours
+(Mon–Fri 9:30 AM–4:00 PM ET). Re-send `{ticker}` and confirm
+`YES {ticker}` once the market is open."""
 
-                # Get entry prices from both platforms
-                alpaca_entry = current_price * 0.025  # Estimate for Alpaca
-                schwab_entry = best_option.get('ask', current_price * 0.025)
+            # Map the Schwab-selected contract to an Alpaca OCC symbol
+            option = self.build_alpaca_option(best_option, ticker)
+            if not option:
+                return f"❌ Could not map the selected {ticker} contract to Alpaca format"
 
-                if alpaca_success:
-                    orders = alpaca_trader.get_orders()
-                    if orders:
-                        symbol_orders = [o for o in orders if ticker in o.get('symbol', '')]
-                        if symbol_orders:
-                            recent_order = symbol_orders[-1]
-                            alpaca_entry = float(recent_order.get('filled_avg_price', alpaca_entry))
+            print(f"[ALPACA PAPER] Placing {ticker} {option['symbol']} ...")
+            order = alpaca_trader.place_order_with_stops(option, quantity=1)
+            if not order:
+                return (f"❌ Alpaca paper order failed for {ticker} "
+                        f"(`{option['symbol']}`). The contract may be untradeable on "
+                        f"Alpaca, illiquid, blocked by the sentiment filter, or over budget.")
 
-                trade_info = {
-                    'ticker': ticker,
-                    'symbol': best_option['symbol'],
-                    'strike': best_option['strike'],
-                    'entry_price': schwab_entry,  # Use Schwab price as primary
-                    'entry_time': datetime.now().isoformat(),
-                    'chat_id': chat_id,
-                    'status': 'open',
-                    'alpaca_status': alpaca_status,
-                    'schwab_status': schwab_status,
-                    'alpaca_entry': alpaca_entry,
-                    'schwab_entry': schwab_entry,
-                    'dual_trade': True,
-                    'notifications_sent': {
-                        'entry': True,
-                        '20_percent_gain': False,
-                        '5_percent_loss': False,
-                        'trailing_stop': False
-                    }
+            # Resolve entry price from the order when available
+            entry_price = best_option.get('ask', current_price * 0.025)
+            try:
+                filled = order.get('filled_avg_price') or order.get('limit_price')
+                if filled:
+                    entry_price = float(filled)
+            except Exception:
+                pass
+
+            trade_info = {
+                'ticker': ticker,
+                'symbol': option['symbol'],
+                'strike': float(best_option['strike']),
+                'entry_price': entry_price,
+                'entry_time': datetime.now().isoformat(),
+                'chat_id': chat_id,
+                'status': 'open',
+                'platform': 'alpaca_paper',
+                'real_trade': True,
+                'order_id': order.get('id'),
+                'notifications_sent': {
+                    'entry': True,
+                    '20_percent_gain': False,
+                    '5_percent_loss': False,
+                    'trailing_stop': False
                 }
+            }
 
-                print(f"[ALPACA] {alpaca_status} | [SCHWAB] {schwab_status}")
-
-                if not alpaca_success and not schwab_success:
-                    return f"Failed to execute on both platforms. Check account status and market conditions."
-            else:
-                # Market closed - Submit orders to Schwab to queue for market open
-                print(f"[MARKET CLOSED] Submitting {ticker} orders to queue in Schwab...")
-
-                # Execute on Schwab - this will queue the order in Schwab's system
-                schwab_result = schwab_trader.execute_trade(best_option, quantity=1)
-                schwab_success = schwab_result is not None
-                schwab_status = "Queued in Schwab" if schwab_success else "Failed"
-
-                # Note: Alpaca may not support queued orders, so we skip it when market is closed
-                alpaca_status = "Skipped (market closed)"
-                alpaca_entry = current_price * 0.025
-
-                schwab_entry = best_option.get('ask', current_price * 0.025)
-
-                trade_info = {
-                    'ticker': ticker,
-                    'symbol': best_option['symbol'],
-                    'strike': best_option['strike'],
-                    'entry_price': schwab_entry,
-                    'entry_time': datetime.now().isoformat(),
-                    'chat_id': chat_id,
-                    'status': 'queued',
-                    'alpaca_status': alpaca_status,
-                    'schwab_status': schwab_status,
-                    'alpaca_entry': alpaca_entry,
-                    'schwab_entry': schwab_entry,
-                    'dual_trade': True,
-                    'schwab_order_id': schwab_result.get('order_id') if schwab_result else None,
-                    'notifications_sent': {
-                        'entry': True,
-                        '20_percent_gain': False,
-                        '5_percent_loss': False,
-                        'trailing_stop': False
-                    }
-                }
-
-                print(f"[SCHWAB] {schwab_status}")
-
-                if not schwab_success:
-                    return f"Failed to queue trade in Schwab. Check account status and permissions."
+            print(f"[ALPACA PAPER] Order placed: {order.get('id')}")
 
             # Save trade info
             self.save_active_trade(trade_info)
@@ -460,20 +451,17 @@ Reply:
             if not self.monitoring:
                 self.start_position_monitoring()
 
-            if market_open:
-                option_type = best_option.get('type', 'CALL')
-                return f"""✅ *Trade Executed on BOTH Platforms: {ticker}*
+            option_type = best_option.get('type', 'CALL')
+            return f"""✅ *Trade Executed (Alpaca Paper): {ticker}*
 
 📊 Stock Price: `${current_price:.2f}`
 🎯 Option: `${best_option['strike']:.0f}` {option_type}
 📅 Expires: `{best_option['expiration'][:10]}`
+🔖 Contract: `{option['symbol']}`
+💵 Entry: `${entry_price:.2f}`
 
-💼 *Platform Status:*
-📈 Alpaca (Paper): {trade_info['alpaca_status']}
-   Entry: `${trade_info['alpaca_entry']:.2f}`
-
-💰 Schwab (Live): {trade_info['schwab_status']}
-   Entry: `${trade_info['schwab_entry']:.2f}`
+💼 *Platform:* Alpaca paper (no real money)
+🧠 Sentiment filter applied to position sizing
 
 🔔 *Auto Notifications:*
 • 20% gain → Close 50%
@@ -481,29 +469,41 @@ Reply:
 • Trailing stop active
 
 Monitoring started..."""
-            else:
-                # Market is closed, return queued status
-                option_type = best_option.get('type', 'CALL')
-                return f"""⏰ *Trade Queued in Schwab: {ticker}*
-
-📊 Stock Price: `${current_price:.2f}`
-🎯 Option: `${best_option['strike']:.0f}` {option_type}
-📅 Expires: `{best_option['expiration'][:10]}`
-
-💼 *Platform Status:*
-📈 Alpaca (Paper): {trade_info['alpaca_status']}
-💰 Schwab (Live): {trade_info['schwab_status']}
-   Entry: `${trade_info['schwab_entry']:.2f}`
-   {f"Order ID: `{trade_info['schwab_order_id']}`" if trade_info.get('schwab_order_id') else ""}
-
-🕐 Market closed - Order queued in Schwab
-✅ Will execute automatically when market opens
-🔔 Will send confirmation when trade fills
-
-Monitoring queued..."""
 
         except Exception as e:
             return f"❌ Error executing trade: {str(e)}"
+
+    def build_alpaca_option(self, best_option, ticker):
+        """Convert a Schwab-selected option into an Alpaca-format option dict.
+
+        Builds the OCC option symbol (e.g. SPY260710P00700000) from the
+        contract's expiration, type and strike so the same contract can be
+        placed on the Alpaca paper account via place_order_with_stops.
+        """
+        try:
+            exp_str = str(best_option['expiration']).split(':')[0].strip()[:10]
+            exp_date = datetime.strptime(exp_str, '%Y-%m-%d')
+            yymmdd = exp_date.strftime('%y%m%d')
+
+            opt_type = str(best_option.get('type', 'CALL')).upper()
+            cp = 'P' if opt_type.startswith('P') else 'C'
+
+            strike = float(best_option['strike'])
+            strike_int = int(round(strike * 1000))
+            occ_symbol = f"{ticker.upper()}{yymmdd}{cp}{strike_int:08d}"
+
+            return {
+                'symbol': occ_symbol,
+                'underlying': ticker.upper(),
+                'type': 'put' if cp == 'P' else 'call',
+                'strike': strike,
+                'expiration': exp_str,
+                'score': best_option.get('score', 0),
+                'mock': False,
+            }
+        except Exception as e:
+            print(f"[ALPACA OPTION] Failed to build symbol: {e}")
+            return None
 
     def store_pending_analysis(self, chat_id, ticker, option, current_price, market_open):
         """Store analysis for confirmation"""
@@ -1134,6 +1134,56 @@ Monitoring queued..."""
         except Exception as e:
             return f"❌ Error getting symbols: {str(e)}"
 
+    def run_screen(self, strategy=None, add_to_tickers=False):
+        """Screen the Nasdaq Buy/Strong-Buy universe using Alpaca price data.
+
+        Picks underlyings only; the chosen tickers then feed the normal
+        analyze/trade flow. Optionally writes the picks into the supported
+        symbols list so they can be analyzed/traded right away.
+        """
+        try:
+            from stock_screener import StockScreener, VALID_STRATEGIES
+        except Exception as e:
+            return f"❌ Screener unavailable: {e}"
+
+        if strategy and strategy not in VALID_STRATEGIES:
+            return ("❌ Unknown strategy. Use one of: "
+                    + ", ".join(VALID_STRATEGIES))
+
+        try:
+            screener = StockScreener()
+            picks = screener.screen(strategy=strategy, limit=10)
+        except Exception as e:
+            return f"❌ Screen failed: {str(e)}"
+
+        if not picks:
+            return "📭 No stocks passed the screen right now (market data or Nasdaq API may be unavailable)."
+
+        used = strategy or screener.default_strategy
+        lines = [f"🔎 *Screen Results* ({used})", ""]
+        for i, p in enumerate(picks, 1):
+            lines.append(
+                f"{i}. `{p['symbol']}`  ${p['market_price']:.2f}  "
+                f"moved {p['moved']:+.2f}%  (range ${p['change_low_to_high']:.2f})"
+            )
+
+        if add_to_tickers:
+            symbols = [p['symbol'] for p in picks]
+            merged = list(self.supported_tickers) + symbols
+            if self.save_supported_tickers(merged):
+                lines.append("")
+                lines.append(f"✅ Added {len(symbols)} picks to supported symbols. "
+                             f"Send a ticker to analyze it.")
+            else:
+                lines.append("")
+                lines.append("⚠️ Could not save picks to the symbol list.")
+        else:
+            lines.append("")
+            lines.append("Send `SCREEN <strategy> ADD` to add these to your list.")
+            lines.append("Strategies: `moved`, `lowtomarket`, `lowtohigh`")
+
+        return "\n".join(lines)
+
     def add_symbol(self, symbol):
         """Add a new trading symbol"""
         try:
@@ -1217,6 +1267,7 @@ Total symbols: `{len(self.supported_tickers)}`"""
 • `STATUS` - Account info
 • `POSITIONS` - Current positions
 • `QUEUE` - View queued trades
+• `SCREEN [strategy]` - Pick stocks (Nasdaq Buy/Strong-Buy)
 • `LIST_SYMBOLS` - Show supported symbols
 • `ADD_SYMBOL TICKER` - Add new symbol
 • `REMOVE_SYMBOL TICKER` - Remove symbol
@@ -1393,6 +1444,16 @@ Position closed to limit losses"""
                             message = update["message"]
                             chat_id = message["chat"]["id"]
                             text = message.get("text", "")
+
+                            # Authorization gate: only allow-listed chat IDs
+                            if not self.is_authorized(chat_id):
+                                print(f"[AUTH] Ignoring message from unauthorized chat {chat_id}")
+                                self.send_message(
+                                    "Not authorized. Ask the bot owner to add your "
+                                    f"chat ID (`{chat_id}`) to TELEGRAM_ALLOWED_CHAT_IDS.",
+                                    chat_id,
+                                )
+                                continue
 
                             # Process command and send response
                             response = self.process_command(text, str(chat_id))
