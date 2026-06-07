@@ -1590,6 +1590,17 @@ class SmartOptionsTrader:
         expiration_start = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d')
         expiration_end = (datetime.now() + timedelta(days=90)).strftime('%Y-%m-%d')
 
+        # Bound strikes to a window around the current price. Without this the
+        # endpoint returns the lowest strikes first (deep ITM), so for a
+        # high-priced underlying the whole page is far-ITM contracts whose
+        # premium blows the per-trade budget -> nothing qualifies. A +/-20%
+        # window keeps the near-the-money (affordable) strikes for any price.
+        price = self.get_current_price(ticker)
+        strike_params = {}
+        if price:
+            strike_params['strike_price_gte'] = round(price * 0.80, 2)
+            strike_params['strike_price_lte'] = round(price * 1.20, 2)
+
         # Get both calls and puts
         all_contracts = []
 
@@ -1601,7 +1612,9 @@ class SmartOptionsTrader:
                     'underlying_symbols': ticker,
                     'expiration_date_gte': expiration_start,
                     'expiration_date_lte': expiration_end,
-                    'type': option_type
+                    'type': option_type,
+                    'limit': 100,
+                    **strike_params
                 }
             )
 

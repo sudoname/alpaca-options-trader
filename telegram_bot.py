@@ -10,6 +10,7 @@ import time
 import threading
 import math
 import random
+import re
 from datetime import datetime, timedelta
 
 class TelegramTradingBot:
@@ -135,7 +136,9 @@ class TelegramTradingBot:
         # Check for YES/NO confirmation commands
         if text.startswith('YES '):
             ticker = text.replace('YES ', '').strip()
-            if ticker in self.supported_tickers:
+            if re.fullmatch(r'[A-Z]{1,5}', ticker):
+                # execute_trade validates there is a pending analysis for this
+                # ticker, so we don't need the allow-list to gate confirmation.
                 return self.execute_trade(ticker, chat_id)
             else:
                 return "❌ Invalid ticker after YES. Use: YES AAPL"
@@ -185,6 +188,13 @@ class TelegramTradingBot:
 
         elif text in ['HELP', '/START']:
             return self.get_help_message()
+
+        # Any unmatched, ticker-shaped token (1-5 letters) is analyzed on
+        # demand. All real commands are matched above, so this only catches
+        # bare symbols. The allow-list (supported_tickers) still governs the
+        # auto-monitor/screen flows; it no longer blocks one-off analysis.
+        elif re.fullmatch(r'[A-Z]{1,5}', text):
+            return self.analyze_ticker(text, chat_id)
 
         else:
             return "❓ Unknown command. Send HELP for available commands."
@@ -621,11 +631,27 @@ Monitoring started..."""
                         current_volume = int(bars[-1].get('v', 0))
                         avg_volume = int(sum(bar.get('v', 0) for bar in bars) / len(bars))
 
-                        # Get year high/low from available data
-                        prices_from_bars = [float(bar['h']) for bar in bars] + [float(bar['l']) for bar in bars]
-                        if prices_from_bars:
-                            year_high = max(prices_from_bars + historical_prices)
-                            year_low = min(prices_from_bars + historical_prices)
+                # Real 52-week range: pull ~1 year of daily bars and use the
+                # actual intraday high/low, not the 30-day close history.
+                year_start = end_time - timedelta(days=365)
+                year_response = requests.get(
+                    f"{trader.data_url}/v2/stocks/{ticker}/bars",
+                    headers=trader.headers,
+                    params={
+                        'timeframe': '1Day',
+                        'start': year_start.strftime('%Y-%m-%d'),
+                        'end': end_time.strftime('%Y-%m-%d'),
+                        'limit': 400,
+                        'feed': 'iex'  # Use IEX data for free tier
+                    }
+                )
+                if year_response.status_code == 200:
+                    year_bars = year_response.json().get('bars', [])
+                    highs = [float(b['h']) for b in year_bars if 'h' in b]
+                    lows = [float(b['l']) for b in year_bars if 'l' in b]
+                    if highs and lows:
+                        year_high = max(highs + [current_price])
+                        year_low = min(lows + [current_price])
 
             except Exception as e:
                 print(f"Volume data error: {e}")
