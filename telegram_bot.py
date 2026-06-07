@@ -256,6 +256,31 @@ class TelegramTradingBot:
         else:
             return 'CALL'
 
+    def get_fear_greed_line(self, trader):
+        """Return a formatted market-wide Fear & Greed line for the analysis
+        message. Fail-safe: returns a 'N/A' string on any error or when the
+        sentiment service is disabled/unavailable, so it never breaks output.
+        """
+        emoji_map = {
+            "Extreme Fear": "😱", "Fear": "😟", "Neutral": "😐",
+            "Greed": "🙂", "Extreme Greed": "🤑",
+        }
+        try:
+            service = getattr(trader, 'sentiment_service', None)
+            if not service:
+                return "Fear & Greed: `N/A` (filter off)"
+            sentiment = service.get_sentiment()
+            primary = sentiment.get('primary_score', {}) if isinstance(sentiment, dict) else {}
+            score = primary.get('score')
+            if primary.get('status') == 'available' and score is not None:
+                cls = primary.get('classification', 'Unknown')
+                emoji = emoji_map.get(cls, "📊")
+                cached = " (cached)" if sentiment.get('from_cache') else ""
+                return f"Fear & Greed: {emoji} `{score:.0f}/100` ({cls}){cached}"
+        except Exception as e:
+            print(f"[SENTIMENT] display error: {e}")
+        return "Fear & Greed: `N/A`"
+
     def analyze_ticker(self, ticker, chat_id):
         """Analyze ticker and show comprehensive option details - Uses Alpaca for options data"""
         try:
@@ -298,6 +323,9 @@ class TelegramTradingBot:
             # Market-hours check (reuse the Alpaca trader)
             market = alpaca_trader.get_market_status()
             market_status = "🟢 OPEN" if market.get('is_open') else "🔴 CLOSED"
+
+            # Market-wide Fear & Greed sentiment (fail-safe, cached ~15 min)
+            fear_greed_display = self.get_fear_greed_line(alpaca_trader)
 
             # Build comprehensive analysis message
             analysis_msg = f"""📊 *{ticker} COMPREHENSIVE ANALYSIS*
@@ -347,6 +375,7 @@ Based on: {market_data['trend']} trend, {market_data['market_sentiment']} sentim
 • Momentum: {market_data['momentum_signal']} {market_data['momentum_strength']}
 • Volatility: {market_data['volatility_regime']} ({market_data['vol_percentile']:.0f}th percentile)
 • Sentiment: {market_data['market_sentiment']} {market_data['sentiment_score']}
+• {fear_greed_display}
 • Catalyst Risk: {market_data['catalyst_risk']} {market_data['upcoming_events']}
 
 🛡️ **Smart Risk Management:**
@@ -591,8 +620,12 @@ Monitoring started..."""
             if not current_price:
                 return None
 
-            # Get historical price data for calculations
-            historical_prices = trader.get_price_history(ticker, days=30)
+            # Get historical price data for calculations. ~70 calendar days
+            # yields ~48 trading bars, enough for MACD (needs >=26) and a full
+            # RSI(14) window; a 30-day window only returned ~20 bars, which
+            # left MACD permanently "Neutral". Downstream slices (last 5/10)
+            # are unaffected.
+            historical_prices = trader.get_price_history(ticker, days=70)
             if len(historical_prices) < 5:
                 return None
 
@@ -602,37 +635,18 @@ Monitoring started..."""
 
             # Get real market data from Alpaca
             try:
-                # Get bars data for volume info
                 from datetime import datetime, timedelta
                 end_time = datetime.now()
-                start_time = end_time - timedelta(days=2)
-
-                response = requests.get(
-                    f"{trader.data_url}/v2/stocks/{ticker}/bars",
-                    headers=trader.headers,
-                    params={
-                        'timeframe': '1Day',
-                        'start': start_time.strftime('%Y-%m-%d'),
-                        'end': end_time.strftime('%Y-%m-%d'),
-                        'limit': 2,
-                        'feed': 'iex'  # Use IEX data for free tier
-                    }
-                )
 
                 current_volume = 0
                 avg_volume = 0
                 year_high = current_price * 1.2
                 year_low = current_price * 0.8
 
-                if response.status_code == 200:
-                    bars_data = response.json()
-                    bars = bars_data.get('bars', [])  # IEX returns bars as a list
-                    if bars:
-                        current_volume = int(bars[-1].get('v', 0))
-                        avg_volume = int(sum(bar.get('v', 0) for bar in bars) / len(bars))
-
-                # Real 52-week range: pull ~1 year of daily bars and use the
-                # actual intraday high/low, not the 30-day close history.
+                # Pull ~1 year of daily bars once and derive both the true
+                # 52-week range (intraday high/low) and volume: the latest
+                # session vs the ~20-day average. A 2-day window made the
+                # average equal the current day (e.g. "3.1M vs 3.1M").
                 year_start = end_time - timedelta(days=365)
                 year_response = requests.get(
                     f"{trader.data_url}/v2/stocks/{ticker}/bars",
@@ -647,11 +661,16 @@ Monitoring started..."""
                 )
                 if year_response.status_code == 200:
                     year_bars = year_response.json().get('bars', [])
-                    highs = [float(b['h']) for b in year_bars if 'h' in b]
-                    lows = [float(b['l']) for b in year_bars if 'l' in b]
-                    if highs and lows:
-                        year_high = max(highs + [current_price])
-                        year_low = min(lows + [current_price])
+                    if year_bars:
+                        current_volume = int(year_bars[-1].get('v', 0))
+                        recent_vols = [b.get('v', 0) for b in year_bars[-20:]]
+                        if recent_vols:
+                            avg_volume = int(sum(recent_vols) / len(recent_vols))
+                        highs = [float(b['h']) for b in year_bars if 'h' in b]
+                        lows = [float(b['l']) for b in year_bars if 'l' in b]
+                        if highs and lows:
+                            year_high = max(highs + [current_price])
+                            year_low = min(lows + [current_price])
 
             except Exception as e:
                 print(f"Volume data error: {e}")

@@ -160,6 +160,25 @@ require_env() {
         echo "    Copy .env.example to .env and fill it in before starting."
         exit 1
     fi
+    # Load .env into the environment so launch settings (ENABLE_SCHEDULER,
+    # SCHEDULER_ARMED, NO_BOT, ...) can live there instead of being passed
+    # inline. Variables already set in the shell take precedence (set -a only
+    # exports; existing values passed like `ENABLE_SCHEDULER=1 ./run.sh` are
+    # not overwritten because we skip keys already present in the environment).
+    set -a
+    while IFS= read -r _line || [ -n "$_line" ]; do
+        case "$_line" in
+            ''|\#*) continue ;;            # skip blanks and comments
+            *=*)
+                _key=${_line%%=*}
+                # Only set if not already defined in the environment.
+                if [ -z "${!_key+x}" ]; then
+                    eval "$_line"
+                fi
+                ;;
+        esac
+    done < "$ROOT/.env"
+    set +a
 }
 
 cmd_start() {

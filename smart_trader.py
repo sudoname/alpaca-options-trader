@@ -491,7 +491,10 @@ class SmartOptionsTrader:
 
     def calculate_volatility(self, ticker: str = None) -> float:
         """Calculate historical volatility"""
-        prices = self.get_price_history(ticker)
+        # ~30 calendar days (~20 trading bars / ~19 returns) for a stable
+        # annualized vol estimate. The default 10-day window only gave ~6
+        # returns, which is far too noisy.
+        prices = self.get_price_history(ticker, days=30)
         if len(prices) < 2:
             return 0.20  # Default 20% volatility
 
@@ -513,7 +516,10 @@ class SmartOptionsTrader:
 
     def calculate_momentum(self, ticker: str = None) -> float:
         """Calculate momentum indicator"""
-        prices = self.get_price_history(ticker, days=5)
+        # ~15 calendar days (~10 trading bars) guarantees the 3- and 5-bar
+        # momentum/smoothing windows always have data. A 5-day window could
+        # drop to ~3 bars after a weekend, making momentum unreliable.
+        prices = self.get_price_history(ticker, days=15)
         if len(prices) < 3:
             return 0
 
@@ -699,8 +705,10 @@ class SmartOptionsTrader:
         volatility = self.calculate_volatility(symbol)
         market_regime = self.get_market_regime(symbol)
 
-        # Get price trends
-        prices = self.get_price_history(symbol, days=10)
+        # Get price trends. ~20 calendar days (~14 trading bars) ensures the
+        # 3- and 5-bar trend slices always have data, even right after a
+        # weekend; a 10-day window could thin to ~6 bars.
+        prices = self.get_price_history(symbol, days=20)
         if len(prices) < 5:
             return 'call'  # Default to calls if insufficient data
 
