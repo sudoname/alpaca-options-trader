@@ -93,6 +93,10 @@ class SmartOptionsTrader:
         # Alpaca's news endpoint and scores them; used to (1) tilt call/put
         # direction, (2) nudge option ranking, and (3) gate/size entries.
         # Never blocks or crashes a trade on failure.
+        # Human-readable cause of the most recent blocked/failed entry, set by
+        # place_order_with_stops so callers (Telegram) can report the real reason.
+        self.last_block_reason = None
+
         self.news_service = None
         try:
             from news import NewsService, NewsConfig
@@ -209,6 +213,28 @@ class SmartOptionsTrader:
         """Get current orders"""
         response = requests.get(f"{self.base_url}/v2/orders", headers=self.headers)
         return response.json() if response.status_code == 200 else []
+
+    def _humanize_risk_breaches(self, risk_verdict: Dict) -> str:
+        """Map raw risk-engine breach codes to a human-readable explanation."""
+        try:
+            max_conc = self.risk_engine.limits.max_concurrent
+        except Exception:
+            max_conc = "?"
+        labels = {
+            "max_concurrent": (f"the maximum number of concurrent open positions "
+                               f"is already reached (limit {max_conc})"),
+            "over_budget": "the trade cost exceeds the per-trade budget",
+            "daily_loss_limit": "today's realized loss limit has been hit",
+            "kill_switch": "the daily loss kill-switch is tripped",
+            "pdt_block": "pattern-day-trader headroom is exhausted",
+            "pdt_unknown": "pattern-day-trader headroom could not be verified",
+            "nonpositive_cost": "the computed trade cost was not positive",
+            "risk_engine_unavailable": "the risk engine is unavailable",
+            "exception": "the risk engine hit an unexpected error",
+        }
+        breaches = risk_verdict.get("breaches") or []
+        parts = [labels.get(b, b) for b in breaches]
+        return "; ".join(parts) if parts else (risk_verdict.get("reason") or "blocked")
 
     def _risk_check(self, trade_cost, qty: int = 1, may_day_trade: bool = True):
         """Run the fail-closed risk engine before an order is placed.
@@ -997,14 +1023,21 @@ class SmartOptionsTrader:
         return best_option
 
     def place_order_with_stops(self, option: Dict, quantity: int = None):
-        """Place order with dynamic stop loss and take profit"""
+        """Place order with dynamic stop loss and take profit.
+
+        On a no-op/blocked entry this returns None and records a human-readable
+        cause in ``self.last_block_reason`` so callers (e.g. the Telegram bot)
+        can surface the actual reason instead of a generic message.
+        """
         order_quantity = quantity or self.quantity
+        self.last_block_reason = None
 
         # Duplicate-order guard: never stack a second position/order on the same
         # contract. Fail-closed if broker positions/orders can't be verified.
         option_symbol = option['symbol']
         if self._has_open_or_pending(option_symbol):
             print(f"[DUP] Open position/order already exists for {option_symbol}; skipping.")
+            self.last_block_reason = "an open position or pending order already exists for this contract"
             return None
 
         # Calculate dynamic levels based on market conditions
@@ -1023,6 +1056,7 @@ class SmartOptionsTrader:
 
         if not current_option_price:
             print(f"[ERROR] Cannot get current price for option {option_symbol}")
+            self.last_block_reason = "could not get a current quote for the contract (untradeable or no market data)"
             return None
 
         entry_price = current_option_price['ask']
@@ -1033,6 +1067,7 @@ class SmartOptionsTrader:
         # Validate price is reasonable
         if entry_price <= 0:
             print(f"[ERROR] Invalid option price: ${entry_price}")
+            self.last_block_reason = f"the contract returned an invalid ask price (${entry_price})"
             return None
 
         # Stale-quote guard: never trade on an out-of-date quote. Fail-closed:
@@ -1041,6 +1076,7 @@ class SmartOptionsTrader:
             print(f"[STALE] Entry quote for {option_symbol} is stale/unverifiable "
                   f"(ts={current_option_price.get('ts')}, "
                   f"max_age={self.quote_max_age_sec}s); skipping.")
+            self.last_block_reason = "the entry quote was stale/unverifiable (skipped for safety)"
             return None
 
         # Calculate total cost
@@ -1054,6 +1090,8 @@ class SmartOptionsTrader:
             order_quantity = int(self.max_budget_per_trade / (entry_price * 100))
             if order_quantity < 1:
                 print(f"[ERROR] Cannot afford even 1 contract at ${entry_price:.2f}")
+                self.last_block_reason = (f"one contract costs ${entry_price * 100:.2f}, over the "
+                                          f"${self.max_budget_per_trade:.2f} per-trade budget")
                 return None
             total_cost = entry_price * 100 * order_quantity
             print(f"[ADJUSTED] New quantity: {order_quantity} contract(s), cost: ${total_cost:.2f}")
@@ -1074,6 +1112,7 @@ class SmartOptionsTrader:
                 print(f"[SENTIMENT] {decision['reason']}")
                 if not decision['allowed']:
                     print("[SENTIMENT] Trade blocked by sentiment filter")
+                    self.last_block_reason = f"sentiment filter: {decision['reason']}"
                     return None
                 if decision['adjusted_size'] != order_quantity:
                     order_quantity = decision['adjusted_size']
@@ -1099,6 +1138,7 @@ class SmartOptionsTrader:
                 print(f"[NEWS] {decision['reason']}")
                 if not decision['allowed']:
                     print("[NEWS] Trade blocked by news filter")
+                    self.last_block_reason = f"news filter: {decision['reason']}"
                     return None
                 if decision['adjusted_size'] != order_quantity:
                     order_quantity = decision['adjusted_size']
@@ -1118,6 +1158,9 @@ class SmartOptionsTrader:
             self._record_blocked_decision(
                 option, underlying_symbol, dynamic_levels,
                 current_option_price, order_quantity, risk_verdict,
+            )
+            self.last_block_reason = (
+                "risk engine: " + self._humanize_risk_breaches(risk_verdict)
             )
             return None
         print(f"[RISK] OK ({risk_verdict.get('reason')})")
@@ -1143,6 +1186,7 @@ class SmartOptionsTrader:
         except Exception as e:
             print(f"[ORDER ERROR] Network/API failure placing "
                   f"{option['symbol']}: {e}")
+            self.last_block_reason = "a network/API error occurred submitting the order"
             return None
 
         if response.status_code in [200, 201]:
@@ -1151,6 +1195,7 @@ class SmartOptionsTrader:
             except Exception as e:
                 print(f"[ORDER ERROR] Order accepted (HTTP "
                       f"{response.status_code}) but response unparseable: {e}")
+                self.last_block_reason = "the broker accepted the order but returned an unreadable response"
                 return None
             order_id = order.get('id')
 
@@ -1165,6 +1210,7 @@ class SmartOptionsTrader:
 
             if status in ('rejected', 'canceled', 'expired') and filled_qty <= 0:
                 print(f"[FILL] Order {order_id} {status} with no fill; no position opened.")
+                self.last_block_reason = f"the broker {status} the order with no fill"
                 return None
 
             entry_ask = current_option_price['ask']  # quote ask drives cost model
@@ -1262,8 +1308,11 @@ class SmartOptionsTrader:
         try:
             print(f"[ORDER ERROR] Order rejected for {option['symbol']} "
                   f"(HTTP {response.status_code}): {response.text[:300]}")
+            self.last_block_reason = (f"the broker rejected the order "
+                                      f"(HTTP {response.status_code}): {response.text[:200]}")
         except Exception:
             print(f"[ORDER ERROR] Order rejected (HTTP {response.status_code})")
+            self.last_block_reason = f"the broker rejected the order (HTTP {response.status_code})"
         return None
 
     def save_active_trade(self, trade_info: Dict):

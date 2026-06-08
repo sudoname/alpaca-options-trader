@@ -454,9 +454,13 @@ Alpaca paper options orders are only accepted during US market hours
             print(f"[ALPACA PAPER] Placing {ticker} {option['symbol']} ...")
             order = alpaca_trader.place_order_with_stops(option, quantity=1)
             if not order:
+                reason = getattr(alpaca_trader, 'last_block_reason', None)
+                if reason:
+                    return (f"❌ Alpaca paper order for {ticker} "
+                            f"(`{option['symbol']}`) was not placed: {reason}.")
                 return (f"❌ Alpaca paper order failed for {ticker} "
                         f"(`{option['symbol']}`). The contract may be untradeable on "
-                        f"Alpaca, illiquid, blocked by the sentiment filter, or over budget.")
+                        f"Alpaca, illiquid, blocked by a risk/sentiment/news filter, or over budget.")
 
             # Resolve entry price from the order when available
             entry_price = best_option.get('ask', current_price * 0.025)
