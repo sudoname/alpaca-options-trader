@@ -34,6 +34,8 @@ spy_qqq_hybrid_trades.json
 spy_1dte_trades.json
 spy_hybrid_trades.json
 telegram_trades.json
+spread_paper_positions.json
+spread_paper_trades.json
 trade_*.json
 option_scan_*.json
 option_scan_*.txt

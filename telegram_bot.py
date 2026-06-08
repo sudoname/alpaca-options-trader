@@ -66,6 +66,13 @@ class TelegramTradingBot:
         self.spread_proposals_enabled = env_vars.get(
             'USE_SPREAD_PROPOSALS', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
 
+        # Phase 6C: when USE_SPREAD_PAPER_TRADING is on, the SPREAD_PAPER_* commands
+        # open/monitor/close SIMULATED defined-risk spread positions in local JSON
+        # files. There is NO broker order and NO live spread-execution path.
+        # Default off -> the commands reply that the feature is disabled.
+        self.spread_paper_enabled = env_vars.get(
+            'USE_SPREAD_PAPER_TRADING', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
+
         if not self.bot_token:
             print("\n❌ Missing TELEGRAM_BOT_TOKEN in .env file")
             print("1. Create bot with @BotFather on Telegram")
@@ -202,6 +209,19 @@ class TelegramTradingBot:
         elif text.startswith('REMOVE_SYMBOL '):
             symbol = text.replace('REMOVE_SYMBOL ', '').strip().upper()
             return self.remove_symbol(symbol)
+
+        elif text.startswith('SPREAD_PAPER_OPEN') or text.startswith('/SPREAD_PAPER_OPEN'):
+            parts = text.replace('/SPREAD_PAPER_OPEN', '').replace('SPREAD_PAPER_OPEN', '', 1).split()
+            symbol = parts[0].strip().upper() if parts else ''
+            return self.spread_paper_open(symbol, chat_id)
+
+        elif text == 'SPREAD_PAPER_POSITIONS' or text == '/SPREAD_PAPER_POSITIONS':
+            return self.spread_paper_positions(chat_id)
+
+        elif text.startswith('SPREAD_PAPER_CLOSE') or text.startswith('/SPREAD_PAPER_CLOSE'):
+            parts = text.replace('/SPREAD_PAPER_CLOSE', '').replace('SPREAD_PAPER_CLOSE', '', 1).split()
+            position_id = parts[0].strip().lower() if parts else ''
+            return self.spread_paper_close(position_id, chat_id)
 
         elif text.startswith('SPREAD_PROPOSAL') or text.startswith('/SPREAD_PROPOSAL'):
             parts = text.replace('/SPREAD_PROPOSAL', '').replace('SPREAD_PROPOSAL', '', 1).split()
@@ -1399,6 +1419,115 @@ Total symbols: `{len(self.supported_tickers)}`"""
             f"_(Proposal only — nothing was traded.)_"
         )
 
+    def _spread_paper_trader(self):
+        """Build a SpreadPaperTrader from env (Phase 6C). No broker client."""
+        from spread_paper_trader import SpreadPaperConfig, SpreadPaperTrader
+        return SpreadPaperTrader(SpreadPaperConfig.from_env())
+
+    def spread_paper_open(self, symbol, chat_id=None):
+        """Phase 6C: open a SIMULATED defined-risk spread position for ``symbol``.
+
+        Builds a proposal via SmartOptionsTrader.propose_spread (proposal only),
+        then opens a paper position via SpreadPaperTrader. NO broker order is ever
+        submitted — positions live in local JSON only. Gated by
+        USE_SPREAD_PAPER_TRADING (default off).
+        """
+        if not self.spread_paper_enabled:
+            return ("🧪 Spread paper trading is disabled.\n"
+                    "Set `USE_SPREAD_PAPER_TRADING=true` to enable simulated spreads.")
+
+        symbol = (symbol or '').strip().upper()
+        if not re.fullmatch(r'[A-Z]{1,5}', symbol):
+            return "❌ Invalid symbol. Usage: `SPREAD_PAPER_OPEN SPY`"
+
+        try:
+            from smart_trader import SmartOptionsTrader
+            trader = SmartOptionsTrader(ticker=symbol)
+            proposal = trader.propose_spread(symbol)
+        except Exception as e:
+            return f"❌ Could not build a spread proposal for `{symbol}`: {e}"
+
+        if proposal is None or not getattr(proposal, 'is_tradeable', False):
+            reason = getattr(proposal, 'reason', 'no_trade') if proposal else 'no_trade'
+            return (f"📭 *No spread to paper-trade for {symbol}*\n"
+                    f"Reason: `{reason}`\n"
+                    f"_(Simulated only — nothing was traded.)_")
+
+        try:
+            paper = self._spread_paper_trader()
+            result = paper.open_position(proposal)
+        except Exception as e:
+            return f"❌ Could not open simulated spread for `{symbol}`: {e}"
+
+        if not result.get('allowed'):
+            return (f"🚫 *Simulated spread rejected for {symbol}*\n"
+                    f"Reason: `{result.get('reason')}`\n"
+                    f"_(Simulated only — nothing was traded.)_")
+
+        pos = result['position']
+        kind = "credit" if pos['net_credit_or_debit'] > 0 else "debit"
+        return (
+            f"🧪 *Paper Spread OPENED — {symbol}* _(SIMULATED)_\n"
+            f"ID: `{pos['id']}`\n"
+            f"Strategy: `{pos['strategy']}`\n"
+            f"Oracle score: `{pos['oracle_score']:.1f}/100`\n"
+            f"Net {kind}: `{abs(pos['net_credit_or_debit']):.2f}`\n"
+            f"Entry mark: `{pos['entry_mark']:+.2f}`\n"
+            f"Max profit: `${pos['max_profit']:.2f}`\n"
+            f"Max loss: `${pos['max_loss']:.2f}`\n\n"
+            f"_(Simulated only — NO broker order was placed.)_"
+        )
+
+    def spread_paper_positions(self, chat_id=None):
+        """Phase 6C: list OPEN simulated spread positions (no broker calls)."""
+        if not self.spread_paper_enabled:
+            return ("🧪 Spread paper trading is disabled.\n"
+                    "Set `USE_SPREAD_PAPER_TRADING=true` to enable simulated spreads.")
+        try:
+            paper = self._spread_paper_trader()
+            positions = paper.get_open_positions()
+        except Exception as e:
+            return f"❌ Could not read simulated positions: {e}"
+
+        if not positions:
+            return "📭 *No open simulated spreads.* _(Paper only.)_"
+
+        lines = ["🧪 *Open Paper Spreads* _(SIMULATED)_\n"]
+        for p in positions:
+            lines.append(
+                f"• `{p['id']}` {p['symbol']} `{p['strategy']}`\n"
+                f"   max_loss `${p.get('max_loss', 0):.2f}` · "
+                f"pnl `{p.get('pnl', 0):+.2f}` "
+                f"(`{p.get('pnl_percent', 0):+.1f}%`)")
+        lines.append("\n_(Simulated only — nothing was traded.)_")
+        return "\n".join(lines)
+
+    def spread_paper_close(self, position_id, chat_id=None):
+        """Phase 6C: close a SIMULATED spread position by id (no broker calls)."""
+        if not self.spread_paper_enabled:
+            return ("🧪 Spread paper trading is disabled.\n"
+                    "Set `USE_SPREAD_PAPER_TRADING=true` to enable simulated spreads.")
+        position_id = (position_id or '').strip()
+        if not position_id:
+            return "❌ Usage: `SPREAD_PAPER_CLOSE POSITION_ID`"
+        try:
+            paper = self._spread_paper_trader()
+            closed = paper.close_position(position_id, exit_reason="manual_close")
+        except Exception as e:
+            return f"❌ Could not close simulated spread: {e}"
+
+        if closed is None:
+            return (f"❓ No open simulated spread with id `{position_id}`.\n"
+                    f"_(Paper only.)_")
+        return (
+            f"🧪 *Paper Spread CLOSED — {closed.get('symbol')}* _(SIMULATED)_\n"
+            f"ID: `{closed['id']}`\n"
+            f"Exit: `{closed.get('exit_reason')}`\n"
+            f"Final P/L: `{closed.get('pnl', 0):+.2f}` "
+            f"(`{closed.get('pnl_percent', 0):+.1f}%` of max loss)\n\n"
+            f"_(Simulated only — NO broker order was placed.)_"
+        )
+
     def get_help_message(self):
         """Get help information"""
         return """🤖 *Options Trading Bot*
@@ -1415,6 +1544,9 @@ Total symbols: `{len(self.supported_tickers)}`"""
 • `ADD_SYMBOL TICKER` - Add new symbol
 • `REMOVE_SYMBOL TICKER` - Remove symbol
 • `SPREAD_PROPOSAL TICKER` - Defined-risk spread idea (proposal only)
+• `SPREAD_PAPER_OPEN TICKER` - Open SIMULATED spread (paper only)
+• `SPREAD_PAPER_POSITIONS` - List open simulated spreads
+• `SPREAD_PAPER_CLOSE ID` - Close a simulated spread (paper only)
 • `START` - Start monitoring
 • `STOP` - Stop monitoring
 
