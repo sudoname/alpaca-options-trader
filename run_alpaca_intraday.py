@@ -58,14 +58,9 @@ SCHEDULER_SOURCE = "alpaca_scheduler"
 # value set in .env is honoured even though python-dotenv is not on the path).
 # --------------------------------------------------------------------------- #
 def _load_env_file(path=".env"):
-    env = {}
-    if os.path.exists(path):
-        with open(path, "r") as f:
-            for line in f:
-                if "=" in line and not line.strip().startswith("#"):
-                    k, v = line.strip().split("=", 1)
-                    env[k] = v
-    return env
+    # Phase 4.5: one parser for the whole project (shared config_loader).
+    from config_loader import parse_env_file
+    return parse_env_file(path)
 
 
 def _truthy(val):
@@ -94,9 +89,11 @@ class Config:
     def __init__(self, env=None, armed_override=None):
         env = env if env is not None else {}
 
-        def get(key, default):
-            # os.environ wins so a shell `KEY=... python ...` overrides .env.
-            return os.environ.get(key, env.get(key, default))
+        # Phase 4.5: resolve through the shared loader. os.environ wins, then the
+        # passed `env` (.env or a selftest dict), then the default — identical to
+        # the previous `os.environ.get(key, env.get(key, default))` semantics.
+        from config_loader import ConfigLoader
+        get = ConfigLoader(file_values=env).get
 
         self.symbols = [s.strip().upper() for s in get("SCHEDULER_SYMBOLS", "SPY,QQQ").split(",") if s.strip()]
         # Optionally fold the screener's picks (supported_tickers.json, written by
@@ -141,6 +138,9 @@ def _parse_iso(ts):
     ts = ts.strip()
     if ts.endswith("Z"):
         ts = ts[:-1] + "+00:00"
+    # Alpaca can return nanosecond precision (9 fractional digits); fromisoformat
+    # only accepts 3 or 6. Clamp the fractional-seconds field to 6 digits.
+    ts = re.sub(r"(\.\d{6})\d+", r"\1", ts)
     return datetime.fromisoformat(ts)
 
 
@@ -329,11 +329,32 @@ class IntradayScheduler:
             log(f"[SKIP] {sym}: no option contracts")
             return None
 
-        direction = self.trader.determine_option_strategy(sym)  # 'call' / 'put'
+        direction = self.trader.determine_option_strategy(sym)  # 'call' / 'put' / 'skip'
+        # Phase 3: a weak/flat-signal NO_TRADE short-circuits before any contract
+        # lookup or order. OFF by default (never returns 'skip'), so unchanged.
+        if str(direction).lower() in ("skip", "no_trade"):
+            reason = getattr(self.trader, "last_skip_reason", None) or "weak/flat signal"
+            log(f"[SKIP] {sym}: NO_TRADE ({reason})")
+            return None
         opt = self.trader.select_best_option(contracts, price, strategy=direction)
         if not opt:
             log(f"[SKIP] {sym}: no suitable option ({direction.upper()})")
             return None
+
+        # Phase 4: aggregate-exposure preview. When USE_PORTFOLIO_GREEK_LIMITS is
+        # on, project this candidate onto the live book and skip it early (before
+        # ranking/entry) if it would breach a portfolio delta/vega/theta or
+        # same-direction/per-underlying cap. OFF by default -> never runs, so the
+        # scheduler is unchanged. place_order_with_stops re-checks authoritatively
+        # with the final conviction-sized quantity; this preview uses cfg.qty.
+        if getattr(self.trader, "use_portfolio_greek_limits", False):
+            try:
+                pf = self.trader._portfolio_greek_check(opt, self.cfg.qty)
+                if not pf.get("allowed", True):
+                    log(f"[SKIP] {sym}: portfolio limit ({pf.get('reason')})")
+                    return None
+            except Exception as e:
+                log(f"[WARN] portfolio preview failed for {sym} (ignored): {e}")
 
         return {"sym": sym, "direction": direction, "opt": opt,
                 "score": float(opt.get("score") or 0)}

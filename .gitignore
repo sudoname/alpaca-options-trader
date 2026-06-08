@@ -24,6 +24,7 @@ rl_experience.json
 sentiment_cache.json
 news_cache.json
 day_trades_log.json
+realized_pnl_log.json
 pending_order.json
 scheduler_status.json
 active_trades.json

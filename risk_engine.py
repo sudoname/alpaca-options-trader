@@ -20,7 +20,6 @@ This module computes the verdict; it does not place or cancel orders.
 """
 
 import math
-import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -35,6 +34,11 @@ class RiskLimits:
     max_concurrent: int = 3               # open positions allowed at once
     min_pdt_remaining: int = 1            # required day-trade headroom for a day trade
     kill_switch_loss: float = 500.0       # $ realized daily loss that trips the switch
+    # Concentration cap: max open positions allowed on a SINGLE underlying.
+    # Default is intentionally high (no-op) so existing behavior is unchanged
+    # until an operator opts in via MAX_POSITIONS_PER_UNDERLYING. A value <= 0
+    # also means "no limit" (disabled).
+    max_per_underlying: int = 1000
 
 
 def _env_float(env: Dict[str, str], key: str, default: float) -> float:
@@ -52,20 +56,21 @@ def _env_int(env: Dict[str, str], key: str, default: int) -> int:
 
 
 def load_risk_limits_from_env(path: str = ".env") -> RiskLimits:
-    """Manual .env parse (matches the rest of the project; no python-dotenv)."""
-    env: Dict[str, str] = {}
-    if os.path.exists(path):
-        with open(path, "r") as f:
-            for line in f:
-                if "=" in line and not line.strip().startswith("#"):
-                    k, v = line.strip().split("=", 1)
-                    env[k] = v
+    """Resolve limits via the shared loader (shell env > .env > default).
+
+    Phase 4.5: ``ConfigLoader`` is a drop-in for the parsed-``.env`` dict this
+    used to build, so ``_env_float``/``_env_int`` work unchanged while a shell
+    ``KEY=... python ...`` now overrides ``.env``.
+    """
+    from config_loader import ConfigLoader
+    env = ConfigLoader(path)
     return RiskLimits(
         max_budget_per_trade=_env_float(env, "MAX_BUDGET_PER_TRADE", 500.0),
         daily_loss_limit=_env_float(env, "DAILY_LOSS_LIMIT", 300.0),
         max_concurrent=_env_int(env, "MAX_CONCURRENT_POSITIONS", 3),
         min_pdt_remaining=_env_int(env, "MIN_PDT_REMAINING", 1),
         kill_switch_loss=_env_float(env, "KILL_SWITCH_LOSS", 500.0),
+        max_per_underlying=_env_int(env, "MAX_POSITIONS_PER_UNDERLYING", 1000),
     )
 
 
@@ -97,12 +102,19 @@ class RiskEngine:
         open_positions: Optional[int] = None,
         pdt_remaining: Optional[int] = None,
         may_day_trade: bool = False,
+        positions_for_underlying: Optional[int] = None,
     ) -> Dict:
         """Return {allowed, reason, breaches}. FAIL-CLOSED on any problem.
 
         Required inputs: trade_cost, realized_pnl_today, open_positions. A None
         for any of these (or any exception) yields allowed=False so a missing
         signal can never be read as permission.
+
+        Optional input: positions_for_underlying = how many positions are
+        already open on the underlying this trade targets. The per-underlying
+        concentration cap is only evaluated when this is supplied AND the limit
+        is active (max_per_underlying > 0). When the count is omitted the cap is
+        a no-op, so callers that don't pass it keep their existing behavior.
         """
         try:
             breaches: List[str] = []
@@ -134,6 +146,13 @@ class RiskEngine:
 
             if open_positions >= lim.max_concurrent:
                 breaches.append("max_concurrent")
+
+            # Per-underlying concentration cap (opt-in). Only evaluated when the
+            # caller supplies the current per-underlying count AND a positive
+            # limit is configured; otherwise it's a no-op (default behavior).
+            if positions_for_underlying is not None and lim.max_per_underlying > 0:
+                if int(positions_for_underlying) >= lim.max_per_underlying:
+                    breaches.append("max_per_underlying")
 
             if may_day_trade:
                 if pdt_remaining is None:
@@ -195,6 +214,29 @@ def _self_test() -> int:
     r = eng.check(trade_cost=100.0, realized_pnl_today=0.0, open_positions=3)
     if r["allowed"] or "max_concurrent" not in r["breaches"]:
         print("FAIL: max concurrent should block", r); ok = False
+
+    # Per-underlying cap is a no-op by default (high default limit), even when
+    # a count is supplied.
+    r = eng.check(trade_cost=100.0, realized_pnl_today=0.0, open_positions=1,
+                  positions_for_underlying=50)
+    if not r["allowed"]:
+        print("FAIL: default per-underlying cap should be no-op", r); ok = False
+
+    # When enabled, the cap blocks once same-symbol exposure reaches the limit.
+    eng_cap = RiskEngine(RiskLimits(max_per_underlying=2))
+    r = eng_cap.check(trade_cost=100.0, realized_pnl_today=0.0, open_positions=1,
+                      positions_for_underlying=2)
+    if r["allowed"] or "max_per_underlying" not in r["breaches"]:
+        print("FAIL: per-underlying cap should block at the limit", r); ok = False
+    # ...but still allows when under the cap.
+    r = eng_cap.check(trade_cost=100.0, realized_pnl_today=0.0, open_positions=1,
+                      positions_for_underlying=1)
+    if not r["allowed"]:
+        print("FAIL: per-underlying cap should allow under the limit", r); ok = False
+    # ...and omitting the count leaves the cap a no-op even when configured.
+    r = eng_cap.check(trade_cost=100.0, realized_pnl_today=0.0, open_positions=1)
+    if not r["allowed"]:
+        print("FAIL: per-underlying cap should be skipped when count omitted", r); ok = False
 
     # PDT headroom -> blocked when it's a day trade with no remaining.
     r = eng.check(trade_cost=100.0, realized_pnl_today=0.0, open_positions=0,

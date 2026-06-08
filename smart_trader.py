@@ -109,14 +109,15 @@ class SmartOptionsTrader:
             print(f"[NEWS] signal unavailable: {e}")
 
     def load_credentials(self):
-        """Load API credentials and trading parameters from .env file"""
-        env_vars = {}
-        if os.path.exists('.env'):
-            with open('.env', 'r') as f:
-                for line in f:
-                    if '=' in line and not line.strip().startswith('#'):
-                        key, value = line.strip().split('=', 1)
-                        env_vars[key] = value
+        """Load API credentials and trading parameters.
+
+        Config resolves shell env first, then ``.env``, then code defaults via the
+        shared ``config_loader.ConfigLoader`` (Phase 4.5). ``env_vars`` keeps a
+        dict-compatible ``.get(name, default)`` so every downstream lookup below is
+        unchanged in form but now honors a shell ``KEY=... python ...`` override.
+        """
+        from config_loader import ConfigLoader
+        env_vars = ConfigLoader()
 
         self.api_key = env_vars.get('ALPACA_API_KEY', '')
         self.secret_key = env_vars.get('ALPACA_SECRET_KEY', '')
@@ -136,6 +137,107 @@ class SmartOptionsTrader:
         self.conf_very_high_signals = int(env_vars.get('CONF_VERY_HIGH_SIGNALS', '4'))
         # Updated by determine_option_strategy; read when sizing a confidence-based order.
         self.last_signal_strength = 0
+
+        # Real option Greeks/IV from Alpaca snapshots. OFF by default so scoring
+        # behavior is unchanged until an operator opts in via USE_REAL_GREEKS.
+        # When on, select_best_option overrides the hardcoded Greek/IV fallbacks
+        # with live snapshot values whenever they're present, and falls back to
+        # the heuristic values for any field the snapshot is missing.
+        self.use_real_greeks = str(
+            env_vars.get('USE_REAL_GREEKS', 'false')
+        ).strip().lower() in ('1', 'true', 'yes', 'on')
+
+        # --- Phase 2: contract-selection refinements ----------------------- #
+        # All sub-gates below are OFF by default; with their flags unset the
+        # selection behaves exactly as before. Each can reject a contract (with
+        # a logged reason) and/or nudge its score toward a preferred target.
+        def _flag(name):
+            return str(env_vars.get(name, 'false')).strip().lower() in (
+                '1', 'true', 'yes', 'on')
+
+        def _f2(name, default):
+            try:
+                return float(env_vars.get(name, str(default)))
+            except (TypeError, ValueError):
+                return default
+
+        def _i2(name, default):
+            try:
+                return int(float(env_vars.get(name, str(default))))
+            except (TypeError, ValueError):
+                return default
+
+        # 1) DTE targeting: prefer contracts near OPTION_TARGET_DTE, gate to the
+        #    [OPTION_MIN_DTE, OPTION_MAX_DTE] window. Gated by USE_DTE_TARGETING.
+        self.option_min_dte = _i2('OPTION_MIN_DTE', 30)
+        self.option_max_dte = _i2('OPTION_MAX_DTE', 90)
+        self.option_target_dte = _i2('OPTION_TARGET_DTE', 45)
+        self.use_dte_targeting = _flag('USE_DTE_TARGETING')
+
+        # 2) Delta targeting (needs a real delta; otherwise falls back to the
+        #    existing behavior). Gated by USE_DELTA_TARGETING.
+        self.option_target_call_delta = _f2('OPTION_TARGET_CALL_DELTA', 0.40)
+        self.option_target_put_delta = _f2('OPTION_TARGET_PUT_DELTA', -0.40)
+        self.option_max_delta_distance = _f2('OPTION_MAX_DELTA_DISTANCE', 0.20)
+        self.use_delta_targeting = _flag('USE_DELTA_TARGETING')
+
+        # 3) Cost/EV gate: reject wide spreads and negative post-cost edge using
+        #    cost_model.py. Gated by USE_COST_EV_GATE. MAX_OPTION_SPREAD_PCT is a
+        #    FRACTION (0.15 = 15%); MIN_POST_COST_EDGE is in expectancy %-points.
+        self.use_cost_ev_gate = _flag('USE_COST_EV_GATE')
+        self.min_post_cost_edge = _f2('MIN_POST_COST_EDGE', 0.00)
+        self.max_option_spread_pct = _f2('MAX_OPTION_SPREAD_PCT', 0.15)
+
+        # 4) Option liquidity filter. Gated by USE_OPTION_LIQUIDITY_FILTER. When
+        #    volume/OI are missing it FAILS OPEN unless REQUIRE_OPTION_LIQUIDITY_DATA.
+        self.min_option_volume = _f2('MIN_OPTION_VOLUME', 0)
+        self.min_option_open_interest = _f2('MIN_OPTION_OPEN_INTEREST', 0)
+        self.use_option_liquidity_filter = _flag('USE_OPTION_LIQUIDITY_FILTER')
+        self.require_option_liquidity_data = _flag('REQUIRE_OPTION_LIQUIDITY_DATA')
+
+        # Lazily-built cost model for the EV gate (fail-open if unavailable).
+        self._phase2_cm = None
+
+        # --- Phase 3: direction quality + sizing safety -------------------- #
+        # All OFF by default so default behavior is byte-for-byte unchanged.
+        #  * USE_SKIP_ON_WEAK_SIGNAL: when on, determine_option_strategy may
+        #    return 'skip' (NO_TRADE) instead of a low-conviction default CALL,
+        #    either because the bull/bear tallies are tied (no edge) or because
+        #    fewer than MIN_DIRECTION_SIGNALS total signals fired.
+        #  * USE_NORMALIZED_CONFIDENCE: when on, the conviction used for sizing
+        #    folds in signal margin + total + agreement so a pile of weak or
+        #    duplicated signals can't inflate size; a collapsed (0) confidence
+        #    sizes to 0 contracts (skip). It never *increases* size vs. before.
+        self.use_skip_on_weak_signal = _flag('USE_SKIP_ON_WEAK_SIGNAL')
+        self.min_direction_signals = _i2('MIN_DIRECTION_SIGNALS', 2)
+        self.use_normalized_confidence = _flag('USE_NORMALIZED_CONFIDENCE')
+        # Set by determine_option_strategy when it returns 'skip'; surfaced by
+        # the scheduler and Telegram so the operator sees *why* nothing traded.
+        self.last_skip_reason = None
+
+        # --- Phase 4: portfolio-level options risk controls ---------------- #
+        # All OFF by default so default behavior is byte-for-byte unchanged.
+        #  * USE_PORTFOLIO_GREEK_LIMITS: when on, an aggregate-exposure gate runs
+        #    before the per-trade risk engine and blocks an entry that would push
+        #    the book past a delta/vega/theta/same-direction/per-underlying cap.
+        #    Greeks come from real Alpaca snapshots when available, else from the
+        #    same heuristic fallbacks select_best_option uses. Limits live in
+        #    portfolio_risk.PortfolioLimits (loaded from .env).
+        #  * USE_REALIZED_PNL_KILLSWITCH: when on, the kill-switch / daily-loss
+        #    inputs use *realized* dollar P/L for today (RealizedPnLTracker) instead
+        #    of equity-minus-last_equity, so a transient unrealized drawdown on open
+        #    options can no longer trip the switch. Resets daily by construction.
+        self.portfolio_limits = None
+        try:
+            from portfolio_risk import load_portfolio_limits_from_env
+            self.portfolio_limits = load_portfolio_limits_from_env()
+            if self.portfolio_limits.enabled:
+                print("[PORTFOLIO] Aggregate greek limits active")
+        except Exception as e:
+            print(f"[PORTFOLIO] limits unavailable: {e}")
+        self.use_portfolio_greek_limits = bool(
+            self.portfolio_limits and self.portfolio_limits.enabled)
+        self.use_realized_pnl_killswitch = _flag('USE_REALIZED_PNL_KILLSWITCH')
 
         # Load profit/loss thresholds from .env with defaults
         self.base_stop_loss = float(env_vars.get('BASE_STOP_LOSS', '0.10'))
@@ -166,6 +268,27 @@ class SmartOptionsTrader:
         self.roll_otm_pct = float(env_vars.get('ROLL_OTM_PCT', '0.05'))
         # Upper bound on OTM distance so the roll doesn't buy a worthless lotto.
         self.roll_max_otm_pct = float(env_vars.get('ROLL_MAX_OTM_PCT', '0.20'))
+
+        # --- Startup mode banner (Phase 4.5) ------------------------------ #
+        # One line summarizing every Oracle mode flag so the operator can see at
+        # a glance which optional gates are active for this process. Purely a log
+        # line — it reads already-resolved flags and changes no behavior.
+        try:
+            _mode_flags = {
+                'USE_REAL_GREEKS': self.use_real_greeks,
+                'USE_DTE_TARGETING': self.use_dte_targeting,
+                'USE_DELTA_TARGETING': self.use_delta_targeting,
+                'USE_COST_EV_GATE': self.use_cost_ev_gate,
+                'USE_OPTION_LIQUIDITY_FILTER': self.use_option_liquidity_filter,
+                'USE_SKIP_ON_WEAK_SIGNAL': self.use_skip_on_weak_signal,
+                'USE_NORMALIZED_CONFIDENCE': self.use_normalized_confidence,
+                'USE_PORTFOLIO_GREEK_LIMITS': self.use_portfolio_greek_limits,
+                'USE_REALIZED_PNL_KILLSWITCH': self.use_realized_pnl_killswitch,
+            }
+            print("[ORACLE] mode flags: " + " ".join(
+                f"{k}={'on' if v else 'off'}" for k, v in _mode_flags.items()))
+        except Exception:
+            pass
 
     def load_trading_history(self):
         """Load historical trades for learning"""
@@ -248,6 +371,160 @@ class SmartOptionsTrader:
         parts = [labels.get(b, b) for b in breaches]
         return "; ".join(parts) if parts else (risk_verdict.get("reason") or "blocked")
 
+    @staticmethod
+    def _occ_underlying(symbol: str) -> str:
+        """Extract the underlying root from an OCC option symbol.
+
+        OCC format is ROOT + YYMMDD + C/P + 8-digit strike, i.e. the trailing 15
+        characters encode date+type+strike. Returns the uppercased root, or the
+        uppercased symbol unchanged if it doesn't look like an OCC option.
+        """
+        s = (symbol or "").upper()
+        if len(s) > 15 and s[-15:-8] and s[-9] in ("C", "P") and s[-8:].isdigit():
+            return s[:-15]
+        return s
+
+    @staticmethod
+    def _occ_parse(symbol: str):
+        """Parse an OCC option symbol -> (underlying, 'call'/'put', strike).
+
+        Returns (underlying, None, None) when the symbol isn't a parseable OCC
+        option. Pure; no network. Strike is the 8-digit field / 1000.
+        """
+        s = (symbol or "").upper()
+        if len(s) > 15 and s[-15:-8] and s[-9] in ("C", "P") and s[-8:].isdigit():
+            underlying = s[:-15]
+            opt_type = "call" if s[-9] == "C" else "put"
+            try:
+                strike = int(s[-8:]) / 1000.0
+            except ValueError:
+                strike = None
+            return underlying, opt_type, strike
+        return s, None, None
+
+    def _fallback_greeks(self, opt_type, strike, underlying_price):
+        """Heuristic per-contract greeks when a real snapshot is unavailable.
+
+        Mirrors the delta heuristic and static vega/theta fallbacks used by
+        select_best_option so the portfolio aggregate degrades gracefully
+        (Phase 4 requirement 3). Returns magnitudes; sign handling lives in
+        portfolio_risk. Never raises.
+        """
+        delta = 0.5
+        try:
+            if strike and underlying_price:
+                if opt_type == "call":
+                    delta = min(0.95, max(0.05,
+                        (underlying_price - strike) / underlying_price * 0.7 + 0.5))
+                else:
+                    delta = abs(min(-0.05, max(-0.95,
+                        (strike - underlying_price) / underlying_price * 0.7 - 0.5)))
+        except Exception:
+            delta = 0.5
+        return {"delta": abs(delta), "vega": 0.10, "theta": 0.05}
+
+    def _position_greeks(self, positions):
+        """Build portfolio_risk-shaped position dicts from live Alpaca positions.
+
+        For each option position: parse the OCC symbol for underlying/type/strike,
+        read |qty|, and attach per-contract greeks — REAL snapshot greeks when
+        available (delta/vega/theta), otherwise heuristic fallbacks. Fail-open:
+        any per-position error is skipped rather than aborting the whole gate.
+        Returns a list of {underlying, direction, qty, delta, vega, theta}.
+        """
+        out = []
+        for p in positions or []:
+            try:
+                sym = p.get("symbol", "")
+                underlying, opt_type, strike = self._occ_parse(sym)
+                if opt_type is None:
+                    continue  # not an option position
+                try:
+                    qty = abs(int(float(p.get("qty", 0) or 0)))
+                except (TypeError, ValueError):
+                    qty = 0
+                if qty <= 0:
+                    continue
+
+                greeks = {}
+                if not p.get("mock", False):
+                    try:
+                        greeks = self.get_option_snapshot(sym) or {}
+                    except Exception:
+                        greeks = {}
+
+                have = (isinstance(greeks.get("delta"), (int, float)) and
+                        isinstance(greeks.get("vega"), (int, float)) and
+                        isinstance(greeks.get("theta"), (int, float)))
+                if have:
+                    g = {"delta": greeks["delta"], "vega": greeks["vega"],
+                         "theta": greeks["theta"]}
+                else:
+                    price = None
+                    try:
+                        price = self.get_current_price(underlying)
+                    except Exception:
+                        price = None
+                    g = self._fallback_greeks(opt_type, strike, price)
+
+                out.append({
+                    "underlying": underlying,
+                    "direction": opt_type,
+                    "qty": qty,
+                    "delta": g["delta"],
+                    "vega": g["vega"],
+                    "theta": g["theta"],
+                })
+            except Exception:
+                continue
+        return out
+
+    def _portfolio_greek_check(self, option, order_quantity):
+        """Phase 4 aggregate-exposure gate (opt-in via USE_PORTFOLIO_GREEK_LIMITS).
+
+        Projects this candidate onto the current book and tests the portfolio
+        delta/vega/theta and same-direction/per-underlying caps. Returns a
+        portfolio_risk verdict dict ({allowed, reason, breaches, current_*,
+        projected_*}). Logs the requested current/projected greeks plus the
+        decision.
+
+        Fail policy: a real cap *breach* blocks (allowed=False). Any computation
+        error (missing greeks, snapshot/network hiccup) FAILS OPEN — consistent
+        with greeks being advisory/fallback data — so the authoritative
+        capital-protection block remains the fail-closed risk engine that runs
+        immediately after. A no-op (allowed=True) is returned when disabled.
+        """
+        if not getattr(self, "use_portfolio_greek_limits", False) or not self.portfolio_limits:
+            return {"allowed": True, "reason": "disabled", "breaches": []}
+        try:
+            from portfolio_risk import check_portfolio_limits, summarize_for_log
+            positions = self.get_positions()
+            current = self._position_greeks(positions if isinstance(positions, list) else [])
+            new_trade = {
+                "underlying": self._occ_underlying(option.get("symbol", ""))
+                              or (self.ticker or "").upper(),
+                "direction": option.get("type", "call"),
+                "qty": int(order_quantity or 1),
+                "delta": option.get("delta", 0.0),
+                "vega": option.get("vega", 0.0),
+                "theta": option.get("theta", 0.0),
+            }
+            verdict = check_portfolio_limits(current, new_trade, self.portfolio_limits)
+            print(f"[PORTFOLIO] {summarize_for_log(verdict)}")
+            print(f"[PORTFOLIO] same_direction={verdict['same_direction']}->"
+                  f"{verdict['projected_same_direction']} "
+                  f"per_underlying={verdict['per_underlying']}->"
+                  f"{verdict['projected_per_underlying']}")
+            if verdict["allowed"]:
+                print("[PORTFOLIO] decision: OK")
+            else:
+                print(f"[PORTFOLIO] decision: BLOCKED reason={verdict['reason']}")
+            return verdict
+        except Exception as e:
+            # Fail-open on computation error (the fail-closed risk engine still runs).
+            print(f"[PORTFOLIO] check error (ignored, failing open): {e}")
+            return {"allowed": True, "reason": f"error:{type(e).__name__}", "breaches": []}
+
     def _risk_check(self, trade_cost, qty: int = 1, may_day_trade: bool = True):
         """Run the fail-closed risk engine before an order is placed.
 
@@ -268,12 +545,41 @@ class SmartOptionsTrader:
             positions = self.get_positions()
             open_positions = len(positions) if isinstance(positions, list) else None
 
-            acct = self.get_account() or {}
-            equity = acct.get('equity')
-            last_equity = acct.get('last_equity')
+            # Per-underlying concentration cap input (opt-in via
+            # MAX_POSITIONS_PER_UNDERLYING). Count open option positions whose
+            # OCC symbol resolves to the current underlying. Fail-open: if this
+            # can't be computed, pass None so the cap is simply skipped.
+            positions_for_underlying = None
+            try:
+                if isinstance(positions, list) and self.ticker:
+                    positions_for_underlying = sum(
+                        1 for p in positions
+                        if self._occ_underlying(p.get('symbol', '')) == self.ticker.upper()
+                    )
+            except Exception:
+                positions_for_underlying = None
+
+            # Today's P/L for the kill-switch / daily-loss gate.
+            #  * Default (USE_REALIZED_PNL_KILLSWITCH off): legacy behavior =
+            #    account equity - last_equity. This includes the *unrealized*
+            #    mark of every open option, so a transient intraday drawdown on
+            #    open contracts can trip the switch.
+            #  * Phase 4 fix (flag on): use *realized* dollar P/L for today only
+            #    (RealizedPnLTracker, resets daily). Unrealized option marks no
+            #    longer trip the switch; closed-trade losses still do.
             realized_pnl_today = None
-            if equity is not None and last_equity is not None:
-                realized_pnl_today = float(equity) - float(last_equity)
+            if getattr(self, 'use_realized_pnl_killswitch', False):
+                try:
+                    from realized_pnl_tracker import RealizedPnLTracker
+                    realized_pnl_today = RealizedPnLTracker().get_today_realized()
+                except Exception:
+                    realized_pnl_today = None
+            else:
+                acct = self.get_account() or {}
+                equity = acct.get('equity')
+                last_equity = acct.get('last_equity')
+                if equity is not None and last_equity is not None:
+                    realized_pnl_today = float(equity) - float(last_equity)
 
             pdt_remaining = None
             try:
@@ -288,6 +594,7 @@ class SmartOptionsTrader:
                 open_positions=open_positions,
                 pdt_remaining=pdt_remaining,
                 may_day_trade=may_day_trade,
+                positions_for_underlying=positions_for_underlying,
             )
         except Exception as e:
             return {"allowed": False,
@@ -697,6 +1004,77 @@ class SmartOptionsTrader:
             print(f"[OPTION PRICE ERROR] {symbol}: {e}")
             return None
 
+    def get_option_snapshot(self, symbol):
+        """Fetch real Greeks + implied volatility for one contract (fail-open).
+
+        Hits Alpaca's options snapshots endpoint and returns a dict containing
+        only the fields actually present, among {delta, gamma, theta, vega, iv}.
+        Returns {} when the snapshot, greeks, or IV are unavailable (e.g. on the
+        indicative feed, for some 0DTE contracts, or on any error) so callers can
+        fall back to heuristic values. Never raises.
+        """
+        try:
+            response = requests.get(
+                f"{self.data_url}/v1beta1/options/snapshots",
+                headers=self.headers,
+                params={'symbols': symbol, 'feed': 'indicative'},
+            )
+            if response.status_code != 200:
+                return {}
+            data = response.json() or {}
+            snap = (data.get('snapshots') or {}).get(symbol) or {}
+            return self._parse_snapshot_greeks(snap)
+        except Exception as e:
+            print(f"[GREEKS ERROR] {symbol}: {e}")
+            return {}
+
+    @staticmethod
+    def _parse_snapshot_greeks(snapshot: Dict) -> Dict:
+        """Pure parser: extract {delta,gamma,theta,vega,iv} from a snapshot dict.
+
+        Alpaca's snapshot carries a `greeks` object (delta/gamma/theta/vega/rho)
+        and a top-level `impliedVolatility`. Only numeric, present values are
+        returned; missing/non-numeric fields are omitted so the caller keeps its
+        fallback. No network, fully unit-testable.
+        """
+        out: Dict = {}
+        if not isinstance(snapshot, dict):
+            return out
+        greeks = snapshot.get('greeks') or {}
+        if isinstance(greeks, dict):
+            for src, dst in (('delta', 'delta'), ('gamma', 'gamma'),
+                             ('theta', 'theta'), ('vega', 'vega')):
+                val = greeks.get(src)
+                if isinstance(val, (int, float)):
+                    out[dst] = float(val)
+        iv = snapshot.get('impliedVolatility')
+        if isinstance(iv, (int, float)):
+            out['iv'] = float(iv)
+        return out
+
+    @staticmethod
+    def _apply_real_greeks(option_data: Dict, snapshot_greeks: Dict) -> str:
+        """Override fallback Greeks/IV in-place with real snapshot values.
+
+        For each of delta/gamma/theta/vega/iv, uses the real value when present
+        in `snapshot_greeks`, otherwise leaves the existing fallback untouched.
+        Returns a human-readable log string tagging each field real/fallback.
+        Pure (no network); the heart of the Phase 1 wiring and unit-tested.
+        """
+        fields = ('delta', 'gamma', 'theta', 'vega', 'iv')
+        parts = []
+        snapshot_greeks = snapshot_greeks or {}
+        for f in fields:
+            if f in snapshot_greeks and isinstance(snapshot_greeks[f], (int, float)):
+                option_data[f] = float(snapshot_greeks[f])
+                src = 'real'
+            else:
+                src = 'fallback'
+            val = option_data.get(f)
+            parts.append(f"{f}={val:.4f}({src})" if isinstance(val, (int, float))
+                         else f"{f}=None({src})")
+        return " ".join(parts)
+
     def calculate_option_score(self, option: Dict) -> float:
         """Calculate option score using ML-enhanced model"""
         base_score = 0
@@ -838,24 +1216,162 @@ class SmartOptionsTrader:
             except Exception as e:
                 print(f"[NEWS] direction vote error (ignored): {e}")
 
+        # Phase 3 diagnostics (always computed; only acted on behind flags so
+        # default behavior is preserved).
+        total_signals = bullish_signals + bearish_signals
+        signal_margin = abs(bullish_signals - bearish_signals)
+        self.last_skip_reason = None
+
         # Make decision
         if bearish_signals > bullish_signals and bearish_signals >= 2:
             strategy = 'put'
         else:
             strategy = 'call'  # Default to calls unless strong bearish signals
 
-        # Conviction = the winning side's signal count. A default 'call' with no
-        # supporting signals has strength 0 (lowest conviction). Used downstream
-        # for confidence-based position sizing.
-        self.last_signal_strength = bearish_signals if strategy == 'put' else bullish_signals
+        # Phase 3 (1): weak/flat-signal SKIP. OFF by default. When enabled, refuse
+        # to trade rather than default to a low-conviction CALL when either too
+        # few directional signals fired or the bull/bear tallies are tied.
+        if self.use_skip_on_weak_signal:
+            if total_signals < self.min_direction_signals:
+                self.last_skip_reason = (
+                    f"below_min_signals ({total_signals} < {self.min_direction_signals})")
+                strategy = 'skip'
+            elif bullish_signals == bearish_signals:
+                self.last_skip_reason = (
+                    f"flat_signal (bull {bullish_signals} == bear {bearish_signals})")
+                strategy = 'skip'
 
+        # Phase 3 (2): conviction/confidence used downstream for sizing. Default
+        # (flag off) is the winning side's signal count — identical to before.
+        # Normalized mode discounts the margin by the agreement ratio so weak or
+        # duplicated signals can't inflate size; a tie/empty tally yields 0.
+        if strategy == 'skip':
+            confidence = 0
+        elif self.use_normalized_confidence:
+            confidence = self._normalized_confidence(
+                bullish_signals, bearish_signals, strategy)
+        else:
+            confidence = bearish_signals if strategy == 'put' else bullish_signals
+        self.last_signal_strength = confidence
+
+        # Phase 3 (5): structured logging of the decision inputs.
         print(f"[STRATEGY] Analysis for {symbol}:")
         print(f"[STRATEGY] Momentum: {momentum:.3f}, Volatility: {volatility:.1%}")
         print(f"[STRATEGY] Short trend: {short_trend:.2%}, Medium trend: {medium_trend:.2%}")
-        print(f"[STRATEGY] Bearish signals: {bearish_signals}, Bullish signals: {bullish_signals}")
-        print(f"[STRATEGY] Decision: {strategy.upper()} options (conviction {self.last_signal_strength})")
+        print(f"[STRATEGY] bullish_score={bullish_signals} bearish_score={bearish_signals} "
+              f"total_signals={total_signals} signal_margin={signal_margin}")
+        print(f"[STRATEGY] confidence={confidence} strategy={strategy.upper()}")
+        if strategy == 'skip':
+            print(f"[STRATEGY] skip_reason={self.last_skip_reason}")
 
         return strategy
+
+    def _normalized_confidence(self, bullish_signals, bearish_signals, strategy) -> int:
+        """Phase 3 normalized confidence (gated by USE_NORMALIZED_CONFIDENCE).
+
+        Returns an integer strength on the SAME scale _confidence_to_quantity
+        already consumes, so downstream sizing is unchanged in shape. It folds:
+          * signal_margin   = abs(bull - bear)   — the directional lead
+          * total_signals   = bull + bear        — how much evidence exists
+          * agreement_ratio = winning / total    — how one-sided it is
+        The score is the margin discounted by the agreement ratio (rounded), so
+        e.g. 4-vs-3 (margin 1, agreement 0.57) collapses to 1 instead of looking
+        like very-high conviction. It is capped at the raw winning-side count so
+        normalization can only *lower* (never raise) size vs. current behavior.
+        A tied/empty tally returns 0 (→ size 0 / skip).
+        """
+        total = bullish_signals + bearish_signals
+        if total <= 0:
+            return 0
+        margin = abs(bullish_signals - bearish_signals)
+        if margin <= 0:
+            return 0
+        agreement = max(bullish_signals, bearish_signals) / total  # 0.5 .. 1.0
+        raw = bearish_signals if strategy == 'put' else bullish_signals
+        eff = int(margin * agreement + 0.5)  # round half up
+        return max(0, min(eff, raw))
+
+    def _cost_model(self):
+        """Lazily build (and cache) the cost model used by the EV gate."""
+        if self._phase2_cm is None:
+            from cost_model import CostModel, load_cost_config_from_env
+            self._phase2_cm = CostModel(load_cost_config_from_env())
+        return self._phase2_cm
+
+    def _dte_distance_mult(self, dte) -> float:
+        """Score multiplier in [0.8, 1.0]: 1.0 at OPTION_TARGET_DTE, decaying
+        with distance across the configured DTE window."""
+        target = self.option_target_dte
+        span = max(self.option_max_dte - target, target - self.option_min_dte, 1)
+        dist = abs(dte - target) / span
+        return max(0.8, 1.0 - 0.2 * min(dist, 1.0))
+
+    def _delta_distance_mult(self, delta, target) -> float:
+        """Score multiplier in [0.8, 1.0]: 1.0 at the target delta, decaying with
+        distance across OPTION_MAX_DELTA_DISTANCE."""
+        md = self.option_max_delta_distance or 0.0
+        if md <= 0:
+            return 1.0
+        dist = abs(delta - target) / md
+        return max(0.8, 1.0 - 0.2 * min(dist, 1.0))
+
+    def evaluate_contract_phase2(self, *, dte, delta, has_real_delta, strategy,
+                                 bid, ask, volume, open_interest,
+                                 volume_present=True, oi_present=True):
+        """Phase 2 advisory contract gate (pure; no network).
+
+        Returns (reject_reason, score_mult). reject_reason is None when the
+        contract passes; otherwise one of: bad_dte, bad_delta, wide_spread,
+        negative_ev, low_volume, low_open_interest, missing_liquidity_data.
+        score_mult is a preference multiplier (1.0 = no nudge). Every sub-gate is
+        OFF unless its env flag is set, so with defaults this returns (None, 1.0)
+        and selection is unchanged.
+        """
+        score_mult = 1.0
+        strategy = (strategy or 'call').lower()
+
+        # 1) DTE window + target preference.
+        if self.use_dte_targeting and dte is not None:
+            if dte < self.option_min_dte or dte > self.option_max_dte:
+                return ('bad_dte', 1.0)
+            score_mult *= self._dte_distance_mult(dte)
+
+        # 2) Delta targeting (only with a REAL delta; missing -> fall back).
+        if self.use_delta_targeting and has_real_delta and delta is not None:
+            target = (self.option_target_call_delta if strategy == 'call'
+                      else self.option_target_put_delta)
+            if abs(delta - target) > self.option_max_delta_distance:
+                return ('bad_delta', 1.0)
+            score_mult *= self._delta_distance_mult(delta, target)
+
+        # 3) Cost / EV gate. Fail-open on any computation error.
+        if self.use_cost_ev_gate:
+            try:
+                b = float(bid or 0.0)
+                a = float(ask or 0.0)
+                spread_frac = (a - b) / a if a > 0 else 1.0
+                if spread_frac > self.max_option_spread_pct:
+                    return ('wide_spread', 1.0)
+                gross_target_pct = self.base_take_profit * 100.0
+                edge = self._cost_model().adjusted_expectancy(
+                    gross_target_pct, b, a, qty=1, hold_days=max(0, int(dte or 0)))
+                if edge < self.min_post_cost_edge:
+                    return ('negative_ev', 1.0)
+            except Exception:
+                pass  # never block a trade on a broken cost calc
+
+        # 4) Liquidity thresholds.
+        if self.use_option_liquidity_filter:
+            if not volume_present or not oi_present:
+                if self.require_option_liquidity_data:
+                    return ('missing_liquidity_data', 1.0)
+            else:
+                if float(volume or 0) < self.min_option_volume:
+                    return ('low_volume', 1.0)
+                if float(open_interest or 0) < self.min_option_open_interest:
+                    return ('low_open_interest', 1.0)
+
+        return (None, score_mult)
 
     def select_best_option(self, contracts, current_price, strategy=None):
         """Select best option using enhanced ML scoring with call/put intelligence.
@@ -924,10 +1440,21 @@ class SmartOptionsTrader:
             # Validate that this option actually exists by checking if we can get a quote
             option_symbol = contract['symbol']
 
+            # Days-to-expiration for the Phase 2 DTE gate (None if unparseable).
+            try:
+                dte = (datetime.strptime(expiration, '%Y-%m-%d').date()
+                       - datetime.now().date()).days
+            except Exception:
+                dte = None
+
             # Get pricing data - either from API or mock Black-Scholes calculation
             ask_price = 0
             bid_price = 0
             spread = 0
+            # Track whether liquidity data was actually supplied (vs defaulted)
+            # so the Phase 2 liquidity filter can fail-open on missing data.
+            volume_present = contract.get('volume') is not None
+            oi_present = contract.get('open_interest') is not None
             try:
                 volume = float(contract.get('volume', 0) or 0)
             except (TypeError, ValueError):
@@ -973,7 +1500,9 @@ class SmartOptionsTrader:
                 print(f"[SKIP] ${strike:.2f} {contract_type.upper()} exp {expiration} - cost ${contract_cost:.2f} exceeds budget ${self.max_budget_per_trade:.2f}")
                 continue
 
-            # Calculate option metrics
+            # Calculate option metrics. delta/gamma/theta/vega/iv start as
+            # heuristic fallbacks; when USE_REAL_GREEKS is on they're overridden
+            # below with live Alpaca snapshot values where available.
             option_data = {
                 'symbol': contract['symbol'],
                 'underlying': self.ticker,
@@ -983,6 +1512,7 @@ class SmartOptionsTrader:
                 'delta': delta,
                 'gamma': 0.01,
                 'theta': -0.05,
+                'vega': 0.10,
                 'iv': 0.25,
                 'moneyness': abs(moneyness),
                 'mock': contract.get('mock', False),
@@ -993,6 +1523,31 @@ class SmartOptionsTrader:
                 'open_interest': open_interest
             }
 
+            # Wire real Greeks/IV from the Alpaca options snapshot (opt-in,
+            # fail-open). Fetched when USE_REAL_GREEKS overrides scoring inputs OR
+            # when USE_DELTA_TARGETING needs a real delta to gate on. Only the
+            # fields the snapshot returns are used; missing ones keep fallbacks.
+            snap_greeks = {}
+            if (self.use_real_greeks or self.use_delta_targeting) and not contract.get('mock', False):
+                snap_greeks = self.get_option_snapshot(option_symbol)
+                if self.use_real_greeks:
+                    log = self._apply_real_greeks(option_data, snap_greeks)
+                    print(f"[GREEKS] {self.ticker} {option_symbol} {log}")
+            has_real_delta = isinstance(snap_greeks.get('delta'), (int, float))
+            gate_delta = snap_greeks['delta'] if has_real_delta else option_data['delta']
+
+            # Phase 2 contract gate (DTE / delta / cost-EV / liquidity). All
+            # sub-gates are off by default -> (None, 1.0). A rejection logs the
+            # reason and skips the contract; otherwise score_mult nudges ranking.
+            reject_reason, phase2_mult = self.evaluate_contract_phase2(
+                dte=dte, delta=gate_delta, has_real_delta=has_real_delta,
+                strategy=strategy, bid=bid_price, ask=ask_price,
+                volume=volume, open_interest=open_interest,
+                volume_present=volume_present, oi_present=oi_present)
+            if reject_reason:
+                print(f"[REJECT] {option_symbol} reason={reject_reason}")
+                continue
+
             # Calculate base score
             score = self.calculate_option_score(option_data)
 
@@ -1002,6 +1557,9 @@ class SmartOptionsTrader:
 
             # News ranking nudge (fail-open; 1.0 when news unavailable)
             score *= news_mult
+
+            # Phase 2 target preference (1.0 unless DTE/delta targeting is on)
+            score *= phase2_mult
 
             # Add liquidity scoring (critical for real trading)
             if not contract.get('mock', False):
@@ -1051,11 +1609,17 @@ class SmartOptionsTrader:
         very high (>= conf_very_high_signals) -> 3 contracts
         high      (>= conf_high_signals)      -> 2 contracts
         regular   (otherwise)                 -> 1 contract
+
+        Phase 3 sizing safety: only when USE_NORMALIZED_CONFIDENCE is on can a
+        collapsed confidence (<= 0) size to 0 contracts (skip). In default mode
+        the floor stays at 1, so existing behavior is unchanged.
         """
         try:
             s = int(strength)
         except (TypeError, ValueError):
             return 1
+        if self.use_normalized_confidence and s <= 0:
+            return 0
         if s >= self.conf_very_high_signals:
             return 3
         if s >= self.conf_high_signals:
@@ -1077,9 +1641,17 @@ class SmartOptionsTrader:
         else:
             strength = option.get('confidence', self.last_signal_strength)
             order_quantity = self._confidence_to_quantity(strength)
-            tier = {3: "very high", 2: "high", 1: "regular"}.get(order_quantity, "regular")
+            tier = {3: "very high", 2: "high", 1: "regular", 0: "skip"}.get(order_quantity, "regular")
             print(f"[SIZE] conviction {strength} -> {order_quantity} contract(s) ({tier})")
         self.last_block_reason = None
+
+        # Phase 3 sizing safety: a confidence that collapses to 0 contracts is a
+        # NO_TRADE — skip rather than place a non-positive-size order. Only
+        # reachable with USE_NORMALIZED_CONFIDENCE on (default sizing floors at 1).
+        if order_quantity is not None and order_quantity <= 0:
+            print(f"[SIZE] confidence too weak to size ({order_quantity}); skipping entry")
+            self.last_block_reason = "signal confidence too weak to size a position"
+            return None
 
         # Duplicate-order guard: never stack a second position/order on the same
         # contract. Fail-closed if broker positions/orders can't be verified.
@@ -1196,6 +1768,20 @@ class SmartOptionsTrader:
                           f"contract(s), cost: ${total_cost:.2f}")
             except Exception as e:
                 print(f"[NEWS] gate error (ignored): {e}")
+
+        # ---- Phase 4: portfolio-level greek gate (opt-in, fail-open) ----------
+        # Runs AFTER sizing so the projection uses the final contract count, and
+        # BEFORE the fail-closed risk engine. Blocks an entry that would push the
+        # aggregate book past a delta/vega/theta/same-direction/per-underlying
+        # cap. OFF by default -> no-op (allowed) and behavior is unchanged.
+        if getattr(self, 'use_portfolio_greek_limits', False):
+            pf_verdict = self._portfolio_greek_check(option, order_quantity)
+            if not pf_verdict.get('allowed', True):
+                print(f"[PORTFOLIO] BLOCKED: {pf_verdict.get('reason')}")
+                self.last_block_reason = (
+                    "portfolio greek limit: " + str(pf_verdict.get('reason'))
+                )
+                return None
 
         # ---- Hard risk gate (fail-closed; last line of capital protection) ----
         # Runs AFTER budget/sentiment sizing so trade_cost is final, and BEFORE
@@ -1453,44 +2039,60 @@ class SmartOptionsTrader:
                 trade['partial_close_done'] = True
                 print(f"[PARTIAL CLOSE] Closed 40% at {pnl_percent:.1f}% (target: {partial_threshold:.1f}%)")
 
-            # Check for dynamic stop loss
-            elif pnl_percent <= -stop_loss_percent:
-                print(f"[STOP LOSS] Dynamic stop at {stop_loss_percent:.1f}%")
-                self.close_position(trade, position, 'dynamic_stop_loss')
-                self.record_trade_outcome(trade, 'dynamic_stop_loss', pnl_percent)
-                continue
+            else:
+                # Phase 5: the stop / take-profit / trailing-stop decision is now
+                # made by the shared exit manager so the Telegram monitor enforces
+                # the SAME logic. Roll-on-profit, partial close, and the richer
+                # should_exit_dynamically checks stay scheduler-only and keep their
+                # legacy reason codes, so recorded outcomes are byte-identical.
+                # check_expiration=False: the scheduler keeps expiration handling
+                # inside should_exit_dynamically (reason 'dynamic_exit').
+                from exit_manager import evaluate_exit, enforce_exit
+                _levels = {
+                    'stop_loss_percent': stop_loss_percent,
+                    'take_profit_percent': take_profit_percent,
+                    'trailing_stop_distance': trailing_distance,
+                }
+                _decision = evaluate_exit(
+                    trade, current_price, _levels,
+                    roll_enabled=self.roll_enabled, check_expiration=False)
 
-            # Roll-on-profit: at ROLL_TRIGGER_PCT (default MAX_TAKE_PROFIT) close
-            # the winner and re-enter a cheaper, further-OTM contract on the same
-            # underlying/direction. Checked before the dynamic full-exit so the
-            # winner can run to the roll trigger. Only active when roll_enabled.
-            elif self.roll_enabled and pnl_percent >= self.roll_trigger_pct:
-                print(f"[ROLL] Trigger at {pnl_percent:.1f}% "
-                      f"(>= {self.roll_trigger_pct:.1f}%)")
-                if self.roll_position(trade, position, pnl_percent):
-                    self.record_trade_outcome(trade, 'roll_take_profit', pnl_percent)
+                # Stop loss.
+                if _decision.action == 'stop_loss':
+                    print(f"[STOP LOSS] Dynamic stop at {stop_loss_percent:.1f}%")
+                    enforce_exit(self, trade, position, 'dynamic_stop_loss',
+                                 pnl_percent, 'scheduler', current_price)
                     continue
-                # No re-entry target found -> fall back to a flat take-profit.
-                self.close_position(trade, position, 'roll_failed_take_profit')
-                self.record_trade_outcome(trade, 'roll_failed_take_profit', pnl_percent)
-                continue
 
-            # Check for dynamic take profit (full exit). When rolling is enabled
-            # we intentionally let winners run to roll_trigger_pct instead of
-            # flat-closing at the lower dynamic target.
-            elif pnl_percent >= take_profit_percent and not self.roll_enabled:
-                print(f"[TAKE PROFIT] Dynamic target at {take_profit_percent:.1f}%")
-                self.close_position(trade, position, 'dynamic_take_profit')
-                self.record_trade_outcome(trade, 'dynamic_take_profit', pnl_percent)
-                continue
+                # Roll-on-profit: at ROLL_TRIGGER_PCT (default MAX_TAKE_PROFIT)
+                # close the winner and re-enter a cheaper, further-OTM contract on
+                # the same underlying/direction. Checked before the dynamic
+                # full-exit so the winner can run to the roll trigger. Only active
+                # when roll_enabled.
+                elif self.roll_enabled and pnl_percent >= self.roll_trigger_pct:
+                    print(f"[ROLL] Trigger at {pnl_percent:.1f}% "
+                          f"(>= {self.roll_trigger_pct:.1f}%)")
+                    if self.roll_position(trade, position, pnl_percent):
+                        self.record_trade_outcome(trade, 'roll_take_profit', pnl_percent)
+                        continue
+                    # No re-entry target found -> fall back to a flat take-profit.
+                    self.close_position(trade, position, 'roll_failed_take_profit')
+                    self.record_trade_outcome(trade, 'roll_failed_take_profit', pnl_percent)
+                    continue
 
-            # Check dynamic trailing stop
-            elif trade['trailing_stop_active']:
-                trailing_stop_price = trade['highest_price'] * (1 - trailing_distance)
-                if current_price <= trailing_stop_price:
+                # Dynamic take profit (full exit). When rolling is enabled the
+                # exit manager suppresses this so winners run to roll_trigger_pct.
+                elif _decision.action == 'take_profit':
+                    print(f"[TAKE PROFIT] Dynamic target at {take_profit_percent:.1f}%")
+                    enforce_exit(self, trade, position, 'dynamic_take_profit',
+                                 pnl_percent, 'scheduler', current_price)
+                    continue
+
+                # Dynamic trailing stop.
+                elif _decision.action == 'trailing_stop':
                     print(f"[TRAILING STOP] Dynamic trailing at {trailing_distance:.1%}")
-                    self.close_position(trade, position, 'dynamic_trailing_stop')
-                    self.record_trade_outcome(trade, 'dynamic_trailing_stop', pnl_percent)
+                    enforce_exit(self, trade, position, 'dynamic_trailing_stop',
+                                 pnl_percent, 'scheduler', current_price)
                     continue
 
             # Dynamic exit based on market conditions
@@ -1814,6 +2416,20 @@ class SmartOptionsTrader:
         self.save_trading_history()
         self.save_ml_model()
 
+        # Phase 4: accumulate realized dollar P/L for today's kill-switch input.
+        # Side-effect only (writes realized_pnl_log.json); it never blocks a
+        # trade and only feeds the switch when USE_REALIZED_PNL_KILLSWITCH is on.
+        # Dollar P/L = entry notional * pnl_percent. Never raises.
+        try:
+            entry_price = trade.get('entry_price')
+            qty = trade.get('quantity', 1) or 1
+            if entry_price:
+                realized_dollars = float(entry_price) * 100.0 * float(qty) * (float(pnl_percent) / 100.0)
+                from realized_pnl_tracker import RealizedPnLTracker
+                RealizedPnLTracker().add_realized(realized_dollars, trade.get('symbol'))
+        except Exception as e:
+            print(f"[REALIZED] record skipped: {e}")
+
         # Shadow recorder owns the close when a decision_id is present: attach
         # the NET-of-cost outcome to the same id and update the agent. No-op for
         # legacy trades without a decision_id.
@@ -2030,6 +2646,181 @@ class SmartOptionsTrader:
             return self.generate_mock_option_contracts(ticker)
 
         return all_contracts
+
+    # ----------------------------------------------------------------------- #
+    # Phase 6A: defined-risk spread PROPOSALS (simulation only, never trades)
+    # ----------------------------------------------------------------------- #
+    def _spread_leg_from_contract(self, contract: Dict, action: str):
+        """Build a spread_builder.SpreadLeg from a chain contract + a live quote.
+
+        Pulls bid/ask from the options-quotes endpoint; a missing/zero quote is
+        passed through as None so the builder's `missing_quote` gate fires. OI /
+        volume are taken from the contract when present (else None -> liquidity
+        gate fails open). No orders, ever.
+        """
+        from spread_builder import SpreadLeg
+
+        def _f(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+
+        sym = contract.get('symbol', '')
+        quote = self.get_option_price(sym) or {}
+        bid = quote.get('bid')
+        ask = quote.get('ask')
+        return SpreadLeg(
+            action=action, option_type=contract.get('type', ''),
+            strike=_f(contract.get('strike_price')) or 0.0,
+            bid=bid if (bid and bid > 0) else None,
+            ask=ask if (ask and ask > 0) else None,
+            symbol=sym, expiration=contract.get('expiration_date', ''),
+            open_interest=_f(contract.get('open_interest')),
+            volume=_f(contract.get('volume')),
+        )
+
+    def propose_spread(self, ticker: str = None, config=None):
+        """Build the best defined-risk spread PROPOSAL for ``ticker`` (no orders).
+
+        Fully fail-open: any error/empty data -> a `no_trade` proposal whose
+        reason names the cause. Steps:
+          1. price + IV/HV -> volatility state; momentum -> trend.
+          2. select_spread_strategy(vol_state, trend) -> strategy (or no_trade).
+          3. snap target strikes to the nearest available, fetch per-leg quotes.
+          4. spread_builder.build_spread applies all hard safety rejections.
+          5. log the [SPREAD_PROPOSAL] block and return the proposal object.
+
+        This method NEVER submits an order; it only returns a proposal object.
+        """
+        from spread_builder import (
+            SpreadConfig, build_spread, classify_volatility, classify_trend,
+            select_spread_strategy, format_proposal_log, no_trade_proposal,
+            BULLISH_PUT_CREDIT_SPREAD, BEARISH_CALL_CREDIT_SPREAD,
+            DEBIT_CALL_SPREAD, DEBIT_PUT_SPREAD, IRON_CONDOR, NO_TRADE,
+        )
+
+        symbol = (ticker or self.ticker or '').upper()
+        cfg = config or SpreadConfig.from_env()
+
+        try:
+            if not symbol:
+                return no_trade_proposal("no_symbol", symbol)
+
+            price = self.get_current_price(symbol)
+            if not price or price <= 0:
+                return no_trade_proposal("no_underlying_price", symbol)
+
+            # 1) Signals: IV/HV -> vol state, momentum -> trend.
+            hv = self.calculate_volatility(symbol)
+            momentum = self.calculate_momentum(symbol)
+            trend = classify_trend(momentum, cfg)
+
+            contracts = self.get_option_contracts(symbol) or []
+            if not contracts:
+                return no_trade_proposal("no_contracts", symbol)
+
+            # Use the nearest available expiration as the structure's expiry.
+            expirations = sorted({c.get('expiration_date') for c in contracts
+                                  if c.get('expiration_date')})
+            if not expirations:
+                return no_trade_proposal("no_contracts", symbol)
+            target_exp = expirations[0]
+            chain = [c for c in contracts if c.get('expiration_date') == target_exp]
+
+            calls = {}
+            puts = {}
+            for c in chain:
+                try:
+                    k = float(c.get('strike_price'))
+                except (TypeError, ValueError):
+                    continue
+                (calls if c.get('type') == 'call' else puts)[k] = c
+            call_strikes = sorted(calls)
+            put_strikes = sorted(puts)
+
+            # IV from an ATM call snapshot (fail-open: None -> vol_state unknown).
+            iv = None
+            if call_strikes:
+                atm = min(call_strikes, key=lambda s: abs(s - price))
+                iv = (self.get_option_snapshot(calls[atm].get('symbol', '')) or {}).get('iv')
+            vol_state = classify_volatility(iv, hv, cfg)
+
+            # 2) Strategy selection (Requirement 4).
+            strategy = select_spread_strategy(vol_state, trend)
+            print(f"[SPREAD] {symbol} price={price:.2f} iv={iv} hv={hv:.3f} "
+                  f"vol_state={vol_state} momentum={momentum:.4f} trend={trend} "
+                  f"-> strategy={strategy}")
+            if strategy == NO_TRADE:
+                return no_trade_proposal(
+                    f"no_edge vol={vol_state} trend={trend}", symbol)
+
+            # 3) Snap target strikes to nearest available, then build legs.
+            def near(strikes, target):
+                return min(strikes, key=lambda s: abs(s - target))
+
+            W = cfg.wing_width
+            legs = []
+            if strategy == BULLISH_PUT_CREDIT_SPREAD:
+                if len(put_strikes) < 2:
+                    return no_trade_proposal("no_strikes", symbol)
+                short_k = near(put_strikes, price * 0.98)
+                long_k = near(put_strikes, short_k - W)
+                if long_k >= short_k:
+                    return no_trade_proposal("no_strikes", symbol)
+                legs = [self._spread_leg_from_contract(puts[short_k], 'sell'),
+                        self._spread_leg_from_contract(puts[long_k], 'buy')]
+            elif strategy == BEARISH_CALL_CREDIT_SPREAD:
+                if len(call_strikes) < 2:
+                    return no_trade_proposal("no_strikes", symbol)
+                short_k = near(call_strikes, price * 1.02)
+                long_k = near(call_strikes, short_k + W)
+                if long_k <= short_k:
+                    return no_trade_proposal("no_strikes", symbol)
+                legs = [self._spread_leg_from_contract(calls[short_k], 'sell'),
+                        self._spread_leg_from_contract(calls[long_k], 'buy')]
+            elif strategy == DEBIT_CALL_SPREAD:
+                if len(call_strikes) < 2:
+                    return no_trade_proposal("no_strikes", symbol)
+                long_k = near(call_strikes, price)
+                short_k = near(call_strikes, long_k + W)
+                if short_k <= long_k:
+                    return no_trade_proposal("no_strikes", symbol)
+                legs = [self._spread_leg_from_contract(calls[long_k], 'buy'),
+                        self._spread_leg_from_contract(calls[short_k], 'sell')]
+            elif strategy == DEBIT_PUT_SPREAD:
+                if len(put_strikes) < 2:
+                    return no_trade_proposal("no_strikes", symbol)
+                long_k = near(put_strikes, price)
+                short_k = near(put_strikes, long_k - W)
+                if short_k >= long_k:
+                    return no_trade_proposal("no_strikes", symbol)
+                legs = [self._spread_leg_from_contract(puts[long_k], 'buy'),
+                        self._spread_leg_from_contract(puts[short_k], 'sell')]
+            elif strategy == IRON_CONDOR:
+                if len(put_strikes) < 2 or len(call_strikes) < 2:
+                    return no_trade_proposal("no_strikes", symbol)
+                short_put_k = near(put_strikes, price * 0.97)
+                long_put_k = near(put_strikes, short_put_k - W)
+                short_call_k = near(call_strikes, price * 1.03)
+                long_call_k = near(call_strikes, short_call_k + W)
+                if not (long_put_k < short_put_k < short_call_k < long_call_k):
+                    return no_trade_proposal("no_strikes", symbol)
+                legs = [self._spread_leg_from_contract(puts[long_put_k], 'buy'),
+                        self._spread_leg_from_contract(puts[short_put_k], 'sell'),
+                        self._spread_leg_from_contract(calls[short_call_k], 'sell'),
+                        self._spread_leg_from_contract(calls[long_call_k], 'buy')]
+            else:
+                return no_trade_proposal("unknown_strategy", symbol)
+
+            # 4) Build + validate (all hard safety gates live in the builder).
+            proposal = build_spread(strategy, legs, cfg, symbol)
+            # 5) Log the required [SPREAD_PROPOSAL] block.
+            print(format_proposal_log(proposal))
+            return proposal
+        except Exception as e:
+            print(f"[SPREAD] propose_spread error (ignored): {e}")
+            return no_trade_proposal(f"error:{type(e).__name__}", symbol)
 
     def calculate_black_scholes_price(self, S: float, K: float, T: float, r: float, sigma: float, option_type: str = 'call') -> float:
         """Calculate option price using Black-Scholes model"""

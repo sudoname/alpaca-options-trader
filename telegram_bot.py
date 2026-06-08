@@ -52,6 +52,20 @@ class TelegramTradingBot:
         self.eod_summary_enabled = env_vars.get(
             'EOD_SUMMARY_ENABLED', '1').strip().lower() not in ('0', 'false', 'no', 'off', '')
 
+        # Phase 5: when USE_UNIFIED_EXIT_MANAGER is on, the position monitor stops
+        # being alert-only and ENFORCES the same stop/take/trailing/expiration
+        # exits as the scheduler (via exit_manager). Default off -> unchanged
+        # alert-only behavior.
+        self.unified_exit_enabled = env_vars.get(
+            'USE_UNIFIED_EXIT_MANAGER', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
+
+        # Phase 6A: when USE_SPREAD_PROPOSALS is on, the /spread_proposal command
+        # returns a defined-risk spread PROPOSAL (simulation only — never places
+        # an order). Default off -> the command replies that the feature is
+        # disabled. No live-execution path exists for spreads.
+        self.spread_proposals_enabled = env_vars.get(
+            'USE_SPREAD_PROPOSALS', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
+
         if not self.bot_token:
             print("\n❌ Missing TELEGRAM_BOT_TOKEN in .env file")
             print("1. Create bot with @BotFather on Telegram")
@@ -189,6 +203,11 @@ class TelegramTradingBot:
             symbol = text.replace('REMOVE_SYMBOL ', '').strip().upper()
             return self.remove_symbol(symbol)
 
+        elif text.startswith('SPREAD_PROPOSAL') or text.startswith('/SPREAD_PROPOSAL'):
+            parts = text.replace('/SPREAD_PROPOSAL', '').replace('SPREAD_PROPOSAL', '', 1).split()
+            symbol = parts[0].strip().upper() if parts else ''
+            return self.get_spread_proposal(symbol, chat_id)
+
         elif text == 'START':
             return self.start_monitoring()
 
@@ -308,6 +327,22 @@ class TelegramTradingBot:
             # reused for the market-hours check and later for execution.
             from smart_trader import SmartOptionsTrader
             alpaca_trader = SmartOptionsTrader(ticker=ticker)
+
+            # Phase 3: honor a weak/flat-signal NO_TRADE from the directional
+            # model. OFF by default (USE_SKIP_ON_WEAK_SIGNAL) -> the extra check
+            # is skipped entirely, so the existing CALL/PUT flow is unchanged.
+            if getattr(alpaca_trader, 'use_skip_on_weak_signal', False):
+                try:
+                    strat = alpaca_trader.determine_option_strategy(ticker)
+                except Exception:
+                    strat = None
+                if str(strat).lower() in ('skip', 'no_trade'):
+                    reason = getattr(alpaca_trader, 'last_skip_reason', None) or 'weak/flat signal'
+                    print(f"[TELEGRAM] {ticker}: NO_TRADE ({reason})")
+                    return (f"⏸️ *{ticker}* — No trade.\n\n"
+                            f"The direction model returned *NO_TRADE* due to a "
+                            f"weak/flat signal ({reason}). Skipping contract "
+                            f"lookup and order.")
 
             print(f"[TELEGRAM] Fetching {recommended_type} option contracts from Alpaca for {ticker}")
             contracts = alpaca_trader.get_option_contracts(ticker)
@@ -1310,6 +1345,59 @@ Total symbols: `{len(self.supported_tickers)}`"""
         self.monitoring = False
         return "⏹️ *Monitoring Stopped*"
 
+    def get_spread_proposal(self, symbol, chat_id=None):
+        """Phase 6A: return a defined-risk spread PROPOSAL for ``symbol``.
+
+        Proposal/simulation ONLY — this never places an order and offers no
+        execution button. Gated by USE_SPREAD_PROPOSALS (default off). Returns
+        the best proposal (or a no_trade with its reason) as a Telegram message.
+        """
+        if not self.spread_proposals_enabled:
+            return ("🧪 Spread proposals are disabled.\n"
+                    "Set `USE_SPREAD_PROPOSALS=true` to enable proposal-only output.")
+
+        symbol = (symbol or '').strip().upper()
+        if not re.fullmatch(r'[A-Z]{1,5}', symbol):
+            return "❌ Invalid symbol. Usage: `SPREAD_PROPOSAL SPY`"
+
+        try:
+            from smart_trader import SmartOptionsTrader
+            trader = SmartOptionsTrader(ticker=symbol)
+            proposal = trader.propose_spread(symbol)
+        except Exception as e:
+            return f"❌ Could not build a spread proposal for `{symbol}`: {e}"
+
+        if proposal is None or not getattr(proposal, 'is_tradeable', False):
+            reason = getattr(proposal, 'reason', 'no_trade') if proposal else 'no_trade'
+            return (f"📭 *No spread proposal for {symbol}*\n"
+                    f"Reason: `{reason}`\n"
+                    f"_(Proposal only — nothing was traded.)_")
+
+        legs = "\n".join(f"   • {l.label()}"
+                         f"{f' @ bid {l.bid:.2f}/ask {l.ask:.2f}' if (l.bid and l.ask) else ''}"
+                         for l in proposal.legs)
+        be = proposal.breakeven
+        if isinstance(be, (list, tuple)):
+            be_str = " / ".join(f"{x:.2f}" for x in be)
+        elif be is None:
+            be_str = "n/a"
+        else:
+            be_str = f"{be:.2f}"
+        kind = "credit" if proposal.is_credit else "debit"
+        return (
+            f"🧪 *Spread Proposal — {symbol}*\n"
+            f"Strategy: `{proposal.strategy_name}`\n"
+            f"Legs:\n{legs}\n"
+            f"Net {kind}: `{abs(proposal.net_credit_or_debit):.2f}`\n"
+            f"Max profit: `${proposal.max_profit:.2f}`\n"
+            f"Max loss: `${proposal.max_loss:.2f}`\n"
+            f"Breakeven: `{be_str}`\n"
+            f"Width: `{proposal.width:g}`\n"
+            f"Est. probability: `{proposal.estimated_probability:.0%}`\n"
+            f"_{proposal.reason}_\n\n"
+            f"_(Proposal only — nothing was traded.)_"
+        )
+
     def get_help_message(self):
         """Get help information"""
         return """🤖 *Options Trading Bot*
@@ -1325,6 +1413,7 @@ Total symbols: `{len(self.supported_tickers)}`"""
 • `LIST_SYMBOLS` - Show supported symbols
 • `ADD_SYMBOL TICKER` - Add new symbol
 • `REMOVE_SYMBOL TICKER` - Remove symbol
+• `SPREAD_PROPOSAL TICKER` - Defined-risk spread idea (proposal only)
 • `START` - Start monitoring
 • `STOP` - Stop monitoring
 
@@ -1426,6 +1515,40 @@ Total symbols: `{len(self.supported_tickers)}`"""
                     current_price = float(position.get('current_price', 0))
                     pnl_pct = float(position.get('unrealized_plpc', 0)) * 100
                     pnl_amount = float(position.get('unrealized_pl', 0))
+
+                    # Phase 5: when enforcement is enabled, the monitor stops being
+                    # alert-only and runs the SAME stop/take/trailing/expiration
+                    # exits as the scheduler (shared exit_manager). On exit it
+                    # closes the position and records the outcome exactly once.
+                    if self.unified_exit_enabled:
+                        try:
+                            from exit_manager import evaluate_exit, enforce_exit
+                            dyn = trader.calculate_dynamic_levels(trade['ticker'])
+                            levels = {
+                                'stop_loss_percent': dyn['stop_loss_percent'] * 100,
+                                'take_profit_percent': dyn['take_profit_percent'] * 100,
+                                'trailing_stop_distance': dyn['trailing_stop_distance'],
+                            }
+                            # Track the running high so the trailing stop can arm,
+                            # mirroring the scheduler's highest_price bookkeeping.
+                            if current_price > trade.get('highest_price', 0):
+                                trade['highest_price'] = current_price
+                                trade['trailing_stop_active'] = True
+                            decision = evaluate_exit(
+                                trade, current_price, levels, check_expiration=True)
+                            if decision.should_exit:
+                                enforce_exit(trader, trade, position, decision.action,
+                                             decision.pnl_percent, 'telegram', current_price)
+                                self.send_message(
+                                    f"🛑 *Exit Enforced* `{trade['ticker']}`\n"
+                                    f"Reason: {decision.action}\n"
+                                    f"P&L: {decision.pnl_percent:+.1f}% (${pnl_amount:.2f})",
+                                    trade['chat_id'])
+                                trade['status'] = 'closed'
+                        except Exception as e:
+                            print(f"[MONITOR ERROR] unified exit failed: {e}")
+                        updated_trades.append(trade)
+                        continue
 
                     # Check for alerts
                     notifications = trade['notifications_sent']
