@@ -153,18 +153,14 @@ status_one() {
 BOT_NAME="telegram_bot"
 SCHED_NAME="scheduler"
 
-require_env() {
-    if [ ! -f "$ROOT/.env" ]; then
-        echo "==> ERROR: .env not found in $ROOT"
-        echo "    The bot needs credentials (ALPACA_API_KEY, TELEGRAM_BOT_TOKEN, ...)."
-        echo "    Copy .env.example to .env and fill it in before starting."
-        exit 1
-    fi
+load_env() {
     # Load .env into the environment so launch settings (ENABLE_SCHEDULER,
     # SCHEDULER_ARMED, NO_BOT, ...) can live there instead of being passed
-    # inline. Variables already set in the shell take precedence (set -a only
-    # exports; existing values passed like `ENABLE_SCHEDULER=1 ./run.sh` are
-    # not overwritten because we skip keys already present in the environment).
+    # inline. Best-effort: a missing .env is a no-op (require_env enforces it
+    # where credentials are actually needed). Variables already set in the shell
+    # take precedence — existing values passed like `ENABLE_SCHEDULER=1 ./run.sh`
+    # are not overwritten because we skip keys already present in the environment.
+    [ -f "$ROOT/.env" ] || return 0
     set -a
     while IFS= read -r _line || [ -n "$_line" ]; do
         case "$_line" in
@@ -179,6 +175,16 @@ require_env() {
         esac
     done < "$ROOT/.env"
     set +a
+}
+
+require_env() {
+    if [ ! -f "$ROOT/.env" ]; then
+        echo "==> ERROR: .env not found in $ROOT"
+        echo "    The bot needs credentials (ALPACA_API_KEY, TELEGRAM_BOT_TOKEN, ...)."
+        echo "    Copy .env.example to .env and fill it in before starting."
+        exit 1
+    fi
+    load_env
 }
 
 cmd_start() {
@@ -206,6 +212,7 @@ cmd_stop() {
 }
 
 cmd_status() {
+    load_env  # so a scheduler enabled only via .env is reflected here
     echo "==> Services:"
     status_one "$BOT_NAME"
     if [ "${ENABLE_SCHEDULER:-0}" = "1" ] || is_running "$SCHED_NAME"; then

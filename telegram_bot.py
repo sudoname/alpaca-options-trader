@@ -20,6 +20,10 @@ class TelegramTradingBot:
         self.last_update_id = 0
         self.pending_analyses = {}  # Store pending trade analyses
         self.supported_tickers = self.load_supported_tickers()
+        # End-of-day summary state: send once per trading day when the market
+        # transitions from open -> closed (see eod_summary_watch).
+        self._eod_last_sent_date = None
+        self._market_was_open = False
 
     def load_config(self):
         """Load Telegram bot configuration"""
@@ -42,6 +46,11 @@ class TelegramTradingBot:
         if self.chat_id:
             allowed.add(str(self.chat_id).strip())
         self.allowed_chat_ids = allowed
+
+        # Daily end-of-day summary (closed P/L, open positions, account, RL note)
+        # is sent at market close unless EOD_SUMMARY_ENABLED is explicitly off.
+        self.eod_summary_enabled = env_vars.get(
+            'EOD_SUMMARY_ENABLED', '1').strip().lower() not in ('0', 'false', 'no', 'off', '')
 
         if not self.bot_token:
             print("\n❌ Missing TELEGRAM_BOT_TOKEN in .env file")
@@ -1464,6 +1473,122 @@ Position closed to limit losses"""
 
         print("[MONITOR] Position monitoring stopped")
 
+    def _broadcast(self, message):
+        """Send a message to every authorized chat (used for unsolicited alerts
+        like the daily summary, which have no originating chat to reply to)."""
+        targets = set(self.allowed_chat_ids)
+        if self.chat_id:
+            targets.add(str(self.chat_id))
+        for cid in targets:
+            try:
+                self.send_message(message, cid)
+            except Exception as e:
+                print(f"[EOD] send to {cid} failed: {e}")
+
+    def build_eod_summary(self, trader):
+        """Compose the daily activity summary: closed trades + P/L, open
+        positions, account snapshot, and an RL/learning note. Each section fails
+        soft so a single data error never blocks the whole summary."""
+        today = datetime.now().strftime('%Y-%m-%d')
+        lines = [f"📋 *Daily Trading Summary* — {today}", ""]
+
+        # 1) Closed trades + P/L (from the shared learning log).
+        closed = []
+        try:
+            with open('trading_history.json', 'r') as f:
+                hist = json.load(f)
+            closed = [t for t in hist.get('trades', [])
+                      if str(t.get('exit_time', '')).startswith(today)]
+        except Exception as e:
+            print(f"[EOD] trading_history read failed: {e}")
+        if closed:
+            wins = [t for t in closed if (t.get('pnl_percent') or 0) > 0]
+            total = sum((t.get('pnl_percent') or 0) for t in closed)
+            avg = total / len(closed)
+            lines.append(f"*Closed:* {len(closed)} trade(s) — "
+                         f"{len(wins)}W / {len(closed) - len(wins)}L")
+            lines.append(f"  P/L: {total:+.1f}% total · {avg:+.1f}% avg")
+            for t in closed[:10]:
+                lines.append(f"  • `{t.get('symbol')}` {t.get('outcome', '')} "
+                             f"{(t.get('pnl_percent') or 0):+.1f}%")
+        else:
+            lines.append("*Closed:* no trades closed today")
+        lines.append("")
+
+        # 2) Open positions with unrealized P/L.
+        try:
+            positions = trader.get_positions() or []
+        except Exception as e:
+            print(f"[EOD] get_positions failed: {e}")
+            positions = []
+        if positions:
+            lines.append(f"*Open positions:* {len(positions)}")
+            for p in positions[:15]:
+                upl = float(p.get('unrealized_pl') or 0)
+                uplpc = float(p.get('unrealized_plpc') or 0) * 100
+                lines.append(f"  • `{p.get('symbol')}` x{p.get('qty')} "
+                             f"{upl:+.2f} ({uplpc:+.1f}%)")
+        else:
+            lines.append("*Open positions:* none")
+        lines.append("")
+
+        # 3) Account snapshot (paper).
+        try:
+            r = requests.get(f"{trader.base_url}/v2/account",
+                             headers=trader.headers, timeout=10)
+            if r.status_code == 200:
+                a = r.json()
+                equity = float(a.get('equity') or 0)
+                last_equity = float(a.get('last_equity') or 0)
+                day_change = equity - last_equity
+                day_pct = (day_change / last_equity * 100) if last_equity else 0
+                bp = float(a.get('buying_power') or 0)
+                lines.append("*Account (paper):*")
+                lines.append(f"  Equity: ${equity:,.2f} "
+                             f"({day_change:+,.2f}, {day_pct:+.2f}%)")
+                lines.append(f"  Buying power: ${bp:,.2f}")
+            else:
+                lines.append(f"*Account:* unavailable (HTTP {r.status_code})")
+        except Exception as e:
+            print(f"[EOD] account fetch failed: {e}")
+            lines.append("*Account:* unavailable")
+        lines.append("")
+
+        # 4) RL/learning note — outcomes recorded today feed the shadow/RL store.
+        lines.append(f"🧠 *Learning:* {len(closed)} outcome(s) recorded to the "
+                     f"RL/shadow store today")
+        return "\n".join(lines)
+
+    def eod_summary_watch(self):
+        """Background watcher: once per trading day, when the market goes from
+        open to closed, send the daily summary to all authorized chats."""
+        if not self.eod_summary_enabled:
+            return
+        try:
+            from smart_trader import SmartOptionsTrader
+            trader = SmartOptionsTrader()
+        except Exception as e:
+            print(f"[EOD] could not start watcher: {e}")
+            return
+        print("[EOD] daily summary watcher started")
+        while True:
+            try:
+                clock = trader.get_market_status()
+                is_open = bool(clock.get('is_open'))
+                today = datetime.now().strftime('%Y-%m-%d')
+                if is_open:
+                    self._market_was_open = True
+                elif self._market_was_open and self._eod_last_sent_date != today:
+                    # Open -> closed transition: emit the summary exactly once.
+                    msg = self.build_eod_summary(trader)
+                    self._broadcast(msg)
+                    self._eod_last_sent_date = today
+                    self._market_was_open = False
+                    print("[EOD] summary sent")
+            except Exception as e:
+                print(f"[EOD] watch error: {e}")
+            time.sleep(60)
+
     def run_bot(self):
         """Main bot loop"""
         print("[BOT] Telegram trading bot starting...")
@@ -1472,6 +1597,10 @@ Position closed to limit losses"""
             return
 
         print("[OK] Bot ready! Send messages to start trading")
+
+        # Start the end-of-day summary watcher (daemon; daily summary at close).
+        if self.eod_summary_enabled:
+            threading.Thread(target=self.eod_summary_watch, daemon=True).start()
 
         while True:
             try:

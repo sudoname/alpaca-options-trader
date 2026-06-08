@@ -26,8 +26,15 @@ Usage
   python run_alpaca_intraday.py --armed --once           # arm, single scan
   python run_alpaca_intraday.py --selftest # no creds/network; exits non-zero on fail
 
+The universe is the base SCHEDULER_SYMBOLS (SPY,QQQ) plus, when
+SCHEDULER_INCLUDE_SCREENER=1 (default), the screener's picks from
+supported_tickers.json (refresh them with `./run.sh screen`). The merged list is
+deduped and capped at SCHEDULER_MAX_SYMBOLS; over-budget/illiquid names self-skip
+in select_best_option, and MAX_NEW_TRADES_PER_DAY still bounds actual entries.
+
 Env overrides (read from .env via the same manual parse smart_trader uses):
   SCHEDULER_SYMBOLS=SPY,QQQ   SCHEDULER_QTY=1
+  SCHEDULER_INCLUDE_SCREENER=1   SCHEDULER_MAX_SYMBOLS=12
   SCAN_INTERVAL_MIN=15        ENTRY_START_ET=09:45
   ENTRY_CUTOFF_MIN_BEFORE_CLOSE=60   EOD_CLOSE_MIN_BEFORE_CLOSE=15
   MAX_NEW_TRADES_PER_DAY=4    SCHEDULER_ARMED=0
@@ -65,6 +72,22 @@ def _truthy(val):
     return str(val).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _load_screener_symbols(path="supported_tickers.json"):
+    """Symbols picked by stock_screener.py (`./run.sh screen --write-tickers`).
+
+    Returns [] if the file is missing/unreadable so the scheduler simply
+    degrades to its base symbols. Local file read only (no network); it is
+    refreshed once per session so fresh screener picks are honoured without a
+    restart.
+    """
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        return [str(s).strip().upper() for s in data.get("tickers", []) if str(s).strip()]
+    except Exception:
+        return []
+
+
 class Config:
     """Resolved scheduler configuration (env first, then .env file, then default)."""
 
@@ -76,6 +99,12 @@ class Config:
             return os.environ.get(key, env.get(key, default))
 
         self.symbols = [s.strip().upper() for s in get("SCHEDULER_SYMBOLS", "SPY,QQQ").split(",") if s.strip()]
+        # Optionally fold the screener's picks (supported_tickers.json, written by
+        # `./run.sh screen`) into the trading universe alongside the base symbols.
+        # The merge happens at runtime in IntradayScheduler._refresh_universe so
+        # this Config stays deterministic for --selftest (no file read here).
+        self.include_screener = _truthy(get("SCHEDULER_INCLUDE_SCREENER", "1"))
+        self.max_symbols = int(get("SCHEDULER_MAX_SYMBOLS", "12"))
         self.qty = int(get("SCHEDULER_QTY", "1"))
         self.scan_interval_min = float(get("SCAN_INTERVAL_MIN", "15"))
         self.entry_start_et = _parse_hhmm(get("ENTRY_START_ET", "09:45"))
@@ -214,6 +243,31 @@ class IntradayScheduler:
         self.current_session = None
         self.trades_today = 0
         self.entered_today = set()
+        # Active trading universe: base symbols now; screener picks are folded in
+        # at runtime (refreshed each session). Held separately from cfg so the
+        # pure-helper --selftest stays deterministic.
+        self.base_symbols = list(config.symbols)
+        self.symbols = list(config.symbols)
+
+    # -- trading universe ---------------------------------------------------- #
+    def _refresh_universe(self):
+        """Rebuild the active universe = base symbols + screener picks, deduped,
+        order-preserving, capped at cfg.max_symbols. Over-budget or illiquid
+        names self-skip later in select_best_option, so a wide list is safe."""
+        universe = []
+        seen = set()
+        sources = list(self.base_symbols)
+        if self.cfg.include_screener:
+            sources += _load_screener_symbols()
+        for s in sources:
+            if s and s not in seen:
+                seen.add(s)
+                universe.append(s)
+        if self.cfg.max_symbols and self.cfg.max_symbols > 0:
+            universe = universe[: self.cfg.max_symbols]
+        if universe != self.symbols:
+            self.symbols = universe
+            log(f"[UNIVERSE] {len(self.symbols)} symbols: {', '.join(self.symbols)}")
 
     # -- per-session counters ------------------------------------------------ #
     def _roll_session(self, sk):
@@ -221,6 +275,8 @@ class IntradayScheduler:
             self.current_session = sk
             self.trades_today = 0
             self.entered_today = set()
+            if self.trader is not None:  # skip the file read during --selftest
+                self._refresh_universe()
             log(f"[SESSION] new session {sk}: counters reset")
 
     # -- exits --------------------------------------------------------------- #
@@ -307,7 +363,7 @@ class IntradayScheduler:
             "mode": self.cfg.mode,
             "is_open": parsed.get("is_open"),
             "next_close": parsed["next_close"].isoformat() if parsed.get("next_close") else None,
-            "symbols": self.cfg.symbols,
+            "symbols": self.symbols,
             "scan_interval_min": self.cfg.scan_interval_min,
             "trades_today": self.trades_today,
             "max_new_trades_per_day": self.cfg.max_new_trades_per_day,
@@ -355,7 +411,7 @@ class IntradayScheduler:
             elif not self._pdt_ok():
                 log("[PDT] no day-trade headroom; skipping entries")
             else:
-                for sym in self.cfg.symbols:
+                for sym in self.symbols:
                     try:
                         self._try_enter(sym)
                     except Exception as e:
@@ -376,8 +432,9 @@ class IntradayScheduler:
 
     # -- main loop ----------------------------------------------------------- #
     def run(self, once=False):
+        self._refresh_universe()
         log(f"[START] Alpaca intraday scheduler — mode={self.cfg.mode}, "
-            f"symbols={self.cfg.symbols}, qty={self.cfg.qty}, "
+            f"symbols={self.symbols}, qty={self.cfg.qty}, "
             f"scan={self.cfg.scan_interval_min:g}m")
         if not self.cfg.armed:
             log("[DRY-RUN] no orders will be placed (set SCHEDULER_ARMED=1 to arm)")
@@ -488,6 +545,25 @@ def _selftest():
     check("config defaults to dry-run", Config(env={}).armed is False)
     check("config arms via env", Config(env={"SCHEDULER_ARMED": "1"}).armed is True)
     check("config symbols default SPY,QQQ", Config(env={}).symbols == ["SPY", "QQQ"])
+
+    # universe: screener-merge logic (deterministic; screener disabled -> no read)
+    check("config max_symbols default 12", Config(env={}).max_symbols == 12)
+    check("config include_screener default on", Config(env={}).include_screener is True)
+    check("config include_screener off via env",
+          Config(env={"SCHEDULER_INCLUDE_SCREENER": "0"}).include_screener is False)
+    s_off = IntradayScheduler(Config(env={"SCHEDULER_INCLUDE_SCREENER": "0"}),
+                              trader=None, pdt=None)
+    s_off.base_symbols = ["SPY", "QQQ", "SPY"]
+    s_off.symbols = []
+    s_off._refresh_universe()
+    check("universe dedupes base (screener off)", s_off.symbols == ["SPY", "QQQ"])
+    s_cap = IntradayScheduler(Config(env={"SCHEDULER_INCLUDE_SCREENER": "0",
+                                          "SCHEDULER_MAX_SYMBOLS": "2"}),
+                              trader=None, pdt=None)
+    s_cap.base_symbols = ["SPY", "QQQ", "AAPL", "NVDA"]
+    s_cap.symbols = []
+    s_cap._refresh_universe()
+    check("universe respects max_symbols cap", s_cap.symbols == ["SPY", "QQQ"])
 
     if failures:
         print(f"\nSELFTEST FAILED ({len(failures)} failed)")
