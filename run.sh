@@ -83,6 +83,30 @@ is_running() {
     kill -0 "$pid" 2>/dev/null
 }
 
+# --- systemd hand-off ------------------------------------------------------
+# On the server the long-lived services are owned by systemd units
+# (alps-bot.service, alps-scheduler.service). When the mapped unit is active,
+# run.sh must NOT start a second copy or sweep systemd's process — doing so
+# spawns a duplicate Telegram poller (HTTP 409) and a perpetual "untracked
+# instance" warning. In that case run.sh defers entirely to systemd.
+
+systemd_unit() {
+    # systemd_unit <name> -> the systemd unit that owns the service (or empty).
+    case "$1" in
+        "$BOT_NAME")   echo "alps-bot.service" ;;
+        "$SCHED_NAME") echo "alps-scheduler.service" ;;
+        *)             echo "" ;;
+    esac
+}
+
+systemd_active() {
+    # systemd_active <name> -> 0 if the mapped unit is active under systemd.
+    local unit; unit="$(systemd_unit "$1")"
+    [ -n "$unit" ] || return 1
+    command -v systemctl >/dev/null 2>&1 || return 1
+    systemctl is-active --quiet "$unit" 2>/dev/null
+}
+
 # --- stray-instance detection ---------------------------------------------
 # A service must have exactly ONE process. A second copy started outside this
 # launcher (a direct `python telegram_bot.py`, the run_background.py wrapper, an
@@ -157,6 +181,11 @@ sweep_strays() {
 start_one() {
     # start_one <name> <script.py>
     local name="$1" script="$2"
+    if systemd_active "$name"; then
+        echo "==> $name owned by systemd ($(systemd_unit "$name")); not starting a duplicate"
+        echo "    Manage it with: systemctl {status|restart|stop} $(systemd_unit "$name")"
+        return 0
+    fi
     if [ ! -f "$script" ]; then
         echo "==> SKIP $name: $script not found"
         return 0
@@ -192,6 +221,11 @@ start_one() {
 stop_one() {
     # stop_one <name>
     local name="$1" pf; pf="$(pid_file "$name")"
+    if systemd_active "$name"; then
+        echo "==> $name owned by systemd ($(systemd_unit "$name")); leaving it running"
+        echo "    Stop it with: systemctl stop $(systemd_unit "$name")"
+        return 0
+    fi
     if is_running "$name"; then
         local pid; pid="$(cat "$pf")"
         echo "==> Stopping $name (PID $pid)"
@@ -216,6 +250,10 @@ stop_one() {
 status_one() {
     # status_one <name>
     local name="$1"
+    if systemd_active "$name"; then
+        echo "  $name: RUNNING (systemd: $(systemd_unit "$name"))"
+        return 0
+    fi
     if is_running "$name"; then
         echo "  $name: RUNNING (PID $(cat "$(pid_file "$name")"))"
     else
@@ -294,7 +332,7 @@ cmd_status() {
     load_env  # so a scheduler enabled only via .env is reflected here
     echo "==> Services:"
     status_one "$BOT_NAME"
-    if [ "${ENABLE_SCHEDULER:-0}" = "1" ] || is_running "$SCHED_NAME"; then
+    if [ "${ENABLE_SCHEDULER:-0}" = "1" ] || is_running "$SCHED_NAME" || systemd_active "$SCHED_NAME"; then
         status_one "$SCHED_NAME"
     fi
     echo "==> Logs in: $LOG_DIR"
