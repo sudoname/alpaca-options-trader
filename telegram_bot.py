@@ -228,6 +228,21 @@ class TelegramTradingBot:
             symbol = parts[0].strip().upper() if parts else ''
             return self.get_spread_proposal(symbol, chat_id)
 
+        elif text == 'ORACLE_DATASET_STATS' or text == '/ORACLE_DATASET_STATS':
+            return self.oracle_dataset_stats(chat_id)
+
+        elif text.startswith('EXPECTED_MOVE') or text.startswith('/EXPECTED_MOVE'):
+            parts = text.replace('/EXPECTED_MOVE', '').replace('EXPECTED_MOVE', '', 1).split()
+            symbol = parts[0].strip().upper() if parts else ''
+            vix = parts[1] if len(parts) > 1 else None
+            return self.expected_move(symbol, vix, chat_id)
+
+        elif text.startswith('VOL_EDGE') or text.startswith('/VOL_EDGE'):
+            parts = text.replace('/VOL_EDGE', '').replace('VOL_EDGE', '', 1).split()
+            symbol = parts[0].strip().upper() if parts else ''
+            vix = parts[1] if len(parts) > 1 else None
+            return self.vol_edge(symbol, vix, chat_id)
+
         elif text == 'START':
             return self.start_monitoring()
 
@@ -1419,6 +1434,205 @@ Total symbols: `{len(self.supported_tickers)}`"""
             f"_(Proposal only — nothing was traded.)_"
         )
 
+    @staticmethod
+    def _parse_vix(vix_arg):
+        """Best-effort parse of an optional VIX argument; None on failure."""
+        if vix_arg in (None, ''):
+            return None
+        try:
+            v = float(vix_arg)
+            return v if v > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    def expected_move(self, symbol, vix_arg=None, chat_id=None):
+        """Phase 7A: ADVISORY expected-move + volatility-edge report for ``symbol``.
+
+        Pure observation layer — never places an order, never alters any trade.
+        Derives HV20/60/90 + recent realized vol from price history; an optional
+        VIX argument (e.g. `EXPECTED_MOVE SPY 18.5`) enables the implied-vol edge.
+        The prediction is appended to expected_move_history.csv. Gated by
+        EXPECTED_MOVE_ENABLED (default on).
+        """
+        symbol = (symbol or '').strip().upper()
+        if not re.fullmatch(r'[A-Z]{1,5}', symbol):
+            return "❌ Invalid symbol. Usage: `EXPECTED_MOVE SPY [VIX]`"
+
+        try:
+            from expected_move_engine import (
+                ExpectedMoveConfig, ExpectedMoveEngine, gather_inputs_from_trader,
+            )
+        except Exception as e:
+            return f"❌ Expected-move engine unavailable: {e}"
+
+        cfg = ExpectedMoveConfig.from_env()
+        if not cfg.enabled:
+            return ("🧪 Expected-move engine is disabled.\n"
+                    "Set `EXPECTED_MOVE_ENABLED=true` to enable advisory output.")
+
+        vix = self._parse_vix(vix_arg)
+        try:
+            from smart_trader import SmartOptionsTrader
+            trader = SmartOptionsTrader(ticker=symbol)
+            inputs = gather_inputs_from_trader(trader, symbol, vix=vix)
+            engine = ExpectedMoveEngine(cfg)
+            result = engine.compute(inputs, symbol=symbol)
+            engine.record(result, inputs)
+        except Exception as e:
+            return f"❌ Could not compute expected move for `{symbol}`: {e}"
+
+        if result.status != "ok":
+            return (f"📭 *No expected move for {symbol}*\n"
+                    f"Reason: `{result.status}` (not enough price history)\n"
+                    f"_(Advisory only — nothing was traded.)_")
+
+        unit = "$" if result.in_dollars else ""
+        suffix = "" if result.in_dollars else " (fraction of price)"
+
+        def fmt(x):
+            return f"{unit}{x:.2f}" if isinstance(x, (int, float)) else "n/a"
+
+        edge = (f"`{result.volatility_edge:+.2f}` ({result.edge_label})"
+                if isinstance(result.volatility_edge, (int, float)) else "`n/a` (supply VIX)")
+        fvol = (f"{result.forecast_vol:.0%}"
+                if isinstance(result.forecast_vol, (int, float)) else "n/a")
+        ivol = (f"{result.implied_vol:.0%}"
+                if isinstance(result.implied_vol, (int, float)) else "n/a")
+        mem = fmt(result.market_expected_move)
+        return (
+            f"📐 *Expected Move — {symbol}*{suffix}\n"
+            f"1d: `{fmt(result.expected_move_1d)}`\n"
+            f"3d: `{fmt(result.expected_move_3d)}`\n"
+            f"7d: `{fmt(result.expected_move_7d)}`\n"
+            f"30d: `{fmt(result.expected_move_30d)}`\n"
+            f"Market expected move (30d): `{mem}`\n"
+            f"Forecast vol: `{fvol}`  Implied vol: `{ivol}`\n"
+            f"Volatility edge: {edge}\n"
+            f"_(Advisory only — logged, does NOT alter trades.)_"
+        )
+
+    def vol_edge(self, symbol, vix_arg=None, chat_id=None):
+        """Phase 7A/8A: ADVISORY volatility edge + shadow recommendation.
+
+        Computes the volatility edge (needs a VIX arg for the implied side),
+        builds a spread proposal for context (oracle score / strategy / trend),
+        and emits a LEARNING SHADOW recommendation + confidence. Strictly
+        advisory: it never places an order and never alters a trade. The shadow
+        observation is logged to learning_shadow_log.csv.
+        """
+        symbol = (symbol or '').strip().upper()
+        if not re.fullmatch(r'[A-Z]{1,5}', symbol):
+            return "❌ Invalid symbol. Usage: `VOL_EDGE SPY [VIX]`"
+
+        try:
+            from expected_move_engine import (
+                ExpectedMoveConfig, ExpectedMoveEngine, gather_inputs_from_trader,
+            )
+        except Exception as e:
+            return f"❌ Expected-move engine unavailable: {e}"
+
+        cfg = ExpectedMoveConfig.from_env()
+        if not cfg.enabled:
+            return ("🧪 Expected-move engine is disabled.\n"
+                    "Set `EXPECTED_MOVE_ENABLED=true` to enable advisory output.")
+
+        vix = self._parse_vix(vix_arg)
+        try:
+            from smart_trader import SmartOptionsTrader
+            trader = SmartOptionsTrader(ticker=symbol)
+            inputs = gather_inputs_from_trader(trader, symbol, vix=vix)
+            result = ExpectedMoveEngine(cfg).compute(inputs, symbol=symbol)
+        except Exception as e:
+            return f"❌ Could not compute volatility edge for `{symbol}`: {e}"
+
+        if result.status != "ok":
+            return (f"📭 *No volatility edge for {symbol}*\n"
+                    f"Reason: `{result.status}` (not enough price history)\n"
+                    f"_(Advisory only — nothing was traded.)_")
+
+        # Pull context from a spread proposal (best-effort; never required).
+        oracle_score = strategy = trend = None
+        try:
+            proposal = trader.propose_spread(symbol)
+            if proposal is not None:
+                oracle_score = getattr(proposal, 'oracle_score', None)
+                strategy = getattr(proposal, 'strategy_name', None)
+                trend = getattr(proposal, 'trend', None)
+        except Exception:
+            pass
+
+        edge = (f"`{result.volatility_edge:+.2f}` ({result.edge_label})"
+                if isinstance(result.volatility_edge, (int, float)) else "`n/a` (supply VIX)")
+        fvol = (f"{result.forecast_vol:.0%}"
+                if isinstance(result.forecast_vol, (int, float)) else "n/a")
+        ivol = (f"{result.implied_vol:.0%}"
+                if isinstance(result.implied_vol, (int, float)) else "n/a")
+
+        shadow_line = ""
+        try:
+            from learning_shadow import (
+                LearningShadow, LearningShadowConfig, ShadowObservation,
+            )
+            scfg = LearningShadowConfig.from_env()
+            if scfg.enabled and strategy:
+                obs = ShadowObservation(
+                    symbol=symbol, volatility_edge=result.volatility_edge,
+                    oracle_score=oracle_score, spread_type=strategy,
+                    dte=None, trend=trend, vix=vix)
+                rec = LearningShadow(scfg).observe_and_log(obs)
+                shadow_line = (
+                    f"\n*Learning shadow (advisory):* `{rec.recommendation}` "
+                    f"conf `{rec.confidence:.2f}` regime `{rec.vix_regime}`\n"
+                    f"_{rec.rationale}_")
+        except Exception:
+            pass
+
+        ctx = ""
+        if strategy:
+            os_str = f"{oracle_score:.0f}/100" if isinstance(oracle_score, (int, float)) else "n/a"
+            ctx = (f"Proposal: `{strategy}` (oracle `{os_str}`"
+                   f"{f', trend {trend}' if trend else ''})\n")
+        return (
+            f"⚖️ *Volatility Edge — {symbol}*\n"
+            f"Forecast vol: `{fvol}`  Implied vol: `{ivol}`\n"
+            f"Volatility edge: {edge}\n"
+            f"{ctx}"
+            f"_(+ = options look overpriced / sell-premium edge)_"
+            f"{shadow_line}\n"
+            f"_(Advisory only — logged, does NOT alter trades.)_"
+        )
+
+    def oracle_dataset_stats(self, chat_id=None):
+        """Phase 8A: summarize the Oracle training dataset (advisory recorder).
+
+        Reports row counts, outcome-completion, and realized win-rate/mean-pnl
+        over rows that have an outcome. Reads only — never trades.
+        """
+        try:
+            from oracle_dataset_builder import OracleDatasetBuilder, OracleDatasetConfig
+        except Exception as e:
+            return f"❌ Oracle dataset builder unavailable: {e}"
+
+        cfg = OracleDatasetConfig.from_env()
+        if not cfg.enabled:
+            return ("🧪 Oracle dataset recorder is disabled.\n"
+                    "Set `ORACLE_DATASET_ENABLED=true` to enable it.")
+        try:
+            s = OracleDatasetBuilder(cfg).stats()
+        except Exception as e:
+            return f"❌ Could not read the Oracle dataset: {e}"
+
+        return (
+            f"🗂️ *Oracle Training Dataset*\n"
+            f"File: `{s['dataset_file']}`\n"
+            f"Total rows: `{s['total_rows']}`\n"
+            f"With outcome: `{s['with_outcome']}`  Pending: `{s['pending']}`\n"
+            f"Completion: `{s['completion_rate']:.0%}`\n"
+            f"Rows with P&L: `{s['n_with_pnl']}`\n"
+            f"Win rate: `{s['win_rate']:.0%}`  Mean P&L: `{s['mean_pnl']:+.2%}`\n"
+            f"_(Advisory recorder — no trades are placed.)_"
+        )
+
     def _spread_paper_trader(self):
         """Build a SpreadPaperTrader from env (Phase 6C). No broker client."""
         from spread_paper_trader import SpreadPaperConfig, SpreadPaperTrader
@@ -1547,6 +1761,9 @@ Total symbols: `{len(self.supported_tickers)}`"""
 • `SPREAD_PAPER_OPEN TICKER` - Open SIMULATED spread (paper only)
 • `SPREAD_PAPER_POSITIONS` - List open simulated spreads
 • `SPREAD_PAPER_CLOSE ID` - Close a simulated spread (paper only)
+• `EXPECTED_MOVE TICKER [VIX]` - Expected move + vol edge (advisory)
+• `VOL_EDGE TICKER [VIX]` - Volatility edge + shadow rec (advisory)
+• `ORACLE_DATASET_STATS` - Training dataset summary (advisory)
 • `START` - Start monitoring
 • `STOP` - Stop monitoring
 
