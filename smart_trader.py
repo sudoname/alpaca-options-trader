@@ -89,6 +89,21 @@ class SmartOptionsTrader:
         except Exception as e:
             print(f"[SENTIMENT] Filter unavailable: {e}")
 
+        # Per-ticker News signal. Fail-open. Fetches recent headlines from
+        # Alpaca's news endpoint and scores them; used to (1) tilt call/put
+        # direction, (2) nudge option ranking, and (3) gate/size entries.
+        # Never blocks or crashes a trade on failure.
+        self.news_service = None
+        try:
+            from news import NewsService, NewsConfig
+            if NewsConfig.from_env().enabled:
+                self.news_service = NewsService(
+                    NewsConfig.from_env(), self.data_url, self.headers
+                )
+                print("[NEWS] Headline signal active")
+        except Exception as e:
+            print(f"[NEWS] signal unavailable: {e}")
+
     def load_credentials(self):
         """Load API credentials and trading parameters from .env file"""
         env_vars = {}
@@ -769,6 +784,22 @@ class SmartOptionsTrader:
         if market_regime == 'volatile' and bearish_signals > 0:
             bearish_signals += 1  # Volatile markets often favor puts
 
+        # News direction tilt (fail-open): add bull/bear votes from recent
+        # headlines for this symbol. No effect when news is unavailable/neutral.
+        if self.news_service:
+            try:
+                from news import news_direction_vote, NewsConfig
+                news = self.news_service.get_news(symbol)
+                bull, bear = news_direction_vote(news, NewsConfig.from_env())
+                if bull or bear:
+                    bullish_signals += bull
+                    bearish_signals += bear
+                    print(f"[NEWS] Direction votes for {symbol}: "
+                          f"+{bull} bull / +{bear} bear "
+                          f"(score {news.get('score')} {news.get('label')})")
+            except Exception as e:
+                print(f"[NEWS] direction vote error (ignored): {e}")
+
         # Make decision
         if bearish_signals > bullish_signals and bearish_signals >= 2:
             strategy = 'put'
@@ -802,6 +833,22 @@ class SmartOptionsTrader:
         best_option = None
         best_score = -1
         validated_count = 0
+
+        # News ranking nudge (fail-open): fetch once for this underlying and
+        # precompute a multiplier that boosts contracts aligned with bullish/
+        # bearish coverage and trims those against it. 1.0 when unavailable.
+        news_mult = 1.0
+        if self.news_service:
+            try:
+                from news import news_score_multiplier, NewsConfig
+                news = self.news_service.get_news(self.ticker)
+                news_mult = news_score_multiplier(news, strategy, NewsConfig.from_env())
+                if news_mult != 1.0:
+                    print(f"[NEWS] Ranking multiplier x{news_mult:.3f} for "
+                          f"{self.ticker} {strategy.upper()} "
+                          f"(score {news.get('score')} {news.get('label')})")
+            except Exception as e:
+                print(f"[NEWS] ranking error (ignored): {e}")
 
         for contract in contracts:
             strike = float(contract['strike_price'])
@@ -908,6 +955,9 @@ class SmartOptionsTrader:
             # Boost score for strategy alignment
             if contract_type == strategy:
                 score *= 1.1  # 10% boost for matching strategy
+
+            # News ranking nudge (fail-open; 1.0 when news unavailable)
+            score *= news_mult
 
             # Add liquidity scoring (critical for real trading)
             if not contract.get('mock', False):
@@ -1032,6 +1082,31 @@ class SmartOptionsTrader:
                           f"contract(s), cost: ${total_cost:.2f}")
             except Exception as e:
                 print(f"[SENTIMENT] filter error (ignored): {e}")
+
+        # News gate (fail-open): block or shrink an entry when recent headlines
+        # strongly OPPOSE the trade direction. Mirrors the sentiment gate above.
+        if self.news_service:
+            try:
+                from news import adjust_trade_by_news, summarize_for_log, NewsConfig
+                news = self.news_service.get_news(self.ticker)
+                print(f"[NEWS] {summarize_for_log(news)}")
+                decision = adjust_trade_by_news(
+                    {'size': order_quantity,
+                     'confidence': dynamic_levels.get('confidence'),
+                     'direction': option.get('type')},
+                    news, NewsConfig.from_env(),
+                )
+                print(f"[NEWS] {decision['reason']}")
+                if not decision['allowed']:
+                    print("[NEWS] Trade blocked by news filter")
+                    return None
+                if decision['adjusted_size'] != order_quantity:
+                    order_quantity = decision['adjusted_size']
+                    total_cost = entry_price * 100 * order_quantity
+                    print(f"[NEWS] Adjusted quantity: {order_quantity} "
+                          f"contract(s), cost: ${total_cost:.2f}")
+            except Exception as e:
+                print(f"[NEWS] gate error (ignored): {e}")
 
         # ---- Hard risk gate (fail-closed; last line of capital protection) ----
         # Runs AFTER budget/sentiment sizing so trade_cost is final, and BEFORE

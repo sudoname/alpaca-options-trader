@@ -22,6 +22,7 @@ rl_qtable.json
 rl_qtable_backtest.json
 rl_experience.json
 sentiment_cache.json
+news_cache.json
 day_trades_log.json
 pending_order.json
 scheduler_status.json
