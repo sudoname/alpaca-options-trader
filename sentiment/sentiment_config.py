@@ -28,6 +28,16 @@ def _get_int(name: str, default: int) -> int:
         return default
 
 
+def _get_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
 # Classification thresholds (score 0-100). Ordered low -> high.
 # 0-25 Extreme Fear | 26-45 Fear | 46-55 Neutral | 56-75 Greed | 76-100 Extreme Greed
 CLASSIFICATION_BANDS = [
@@ -68,7 +78,10 @@ class SentimentConfig:
     cache_minutes: int = 15
     use_cnn: bool = True
     use_custom: bool = True
-    primary_source: str = "custom"  # "custom" or "cnn"
+    primary_source: str = "blend"  # "blend", "custom", or "cnn"
+    # Weight given to the custom score when primary_source == "blend".
+    # CNN gets (1 - blend_custom_weight). Clamped to [0, 1].
+    blend_custom_weight: float = 0.5
     min_components: int = 3
 
     # CNN scraper settings
@@ -98,7 +111,8 @@ class SentimentConfig:
             cache_minutes=_get_int("SENTIMENT_CACHE_MINUTES", 15),
             use_cnn=_get_bool("SENTIMENT_USE_CNN", True),
             use_custom=_get_bool("SENTIMENT_USE_CUSTOM", True),
-            primary_source=os.getenv("SENTIMENT_PRIMARY_SOURCE", "custom").strip().lower(),
+            primary_source=os.getenv("SENTIMENT_PRIMARY_SOURCE", "blend").strip().lower(),
+            blend_custom_weight=_get_float("SENTIMENT_BLEND_CUSTOM_WEIGHT", 0.5),
             min_components=_get_int("SENTIMENT_MIN_COMPONENTS", 3),
             cnn_url=os.getenv(
                 "SENTIMENT_CNN_URL",

@@ -83,6 +83,77 @@ is_running() {
     kill -0 "$pid" 2>/dev/null
 }
 
+# --- stray-instance detection ---------------------------------------------
+# A service must have exactly ONE process. A second copy started outside this
+# launcher (a direct `python telegram_bot.py`, the run_background.py wrapper, an
+# old systemd unit, ...) becomes a second Telegram poller and the bot then
+# replies to every message twice. These helpers find and clear such orphans.
+
+sweep_patterns() {
+    # sweep_patterns <name> -> cmdline regex(es) (one per line) that identify a
+    # running copy of the service. Anchored on `python` so editors/tails of the
+    # same filename are never matched. The literal dot is escaped for the regex.
+    case "$1" in
+        "$BOT_NAME")   printf '%s\n' 'python.*telegram_bot\.py' 'python.*run_background\.py' ;;
+        "$SCHED_NAME") printf '%s\n' "python.*${SCHEDULER//./\\.}" ;;
+        *)             : ;;
+    esac
+}
+
+pids_matching() {
+    # pids_matching <regex> -> PIDs whose full command line matches, excluding
+    # this launcher's own PID. Prefers pgrep; falls back to ps+grep.
+    local pat="$1" pids="" p out=""
+    if command -v pgrep >/dev/null 2>&1; then
+        pids="$(pgrep -f -- "$pat" 2>/dev/null || true)"
+    else
+        pids="$(ps -eo pid= -o args= 2>/dev/null | grep -E -- "$pat" | grep -v grep | awk '{print $1}' || true)"
+    fi
+    for p in $pids; do
+        [ "$p" = "$$" ] && continue
+        out="$out $p"
+    done
+    echo $out
+}
+
+stray_pids() {
+    # stray_pids <name> -> PIDs that match the service patterns but are NOT the
+    # PID this launcher is tracking in the pid file (those are the orphans).
+    local name="$1" tracked="" pf seen="" out="" pat p
+    pf="$(pid_file "$name")"
+    [ -f "$pf" ] && tracked="$(cat "$pf" 2>/dev/null || true)"
+    while IFS= read -r pat; do
+        [ -n "$pat" ] || continue
+        for p in $(pids_matching "$pat"); do
+            [ "$p" = "$tracked" ] && continue
+            case " $seen " in *" $p "*) continue ;; esac
+            seen="$seen $p"; out="$out $p"
+        done
+    done <<EOF
+$(sweep_patterns "$name")
+EOF
+    echo $out
+}
+
+sweep_strays() {
+    # sweep_strays <name> -> SIGTERM (then SIGKILL) any untracked copies so the
+    # service is left with at most its one tracked instance.
+    local name="$1" strays; strays="$(stray_pids "$name")"
+    [ -n "$strays" ] || return 0
+    echo "    WARN: untracked $name process(es) found: $strays — terminating"
+    kill $strays 2>/dev/null || true
+    local _
+    for _ in $(seq 1 10); do
+        [ -n "$(stray_pids "$name")" ] || break
+        sleep 1
+    done
+    strays="$(stray_pids "$name")"
+    if [ -n "$strays" ]; then
+        echo "    still alive; SIGKILL $strays"
+        kill -9 $strays 2>/dev/null || true
+    fi
+}
+
 start_one() {
     # start_one <name> <script.py>
     local name="$1" script="$2"
@@ -90,6 +161,9 @@ start_one() {
         echo "==> SKIP $name: $script not found"
         return 0
     fi
+    # Clear any untracked copies first so we never end up with two pollers,
+    # even if the tracked instance is already up.
+    sweep_strays "$name"
     if is_running "$name"; then
         echo "==> $name already running (PID $(cat "$(pid_file "$name")"))"
         return 0
@@ -118,24 +192,25 @@ start_one() {
 stop_one() {
     # stop_one <name>
     local name="$1" pf; pf="$(pid_file "$name")"
-    if ! is_running "$name"; then
-        echo "==> $name not running"
-        rm -f "$pf"
-        return 0
-    fi
-    local pid; pid="$(cat "$pf")"
-    echo "==> Stopping $name (PID $pid)"
-    kill "$pid" 2>/dev/null || true
-    # Wait up to 10s for a graceful exit, then SIGKILL.
-    for _ in $(seq 1 10); do
-        is_running "$name" || break
-        sleep 1
-    done
     if is_running "$name"; then
-        echo "    still alive; sending SIGKILL"
-        kill -9 "$pid" 2>/dev/null || true
+        local pid; pid="$(cat "$pf")"
+        echo "==> Stopping $name (PID $pid)"
+        kill "$pid" 2>/dev/null || true
+        # Wait up to 10s for a graceful exit, then SIGKILL.
+        for _ in $(seq 1 10); do
+            is_running "$name" || break
+            sleep 1
+        done
+        if is_running "$name"; then
+            echo "    still alive; sending SIGKILL"
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+    else
+        echo "==> $name not running (no tracked PID)"
     fi
     rm -f "$pf"
+    # Also clear any untracked orphans so 'stop'/'restart' truly leaves none.
+    sweep_strays "$name"
 }
 
 status_one() {
@@ -145,6 +220,10 @@ status_one() {
         echo "  $name: RUNNING (PID $(cat "$(pid_file "$name")"))"
     else
         echo "  $name: stopped"
+    fi
+    local strays; strays="$(stray_pids "$name")"
+    if [ -n "$strays" ]; then
+        echo "  $name: WARN untracked instance(s): $strays (run './run.sh restart' to clear)"
     fi
 }
 

@@ -303,32 +303,45 @@ class IntradayScheduler:
         return any(underlying_of(p.get("symbol")) == sym for p in positions)
 
     # -- entries ------------------------------------------------------------- #
-    def _try_enter(self, sym):
+    def _evaluate(self, sym):
+        """Score a symbol's best contract WITHOUT entering. Returns a candidate
+        dict ``{sym, direction, opt, score}`` or None if the symbol skips.
+
+        Selection is split from entry so the entry loop can rank candidates by
+        score and let the daily cap fill with the strongest setups (not just
+        whatever comes first in universe order)."""
         if sym in self.entered_today:
-            return
+            return None
         if self._has_live_position(sym):
             log(f"[SKIP] {sym}: already holding a position")
             self.entered_today.add(sym)
-            return
+            return None
 
         self.trader.ticker = sym  # keep direction/underlying defaults correct
 
         price = self.trader.get_current_price(sym)
         if not price:
             log(f"[SKIP] {sym}: no current price")
-            return
+            return None
 
         contracts = self.trader.get_option_contracts(sym)
         if not contracts:
             log(f"[SKIP] {sym}: no option contracts")
-            return
+            return None
 
         direction = self.trader.determine_option_strategy(sym)  # 'call' / 'put'
         opt = self.trader.select_best_option(contracts, price, strategy=direction)
         if not opt:
             log(f"[SKIP] {sym}: no suitable option ({direction.upper()})")
-            return
+            return None
 
+        return {"sym": sym, "direction": direction, "opt": opt,
+                "score": float(opt.get("score") or 0)}
+
+    def _enter_candidate(self, cand):
+        """Place (or, in dry-run, log) the entry for a pre-scored candidate."""
+        sym, direction, opt = cand["sym"], cand["direction"], cand["opt"]
+        self.trader.ticker = sym  # underlying/direction defaults
         desc = (f"{sym} {direction.upper()} {opt.get('symbol')} x{self.cfg.qty} "
                 f"(ask={opt.get('ask')}, score={opt.get('score')})")
 
@@ -348,6 +361,36 @@ class IntradayScheduler:
         else:
             log(f"[ARMED] order NOT placed for {opt.get('symbol')} "
                 f"(blocked by risk/budget/duplicate or broker rejection)")
+
+    def _rank_and_enter(self):
+        """Evaluate the whole universe, rank by score (desc), then enter in that
+        order. Armed mode stops at max_new_trades_per_day so the cap fills with
+        the highest-scoring setups; dry-run previews all candidates, ranked."""
+        candidates = []
+        for sym in self.symbols:
+            try:
+                cand = self._evaluate(sym)
+            except Exception as e:
+                log(f"[WARN] evaluate failed for {sym}: {e}")
+                cand = None
+            if cand:
+                candidates.append(cand)
+
+        if not candidates:
+            log("[ENTRY] no candidates this scan")
+            return
+
+        candidates.sort(key=lambda c: c["score"], reverse=True)
+        log("[RANK] " + ", ".join(f"{c['sym']}({c['score']:.0f})" for c in candidates))
+
+        for cand in candidates:
+            if self.cfg.armed and self.trades_today >= self.cfg.max_new_trades_per_day:
+                log(f"[CAP] reached max_new_trades_per_day={self.cfg.max_new_trades_per_day}")
+                break
+            try:
+                self._enter_candidate(cand)
+            except Exception as e:
+                log(f"[WARN] entry attempt failed for {cand['sym']}: {e}")
 
     # -- heartbeat ----------------------------------------------------------- #
     def _write_status(self, parsed):
@@ -411,11 +454,7 @@ class IntradayScheduler:
             elif not self._pdt_ok():
                 log("[PDT] no day-trade headroom; skipping entries")
             else:
-                for sym in self.symbols:
-                    try:
-                        self._try_enter(sym)
-                    except Exception as e:
-                        log(f"[WARN] entry attempt failed for {sym}: {e}")
+                self._rank_and_enter()
         else:
             mtc = minutes_to_close(parsed["now"], parsed["next_close"])
             log(f"[WAIT] outside entry window (min_to_close={mtc:.0f})")

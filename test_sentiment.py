@@ -393,6 +393,49 @@ class TestService(unittest.TestCase):
         self.assertTrue(result.get("from_cache"))
         self.assertEqual(result["primary_score"]["score"], 99.0)
 
+    def test_blend_averages_both_sources(self):
+        # CNN=40, custom>55 (greedy). Equal weights => mean of the two.
+        config = self._config(use_cnn=True, primary_source="blend",
+                              blend_custom_weight=0.5)
+        svc = SentimentService(provider=GreedyProvider(), config=config,
+                               cache=SentimentCache(self.cache_path, 15))
+        cnn_ok = {"source": "cnn_unofficial", "status": "available",
+                  "score": 40.0, "classification": "Fear", "timestamp": "t"}
+        with mock.patch("sentiment.sentiment_service.fetch_cnn_fear_greed",
+                        return_value=cnn_ok):
+            result = svc.get_sentiment()
+        self.assertEqual(result["primary_source"], "blend")
+        custom_score = result["custom_score"]["score"]
+        expected = round(custom_score * 0.5 + 40.0 * 0.5, 2)
+        self.assertEqual(result["primary_score"]["score"], expected)
+        # Components record each input and its weight.
+        comps = {c["name"]: c for c in result["primary_score"]["components"]}
+        self.assertEqual(comps["cnn"]["score"], 40.0)
+        self.assertEqual(comps["custom"]["weight"], 0.5)
+
+    def test_blend_respects_custom_weight(self):
+        # Weight 1.0 => blend equals the custom score exactly.
+        config = self._config(use_cnn=True, primary_source="blend",
+                              blend_custom_weight=1.0)
+        svc = SentimentService(provider=GreedyProvider(), config=config,
+                               cache=SentimentCache(self.cache_path, 15))
+        cnn_ok = {"source": "cnn_unofficial", "status": "available",
+                  "score": 10.0, "classification": "Extreme Fear", "timestamp": "t"}
+        with mock.patch("sentiment.sentiment_service.fetch_cnn_fear_greed",
+                        return_value=cnn_ok):
+            result = svc.get_sentiment()
+        self.assertEqual(result["primary_score"]["score"],
+                         round(result["custom_score"]["score"], 2))
+
+    def test_blend_degrades_to_single_source(self):
+        # CNN disabled => blend falls back to the custom score alone.
+        config = self._config(use_cnn=False, primary_source="blend")
+        svc = SentimentService(provider=GreedyProvider(), config=config,
+                               cache=SentimentCache(self.cache_path, 15))
+        result = svc.get_sentiment()
+        self.assertEqual(result["primary_source"], "custom")
+        self.assertEqual(result["primary_score"]["status"], "available")
+
 
 # --------------------------------------------------------------------------- #
 # Sentiment filter

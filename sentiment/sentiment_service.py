@@ -8,11 +8,14 @@ This is the single entry point the rest of the bot should use:
     service = SentimentService(SchwabMarketDataProvider(client))
     sentiment = service.get_sentiment()
     # -> {"cnn_score": {...}, "custom_score": {...},
-    #     "primary_score": {...}, "primary_source": "custom", "timestamp": ...}
+    #     "primary_score": {...}, "primary_source": "blend", "timestamp": ...}
 
-The custom score is the PRIMARY source; CNN is fetched (when enabled) only for
-comparison/validation. The service never raises — on total failure it returns a
-payload with ``primary_score.status == "error"`` so callers can no-op safely.
+By default the primary score is a weighted BLEND of the custom score and CNN
+(SENTIMENT_PRIMARY_SOURCE=blend, custom weighted by SENTIMENT_BLEND_CUSTOM_WEIGHT,
+default 0.5). Set SENTIMENT_PRIMARY_SOURCE=custom or =cnn to use a single source.
+Blend degrades to whichever single source is available. The service never raises
+— on total failure it returns a payload with ``primary_score.status == "error"``
+so callers can no-op safely.
 """
 
 import logging
@@ -26,9 +29,55 @@ from .custom_fear_greed import (
     compute_custom_fear_greed,
 )
 from .sentiment_cache import SentimentCache
-from .sentiment_config import SentimentConfig
+from .sentiment_config import SentimentConfig, classify_score
 
 logger = logging.getLogger(__name__)
+
+
+def _is_available(score: Optional[dict]) -> bool:
+    return bool(
+        score
+        and score.get("status") == "available"
+        and score.get("score") is not None
+    )
+
+
+def _blend_scores(cnn: Optional[dict], custom: Optional[dict], w_custom: float):
+    """Weighted blend of the custom and CNN scores into a 'blend' primary.
+
+    When both sources are available, return a weighted-average payload (custom
+    weighted by ``w_custom``, CNN by ``1 - w_custom``). When only one is
+    available, return that source unchanged so the blend degrades gracefully.
+
+    Returns ``(primary_payload, primary_source)`` or ``(None, None)`` if neither
+    source is usable.
+    """
+    cnn_ok = _is_available(cnn)
+    custom_ok = _is_available(custom)
+
+    if cnn_ok and custom_ok:
+        w_custom = max(0.0, min(1.0, w_custom))
+        w_cnn = 1.0 - w_custom
+        cs = float(custom["score"])
+        xs = float(cnn["score"])
+        blended = cs * w_custom + xs * w_cnn
+        return {
+            "source": "blend",
+            "status": "available",
+            "score": round(blended, 2),
+            "classification": classify_score(blended),
+            "components": [
+                {"name": "custom", "score": cs, "weight": round(w_custom, 3)},
+                {"name": "cnn", "score": xs, "weight": round(w_cnn, 3)},
+            ],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }, "blend"
+
+    if custom_ok:
+        return custom, "custom"
+    if cnn_ok:
+        return cnn, "cnn"
+    return None, None
 
 
 def _disabled_payload(reason: str) -> dict:
@@ -82,18 +131,22 @@ class SentimentService:
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
 
-        # Select the primary score. Custom is preferred; fall back to the other
-        # source if the configured primary is missing/errored.
+        # Select the primary score. "blend" combines both sources; "custom"/"cnn"
+        # pick that source and fall back to the other if it is missing/errored.
         primary_source = self.config.primary_source
         primary = None
-        if primary_source == "cnn":
-            primary = cnn if (cnn and cnn.get("status") == "available") else None
-            if primary is None and custom and custom.get("status") == "available":
+        if primary_source == "blend":
+            primary, primary_source = _blend_scores(
+                cnn, custom, self.config.blend_custom_weight
+            )
+        elif primary_source == "cnn":
+            primary = cnn if _is_available(cnn) else None
+            if primary is None and _is_available(custom):
                 primary = custom
                 primary_source = "custom"
         else:  # default: custom primary
-            primary = custom if (custom and custom.get("status") == "available") else None
-            if primary is None and cnn and cnn.get("status") == "available":
+            primary = custom if _is_available(custom) else None
+            if primary is None and _is_available(cnn):
                 primary = cnn
                 primary_source = "cnn"
 

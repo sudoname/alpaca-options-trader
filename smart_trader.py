@@ -118,6 +118,24 @@ class SmartOptionsTrader:
         self.fill_wait_sec = float(env_vars.get('FILL_WAIT_SEC', '5'))
         self.fill_poll_sec = float(env_vars.get('FILL_POLL_SEC', '0.5'))
 
+        # Roll-on-profit: when a winner reaches ROLL_TRIGGER_PCT (default
+        # MAX_TAKE_PROFIT), close it and re-enter a cheaper, further-OTM contract
+        # on the same underlying/direction to lock gains while staying in the
+        # trade. Disabled by default so existing behavior is unchanged.
+        self.roll_enabled = str(
+            env_vars.get('ROLL_ENABLED', 'false')
+        ).strip().lower() in ('1', 'true', 'yes', 'on')
+        # Trigger as a P/L percentage (e.g. 500 = +500%). Defaults to the
+        # max_take_profit clamp expressed in percent.
+        self.roll_trigger_pct = float(
+            env_vars.get('ROLL_TRIGGER_PCT', self.max_take_profit * 100)
+        )
+        # How far out-of-the-money the re-entry strike must be (fraction of the
+        # underlying price). 0.05 = at least 5% OTM.
+        self.roll_otm_pct = float(env_vars.get('ROLL_OTM_PCT', '0.05'))
+        # Upper bound on OTM distance so the roll doesn't buy a worthless lotto.
+        self.roll_max_otm_pct = float(env_vars.get('ROLL_MAX_OTM_PCT', '0.20'))
+
     def load_trading_history(self):
         """Load historical trades for learning"""
         self.history_file = 'trading_history.json'
@@ -1269,8 +1287,25 @@ class SmartOptionsTrader:
                 self.record_trade_outcome(trade, 'dynamic_stop_loss', pnl_percent)
                 continue
 
-            # Check for dynamic take profit (full exit)
-            elif pnl_percent >= take_profit_percent:
+            # Roll-on-profit: at ROLL_TRIGGER_PCT (default MAX_TAKE_PROFIT) close
+            # the winner and re-enter a cheaper, further-OTM contract on the same
+            # underlying/direction. Checked before the dynamic full-exit so the
+            # winner can run to the roll trigger. Only active when roll_enabled.
+            elif self.roll_enabled and pnl_percent >= self.roll_trigger_pct:
+                print(f"[ROLL] Trigger at {pnl_percent:.1f}% "
+                      f"(>= {self.roll_trigger_pct:.1f}%)")
+                if self.roll_position(trade, position, pnl_percent):
+                    self.record_trade_outcome(trade, 'roll_take_profit', pnl_percent)
+                    continue
+                # No re-entry target found -> fall back to a flat take-profit.
+                self.close_position(trade, position, 'roll_failed_take_profit')
+                self.record_trade_outcome(trade, 'roll_failed_take_profit', pnl_percent)
+                continue
+
+            # Check for dynamic take profit (full exit). When rolling is enabled
+            # we intentionally let winners run to roll_trigger_pct instead of
+            # flat-closing at the lower dynamic target.
+            elif pnl_percent >= take_profit_percent and not self.roll_enabled:
                 print(f"[TAKE PROFIT] Dynamic target at {take_profit_percent:.1f}%")
                 self.close_position(trade, position, 'dynamic_take_profit')
                 self.record_trade_outcome(trade, 'dynamic_take_profit', pnl_percent)
@@ -1327,6 +1362,190 @@ class SmartOptionsTrader:
 
         requests.post(f"{self.base_url}/v2/orders", headers=self.headers, json=order_data)
         print(f"[CLOSE] Position closed - Reason: {reason}")
+
+    @staticmethod
+    def direction_from_occ(occ_symbol: str) -> Optional[str]:
+        """Infer 'call'/'put' from an OCC option symbol (…YYMMDD[C|P]NNNNNNNN).
+
+        Active-trade rows store only the OCC ``symbol`` (no option type), so the
+        roll path recovers direction from the standard layout: 8-digit strike,
+        preceded by a single C/P, preceded by the 6-digit expiration. Returns
+        None when the symbol doesn't match (caller then skips the roll).
+        """
+        if not occ_symbol or len(occ_symbol) < 9:
+            return None
+        cp = occ_symbol[-9].upper()
+        if cp == 'C':
+            return 'call'
+        if cp == 'P':
+            return 'put'
+        return None
+
+    @staticmethod
+    def _roll_candidates(contracts, current_price, direction,
+                         otm_pct, max_otm_pct):
+        """Pure filter/sort for roll re-entry candidates (no network).
+
+        Keeps same-direction contracts whose strike is between ``otm_pct`` and
+        ``max_otm_pct`` out-of-the-money relative to ``current_price`` (higher
+        strike for calls, lower for puts), sorted nearest-expiration first then
+        nearest to the OTM floor. Quote/budget validation happens in
+        ``select_roll_option``; this part is unit-testable offline.
+        """
+        if not current_price or current_price <= 0:
+            return []
+        direction = (direction or '').lower()
+        out = []
+        for c in contracts:
+            if (c.get('type') or 'call').lower() != direction:
+                continue
+            try:
+                strike = float(c['strike_price'])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if direction == 'call':
+                low = current_price * (1 + otm_pct)
+                high = current_price * (1 + max_otm_pct)
+                if not (low <= strike <= high):
+                    continue
+                otm_dist = (strike - current_price) / current_price
+            else:  # put
+                low = current_price * (1 - max_otm_pct)
+                high = current_price * (1 - otm_pct)
+                if not (low <= strike <= high):
+                    continue
+                otm_dist = (current_price - strike) / current_price
+            out.append((c, otm_dist))
+        # Nearest expiration first, then closest to the OTM floor (least far OTM
+        # that still clears the threshold) -> the cheapest reasonable re-entry.
+        out.sort(key=lambda t: (t[0].get('expiration_date', '9999-99-99'), t[1]))
+        return [c for c, _ in out]
+
+    def select_roll_option(self, contracts, current_price, direction):
+        """Pick a cheaper, further-OTM contract for a roll re-entry.
+
+        Reuses the OCC quote/spread/budget validation logic but, unlike
+        ``select_best_option``, deliberately targets OTM strikes (which
+        ``select_best_option`` skips). Returns an option_data dict shaped for
+        ``place_order_with_stops`` or None if nothing qualifies.
+        """
+        direction = (direction or '').lower()
+        candidates = self._roll_candidates(
+            contracts, current_price, direction,
+            self.roll_otm_pct, self.roll_max_otm_pct,
+        )
+        print(f"[ROLL] {len(candidates)} OTM {direction} candidate(s) "
+              f"({self.roll_otm_pct:.0%}-{self.roll_max_otm_pct:.0%} OTM)")
+
+        for contract in candidates:
+            option_symbol = contract['symbol']
+            strike = float(contract['strike_price'])
+            expiration = contract.get('expiration_date')
+
+            if contract.get('mock', False):
+                bid_price = contract.get('mock_bid', 0)
+                ask_price = contract.get('mock_ask', 0)
+            else:
+                quote = self.get_option_price(option_symbol)
+                if not quote or quote.get('ask', 0) <= 0:
+                    continue
+                ask_price = quote['ask']
+                bid_price = quote['bid']
+                spread_pct = ((ask_price - bid_price) / ask_price * 100) if ask_price > 0 else 100
+                if spread_pct > 20:
+                    continue
+
+            if ask_price <= 0:
+                continue
+            if ask_price * 100 > self.max_budget_per_trade:
+                # Too rich for the roll; candidates are sorted cheapest-ish so a
+                # later one may fit — keep scanning.
+                continue
+
+            print(f"[ROLL] Re-entry target ${strike:.2f} {direction.upper()} "
+                  f"exp {expiration} ask ${ask_price:.2f}")
+            return {
+                'symbol': option_symbol,
+                'underlying': self.ticker,
+                'strike': strike,
+                'expiration': expiration,
+                'type': direction,
+                'ask': ask_price,
+                'bid': bid_price,
+                'mock': contract.get('mock', False),
+                'score': 0,
+                'strategy_type': direction,
+            }
+
+        print("[ROLL] No OTM candidate passed quote/budget validation")
+        return None
+
+    def roll_position(self, trade: Dict, position: Dict, pnl_percent: float) -> bool:
+        """Roll a winning option into a cheaper, further-OTM contract.
+
+        Closes the current position (locking gains) only after a valid re-entry
+        target is found, then opens it via ``place_order_with_stops`` so all
+        gates (budget, sentiment, fail-closed risk, fill readback) still apply.
+        Returns True if the old position was closed (rolled or, if re-entry
+        failed after close, simply taken-profit); False if no target was found
+        and the caller should flat-close instead.
+        """
+        underlying = trade.get('underlying_symbol', self.ticker)
+        direction = self.direction_from_occ(trade.get('symbol', ''))
+        if direction is None:
+            print(f"[ROLL] Could not parse direction from {trade.get('symbol')}; "
+                  "skipping roll")
+            return False
+
+        current_price = self.get_current_price(underlying)
+        if not current_price:
+            print(f"[ROLL] No underlying price for {underlying}; skipping roll")
+            return False
+
+        contracts = self.get_option_contracts(underlying)
+        new_opt = self.select_roll_option(contracts, current_price, direction)
+        if not new_opt:
+            print("[ROLL] No suitable OTM contract; taking profit flat instead")
+            return False
+
+        # Lock gains: close the winner first, then re-enter.
+        self.close_position(trade, position, 'roll_take_profit')
+
+        qty = int(trade.get('quantity', self.quantity) or self.quantity)
+        order = self.place_order_with_stops(new_opt, qty)
+        if order:
+            print(f"[ROLL] {trade['symbol']} -> {new_opt['symbol']} "
+                  f"(+{pnl_percent:.0f}% locked, re-entered OTM)")
+            self._stamp_rolled_from(new_opt['symbol'], trade)
+        else:
+            print("[ROLL] Re-entry order did not fill; profit already locked "
+                  "by close")
+        # Old position is closed either way -> handled; don't flat-close again.
+        return True
+
+    def _stamp_rolled_from(self, new_symbol: str, old_trade: Dict):
+        """Tag the freshly-saved roll re-entry row for traceability.
+
+        Adds ``rolled_from`` and carries over the originating ``source`` (e.g.
+        'alpaca_scheduler') so EOD close targeting still recognizes the new row.
+        Fail-open: any error is logged and ignored.
+        """
+        active_file = 'active_trades.json'
+        try:
+            if not os.path.exists(active_file):
+                return
+            with open(active_file, 'r') as f:
+                trades = json.load(f)
+            for t in trades:
+                if t.get('symbol') == new_symbol and 'rolled_from' not in t:
+                    t['rolled_from'] = old_trade.get('symbol')
+                    if old_trade.get('source') is not None:
+                        t['source'] = old_trade['source']
+                    break
+            with open(active_file, 'w') as f:
+                json.dump(trades, f, indent=2, default=str)
+        except Exception as e:
+            print(f"[ROLL] stamp rolled_from failed (ignored): {e}")
 
     def should_exit_dynamically(self, trade: Dict, position: Dict, current_price: float) -> bool:
         """Determine if position should be exited based on dynamic conditions"""
