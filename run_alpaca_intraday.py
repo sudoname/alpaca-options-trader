@@ -351,7 +351,9 @@ class IntradayScheduler:
             return
 
         log(f"[ARMED] entering {desc}")
-        order = self.trader.place_order_with_stops(opt, quantity=self.cfg.qty)
+        # quantity=None lets place_order_with_stops size by directional conviction
+        # (very high -> 3, high -> 2, regular -> 1 contract).
+        order = self.trader.place_order_with_stops(opt, quantity=None)
         if order:
             self.trades_today += 1
             self.entered_today.add(sym)

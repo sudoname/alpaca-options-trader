@@ -125,6 +125,18 @@ class SmartOptionsTrader:
         # Budget per trade (dollars) from .env with default
         self.max_budget_per_trade = float(env_vars.get('MAX_BUDGET_PER_TRADE', '500'))
 
+        # Liquidity gate: skip contracts whose bid/ask spread (as a % of ask)
+        # exceeds this. Tighter = only liquid contracts pass.
+        self.max_spread_pct = float(env_vars.get('MAX_SPREAD_PCT', '15'))
+
+        # Confidence-based position sizing. Quantity is keyed off the directional
+        # signal strength from determine_option_strategy (winning side's signal
+        # count): strength >= very_high -> 3 contracts, >= high -> 2, else 1.
+        self.conf_high_signals = int(env_vars.get('CONF_HIGH_SIGNALS', '2'))
+        self.conf_very_high_signals = int(env_vars.get('CONF_VERY_HIGH_SIGNALS', '4'))
+        # Updated by determine_option_strategy; read when sizing a confidence-based order.
+        self.last_signal_strength = 0
+
         # Load profit/loss thresholds from .env with defaults
         self.base_stop_loss = float(env_vars.get('BASE_STOP_LOSS', '0.10'))
         self.base_take_profit = float(env_vars.get('BASE_TAKE_PROFIT', '0.20'))
@@ -832,11 +844,16 @@ class SmartOptionsTrader:
         else:
             strategy = 'call'  # Default to calls unless strong bearish signals
 
+        # Conviction = the winning side's signal count. A default 'call' with no
+        # supporting signals has strength 0 (lowest conviction). Used downstream
+        # for confidence-based position sizing.
+        self.last_signal_strength = bearish_signals if strategy == 'put' else bullish_signals
+
         print(f"[STRATEGY] Analysis for {symbol}:")
         print(f"[STRATEGY] Momentum: {momentum:.3f}, Volatility: {volatility:.1%}")
         print(f"[STRATEGY] Short trend: {short_trend:.2%}, Medium trend: {medium_trend:.2%}")
         print(f"[STRATEGY] Bearish signals: {bearish_signals}, Bullish signals: {bullish_signals}")
-        print(f"[STRATEGY] Decision: {strategy.upper()} options")
+        print(f"[STRATEGY] Decision: {strategy.upper()} options (conviction {self.last_signal_strength})")
 
         return strategy
 
@@ -942,9 +959,10 @@ class SmartOptionsTrader:
                 validated_count += 1
                 print(f"[VALIDATED] ${strike:.2f} {contract_type.upper()} exp {expiration} - Bid: ${bid_price:.2f}, Ask: ${ask_price:.2f}, Vol: {volume}, OI: {open_interest}")
 
-                # Skip options with very wide spreads (>20%) or no liquidity
-                if spread_pct > 20:
-                    print(f"[SKIP] Spread too wide: {spread_pct:.1f}%")
+                # Skip options whose spread is wider than the configured max.
+                if spread_pct > self.max_spread_pct:
+                    print(f"[SKIP] Spread too wide: {spread_pct:.1f}% "
+                          f"(max {self.max_spread_pct:.0f}%)")
                     continue
 
             # Budget filter: skip contracts whose per-contract cost exceeds the
@@ -1015,12 +1033,34 @@ class SmartOptionsTrader:
 
         print(f"[VALIDATION] {validated_count} contracts validated with real quotes")
 
+        if best_option:
+            # Carry the directional conviction (signal strength) onto the chosen
+            # option so place_order_with_stops can size the position by confidence.
+            best_option['confidence'] = self.last_signal_strength
+
         if best_option and not best_option.get('mock', False):
             print(f"[BEST OPTION] Strike: ${best_option['strike']:.2f} {best_option['type'].upper()}")
             print(f"[BEST OPTION] Expiration: {best_option['expiration']}")
             print(f"[BEST OPTION] Score: {best_option['score']:.2f}")
 
         return best_option
+
+    def _confidence_to_quantity(self, strength) -> int:
+        """Map a directional signal strength to a contract count.
+
+        very high (>= conf_very_high_signals) -> 3 contracts
+        high      (>= conf_high_signals)      -> 2 contracts
+        regular   (otherwise)                 -> 1 contract
+        """
+        try:
+            s = int(strength)
+        except (TypeError, ValueError):
+            return 1
+        if s >= self.conf_very_high_signals:
+            return 3
+        if s >= self.conf_high_signals:
+            return 2
+        return 1
 
     def place_order_with_stops(self, option: Dict, quantity: int = None):
         """Place order with dynamic stop loss and take profit.
@@ -1029,7 +1069,16 @@ class SmartOptionsTrader:
         cause in ``self.last_block_reason`` so callers (e.g. the Telegram bot)
         can surface the actual reason instead of a generic message.
         """
-        order_quantity = quantity or self.quantity
+        # Sizing: an explicit quantity (e.g. a manual Telegram trade) is always
+        # honored. When the caller passes no quantity (the automated screener),
+        # size by directional conviction carried on the option.
+        if quantity is not None:
+            order_quantity = quantity
+        else:
+            strength = option.get('confidence', self.last_signal_strength)
+            order_quantity = self._confidence_to_quantity(strength)
+            tier = {3: "very high", 2: "high", 1: "regular"}.get(order_quantity, "regular")
+            print(f"[SIZE] conviction {strength} -> {order_quantity} contract(s) ({tier})")
         self.last_block_reason = None
 
         # Duplicate-order guard: never stack a second position/order on the same
@@ -1576,7 +1625,7 @@ class SmartOptionsTrader:
                 ask_price = quote['ask']
                 bid_price = quote['bid']
                 spread_pct = ((ask_price - bid_price) / ask_price * 100) if ask_price > 0 else 100
-                if spread_pct > 20:
+                if spread_pct > self.max_spread_pct:
                     continue
 
             if ask_price <= 0:
