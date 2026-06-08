@@ -1387,6 +1387,7 @@ Total symbols: `{len(self.supported_tickers)}`"""
         return (
             f"🧪 *Spread Proposal — {symbol}*\n"
             f"Strategy: `{proposal.strategy_name}`\n"
+            f"Oracle score: `{proposal.oracle_score:.1f}/100`\n"
             f"Legs:\n{legs}\n"
             f"Net {kind}: `{abs(proposal.net_credit_or_debit):.2f}`\n"
             f"Max profit: `${proposal.max_profit:.2f}`\n"

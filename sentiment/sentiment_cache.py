@@ -58,6 +58,11 @@ class SentimentCache:
         age = self._age_seconds(entry)
         if age is None:
             return None
+        # A non-positive TTL means "never fresh" deterministically: without this
+        # guard a same-instant set()+get_fresh() can read age==0 and 0<=0 would
+        # report a hit, making the ttl=0 contract timing-dependent.
+        if self.ttl_seconds <= 0:
+            return None
         if age <= self.ttl_seconds:
             logger.debug("Sentiment cache hit (age %.0fs / ttl %ds)",
                          age, self.ttl_seconds)

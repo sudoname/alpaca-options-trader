@@ -22,9 +22,12 @@ from spread_builder import (
     build_debit_call_spread, build_debit_put_spread, build_iron_condor,
     build_spread, validate_legs, validate_defined_risk,
     classify_volatility, classify_trend, select_spread_strategy,
-    format_proposal_log,
+    format_proposal_log, compute_oracle_score, quality_check,
+    map_reason_to_quality,
     BULLISH_PUT_CREDIT_SPREAD, BEARISH_CALL_CREDIT_SPREAD,
     DEBIT_CALL_SPREAD, DEBIT_PUT_SPREAD, IRON_CONDOR, NO_TRADE,
+    REASON_WEAK_VOL_EDGE, REASON_POOR_LIQUIDITY, REASON_POOR_RISK_REWARD,
+    REASON_MISSING_CHAIN, REASON_MISSING_QUOTES, REASON_MAX_LOSS_TOO_HIGH,
 )
 
 
@@ -242,8 +245,101 @@ class TestLog(unittest.TestCase):
         log = format_proposal_log(p)
         for tok in ("[SPREAD_PROPOSAL]", "strategy=", "symbol=SPY", "legs=",
                     "net_credit_or_debit=", "max_profit=", "max_loss=",
-                    "breakeven=", "reason="):
+                    "breakeven=", "oracle_score=", "reason="):
             self.assertIn(tok, log)
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6B: oracle_score (Requirement 2)
+# --------------------------------------------------------------------------- #
+class TestOracleScore(unittest.TestCase):
+    def _good_spread(self, cfg=CFG):
+        # Tight quotes, deep liquidity, healthy width -> a strong proposal.
+        return build_bull_put_credit_spread(
+            leg("sell", "put", 100, 1.20, 1.25, oi=2000, vol=2000),
+            leg("buy", "put", 95, 0.40, 0.45, oi=2000, vol=2000), cfg, "SPY")
+
+    def test_score_is_set_on_build(self):
+        p = self._good_spread()
+        self.assertGreater(p.oracle_score, 0.0)
+        self.assertLessEqual(p.oracle_score, 100.0)
+
+    def test_no_trade_scores_zero(self):
+        p = build_spread(BULLISH_PUT_CREDIT_SPREAD,
+                         [leg("sell", "put", 100, 1.0, 1.1)], CFG, "SPY")
+        self.assertEqual(p.strategy_name, NO_TRADE)
+        self.assertEqual(compute_oracle_score(p, CFG), 0.0)
+        self.assertEqual(p.oracle_score, 0.0)
+
+    def test_liquidity_raises_score(self):
+        deep = self._good_spread()
+        thin = build_bull_put_credit_spread(
+            leg("sell", "put", 100, 1.20, 1.25, oi=1, vol=1),
+            leg("buy", "put", 95, 0.40, 0.45, oi=1, vol=1), CFG, "SPY")
+        self.assertGreater(deep.oracle_score, thin.oracle_score)
+
+    def test_cost_quality_raises_score(self):
+        wide_cfg = SpreadConfig(enabled=True, max_loss_limit=1000.0,
+                                max_leg_spread_pct=80.0)
+        tight = build_bull_put_credit_spread(
+            leg("sell", "put", 100, 1.24, 1.25, oi=2000, vol=2000),
+            leg("buy", "put", 95, 0.44, 0.45, oi=2000, vol=2000), wide_cfg, "SPY")
+        wide = build_bull_put_credit_spread(
+            leg("sell", "put", 100, 1.00, 1.50, oi=2000, vol=2000),
+            leg("buy", "put", 95, 0.20, 0.45, oi=2000, vol=2000), wide_cfg, "SPY")
+        self.assertGreater(tight.oracle_score, wide.oracle_score)
+
+    def test_measured_volatility_alignment_raises_score(self):
+        p = self._good_spread()
+        aligned = compute_oracle_score(p, CFG, vol_state="overpriced", trend="bullish")
+        opposed = compute_oracle_score(p, CFG, vol_state="underpriced", trend="bearish")
+        self.assertGreater(aligned, opposed)
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6B: no_trade quality reasons (Requirement 3)
+# --------------------------------------------------------------------------- #
+class TestQualityReasons(unittest.TestCase):
+    def test_reason_mapping(self):
+        self.assertEqual(map_reason_to_quality("missing_quote"), REASON_MISSING_QUOTES)
+        self.assertEqual(map_reason_to_quality("illiquid_leg"), REASON_POOR_LIQUIDITY)
+        self.assertEqual(map_reason_to_quality("max_loss_exceeds_limit"),
+                         REASON_MAX_LOSS_TOO_HIGH)
+        self.assertEqual(map_reason_to_quality("no_contracts"), REASON_MISSING_CHAIN)
+        self.assertEqual(map_reason_to_quality("no_strikes"), REASON_MISSING_CHAIN)
+        # carries trailing context
+        self.assertEqual(map_reason_to_quality("no_edge vol=fair trend=neutral"),
+                         REASON_WEAK_VOL_EDGE)
+        # unmapped reasons pass through unchanged
+        self.assertEqual(map_reason_to_quality("undefined_risk"), "undefined_risk")
+
+    def test_quality_check_noop_by_default(self):
+        p = build_bull_put_credit_spread(
+            leg("sell", "put", 100, 1.20, 1.25),
+            leg("buy", "put", 95, 0.40, 0.45), CFG, "SPY")
+        self.assertIsNone(quality_check(p, CFG))
+
+    def test_quality_check_poor_risk_reward(self):
+        rr_cfg = SpreadConfig(enabled=True, max_loss_limit=1000.0,
+                              max_leg_spread_pct=50.0, min_risk_reward=1.0)
+        # bull put credit max_profit 75 / max_loss 425 -> rr ~0.18 < 1.0.
+        p = build_bull_put_credit_spread(
+            leg("sell", "put", 100, 1.20, 1.25),
+            leg("buy", "put", 95, 0.40, 0.45), rr_cfg, "SPY")
+        self.assertEqual(p.strategy_name, BULLISH_PUT_CREDIT_SPREAD)  # still builds
+        self.assertEqual(quality_check(p, rr_cfg), REASON_POOR_RISK_REWARD)
+
+    def test_quality_check_poor_liquidity(self):
+        liq_cfg = SpreadConfig(enabled=True, max_loss_limit=1000.0,
+                               max_leg_spread_pct=50.0, min_liquidity_score=0.9)
+        p = build_bull_put_credit_spread(
+            leg("sell", "put", 100, 1.20, 1.25, oi=1, vol=1),
+            leg("buy", "put", 95, 0.40, 0.45, oi=1, vol=1), liq_cfg, "SPY")
+        self.assertEqual(quality_check(p, liq_cfg), REASON_POOR_LIQUIDITY)
+
+    def test_quality_check_ignores_no_trade(self):
+        nope = SpreadProposal(strategy_name=NO_TRADE, symbol="SPY", reason="x")
+        self.assertIsNone(quality_check(nope, CFG))
 
 
 # --------------------------------------------------------------------------- #
@@ -280,7 +376,7 @@ class TestTelegramSpreadCommand(unittest.TestCase):
                   SpreadLeg("buy", "put", 95, 0.40, 0.45)],
             net_credit_or_debit=0.75, max_profit=75.0, max_loss=425.0,
             breakeven=99.25, width=5.0, estimated_probability=0.85,
-            reason="vol overpriced + bullish")
+            oracle_score=62.5, reason="vol overpriced + bullish")
 
         class _FakeTrader:
             def __init__(self, ticker=None, **k):
@@ -298,6 +394,8 @@ class TestTelegramSpreadCommand(unittest.TestCase):
         self.assertIn("Spread Proposal", msg)
         self.assertIn("bullish_put_credit_spread", msg)
         self.assertIn("425.00", msg)        # max loss surfaced
+        self.assertIn("62.5", msg)          # oracle_score surfaced
+        self.assertIn("Oracle score", msg)
         self.assertIn("nothing was traded", msg.lower())
 
     def test_enabled_no_trade_message(self):

@@ -46,6 +46,51 @@ STRATEGY_NAMES = {
 CREDIT_STRATEGIES = {BULLISH_PUT_CREDIT_SPREAD, BEARISH_CALL_CREDIT_SPREAD, IRON_CONDOR}
 DEBIT_STRATEGIES = {DEBIT_CALL_SPREAD, DEBIT_PUT_SPREAD}
 
+# Each strategy's intended (volatility state, trend). Used by the oracle score
+# to confirm a structure's edge/trend alignment.
+STRATEGY_PROFILE = {
+    BULLISH_PUT_CREDIT_SPREAD: ("overpriced", "bullish"),
+    BEARISH_CALL_CREDIT_SPREAD: ("overpriced", "bearish"),
+    DEBIT_CALL_SPREAD: ("underpriced", "bullish"),
+    DEBIT_PUT_SPREAD: ("underpriced", "bearish"),
+    IRON_CONDOR: ("overpriced", "neutral"),
+}
+
+# --------------------------------------------------------------------------- #
+# Phase 6B: no_trade quality reasons (Requirement 3)
+# --------------------------------------------------------------------------- #
+REASON_WEAK_VOL_EDGE = "weak_vol_edge"          # IV/HV too close to fair
+REASON_POOR_LIQUIDITY = "poor_liquidity"        # thin OI/volume on the legs
+REASON_POOR_RISK_REWARD = "poor_risk_reward"    # max_profit/max_loss below floor
+REASON_MISSING_CHAIN = "missing_chain"          # no contracts for the symbol
+REASON_MISSING_QUOTES = "missing_quotes"        # a leg lacks a usable bid/ask
+REASON_MAX_LOSS_TOO_HIGH = "max_loss_too_high"  # structure max_loss over the cap
+
+# Translate an internal validate_legs / builder reason to its Phase-6B quality
+# equivalent (orchestration-facing vocabulary). Reasons without a mapping pass
+# through unchanged.
+_QUALITY_REASON_MAP = {
+    "missing_quote": REASON_MISSING_QUOTES,
+    "illiquid_leg": REASON_POOR_LIQUIDITY,
+    "max_loss_exceeds_limit": REASON_MAX_LOSS_TOO_HIGH,
+    "no_contracts": REASON_MISSING_CHAIN,
+    "no_strikes": REASON_MISSING_CHAIN,
+    "no_edge": REASON_WEAK_VOL_EDGE,
+}
+
+
+def map_reason_to_quality(reason: str) -> str:
+    """Return the Phase-6B quality reason for an internal builder reason.
+
+    Reasons without a mapping (e.g. ``undefined_risk``, ``wide_spread``) pass
+    through unchanged. Trailing context after the first token is dropped so a
+    reason like ``"no_edge vol=fair trend=neutral"`` still maps cleanly.
+    """
+    if not reason:
+        return reason
+    base = reason.split()[0]
+    return _QUALITY_REASON_MAP.get(base, reason)
+
 
 # --------------------------------------------------------------------------- #
 # Config
@@ -61,6 +106,8 @@ class SpreadConfig:
     iv_underpriced_ratio: float = 0.80    # IV/HV <= this -> "underpriced"
     wing_width: float = 5.0               # target strike width (orchestration hint)
     min_trend_momentum: float = 0.01      # |momentum| below this -> trend neutral
+    min_risk_reward: float = 0.0          # reject if max_profit/max_loss below (0 = off)
+    min_liquidity_score: float = 0.0      # reject if liquidity sub-score below (0 = off)
 
     @staticmethod
     def from_env(path: str = ".env") -> "SpreadConfig":
@@ -80,6 +127,8 @@ class SpreadConfig:
             iv_underpriced_ratio=env.get_float("SPREAD_IV_UNDERPRICED_RATIO", 0.80),
             wing_width=env.get_float("SPREAD_WING_WIDTH", 5.0),
             min_trend_momentum=env.get_float("SPREAD_MIN_TREND_MOMENTUM", 0.01),
+            min_risk_reward=env.get_float("SPREAD_MIN_RISK_REWARD", 0.0),
+            min_liquidity_score=env.get_float("SPREAD_MIN_LIQUIDITY_SCORE", 0.0),
         )
 
 
@@ -121,6 +170,7 @@ class SpreadProposal:
     breakeven: Union[float, List[float], None] = None
     width: float = 0.0
     estimated_probability: float = 0.0
+    oracle_score: float = 0.0            # 0-100 proposal confidence (Phase 6B)
     reason: str = ""
 
     @property
@@ -142,6 +192,7 @@ class SpreadProposal:
             "breakeven": self.breakeven,
             "width": self.width,
             "estimated_probability": self.estimated_probability,
+            "oracle_score": self.oracle_score,
             "reason": self.reason,
         }
 
@@ -292,6 +343,133 @@ def _clamp_prob(p: float) -> float:
     return max(0.01, min(0.99, p))
 
 
+def _clamp01(x: float) -> float:
+    return max(0.0, min(1.0, x))
+
+
+def _mean(values) -> float:
+    values = list(values)
+    return sum(values) / len(values) if values else 0.0
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6B: oracle_score (Requirement 2) — pure, no network
+# --------------------------------------------------------------------------- #
+def _liquidity_subscore(legs: List[SpreadLeg]) -> float:
+    """0..1 from per-leg open-interest / volume. Missing data scores neutral
+    (0.5) so the score never penalizes a symbol for a thin data feed."""
+    if not legs:
+        return 0.0
+    per_leg = []
+    for leg in legs:
+        oi_s = _clamp01((leg.open_interest or 0.0) / 500.0) \
+            if leg.open_interest is not None else 0.5
+        vol_s = _clamp01((leg.volume or 0.0) / 100.0) \
+            if leg.volume is not None else 0.5
+        per_leg.append((oi_s + vol_s) / 2.0)
+    return _mean(per_leg)
+
+
+def _cost_subscore(legs: List[SpreadLeg], config: SpreadConfig) -> float:
+    """0..1 from average per-leg bid/ask width vs the configured ceiling. Tight
+    quotes score high; a missing quote scores 0 (worst execution quality)."""
+    if not legs:
+        return 0.0
+    ceiling = config.max_leg_spread_pct if config.max_leg_spread_pct > 0 else 15.0
+    per_leg = []
+    for leg in legs:
+        sp = _leg_spread_pct(leg)
+        if sp is None:
+            per_leg.append(0.0)
+        else:
+            per_leg.append(_clamp01(1.0 - sp / ceiling))
+    return _mean(per_leg)
+
+
+def _risk_reward_subscore(proposal: "SpreadProposal") -> float:
+    """0..1 from max_profit/max_loss, mapped via rr/(rr+1) so rr=1 -> 0.5."""
+    if proposal.max_loss <= 0:
+        return 0.5
+    rr = proposal.max_profit / proposal.max_loss
+    if rr <= 0:
+        return 0.0
+    return _clamp01(rr / (rr + 1.0))
+
+
+def _vol_edge_subscore(strategy_name: str, vol_state: Optional[str]) -> float:
+    """0..1 — how well the measured volatility state confirms the structure.
+    Unknown/None volatility scores 0.7 (selection-aligned but unconfirmed)."""
+    desired = STRATEGY_PROFILE.get(strategy_name, (None, None))[0]
+    if vol_state is None or vol_state == "unknown":
+        return 0.7
+    if vol_state == desired:
+        return 1.0
+    if vol_state == "fair":
+        return 0.5
+    return 0.2
+
+
+def _trend_subscore(strategy_name: str, trend: Optional[str]) -> float:
+    """0..1 — how well the measured trend confirms the structure's direction."""
+    desired = STRATEGY_PROFILE.get(strategy_name, (None, None))[1]
+    if trend is None:
+        return 0.7
+    if trend == desired:
+        return 1.0
+    if desired == "neutral" or trend == "neutral":
+        return 0.5
+    return 0.2  # directionally opposite
+
+
+def compute_oracle_score(proposal: "SpreadProposal", config: SpreadConfig,
+                         vol_state: Optional[str] = None,
+                         trend: Optional[str] = None) -> float:
+    """Blend five sub-scores into a 0-100 proposal confidence (Requirement 2).
+
+    Considers: volatility edge, liquidity, width/max_loss (risk-reward), spread
+    cost quality, and trend alignment. PROPOSAL ONLY — this never affects
+    execution (there is no spread execution). A no_trade / empty proposal scores
+    0.0. ``vol_state`` / ``trend`` are the *measured* market context; when
+    omitted the score assumes the structure is selection-aligned but unconfirmed.
+    """
+    if not proposal.is_tradeable or not proposal.legs:
+        return 0.0
+    vol_edge = _vol_edge_subscore(proposal.strategy_name, vol_state)
+    liquidity = _liquidity_subscore(proposal.legs)
+    risk_reward = _risk_reward_subscore(proposal)
+    cost = _cost_subscore(proposal.legs, config)
+    trend_align = _trend_subscore(proposal.strategy_name, trend)
+    blended = (0.25 * vol_edge + 0.20 * liquidity + 0.25 * risk_reward +
+               0.15 * cost + 0.15 * trend_align)
+    return round(_clamp01(blended) * 100.0, 1)
+
+
+def quality_check(proposal: "SpreadProposal", config: SpreadConfig) -> Optional[str]:
+    """Return a Phase-6B quality no_trade reason when a *tradeable* proposal
+    fails a configured quality floor, else None.
+
+    All floors default to 0 (off), so the gate is a no-op unless configured via
+    SPREAD_MIN_LIQUIDITY_SCORE / SPREAD_MIN_RISK_REWARD. NEVER raises.
+    """
+    if not proposal.is_tradeable:
+        return None
+    if config.min_liquidity_score > 0 and \
+            _liquidity_subscore(proposal.legs) < config.min_liquidity_score:
+        return REASON_POOR_LIQUIDITY
+    if config.min_risk_reward > 0 and proposal.max_loss > 0 and \
+            (proposal.max_profit / proposal.max_loss) < config.min_risk_reward:
+        return REASON_POOR_RISK_REWARD
+    return None
+
+
+def _scored(proposal: "SpreadProposal", config: SpreadConfig) -> "SpreadProposal":
+    """Attach the oracle_score to a freshly-built proposal (builder default:
+    no measured vol/trend context). Orchestration may recompute with measured
+    context. NO-op for no_trade proposals (score stays 0.0)."""
+    proposal.oracle_score = compute_oracle_score(proposal, config)
+    return proposal
+
+
 # --------------------------------------------------------------------------- #
 # Builders — each returns a SpreadProposal (valid) or a no_trade proposal whose
 # reason names the failed safety check. Quotes are filled conservatively: you
@@ -323,12 +501,12 @@ def build_bull_put_credit_spread(short_put: SpreadLeg, long_put: SpreadLeg,
     if reason:
         return _no_trade(reason, symbol, legs)
 
-    return SpreadProposal(
+    return _scored(SpreadProposal(
         strategy_name=BULLISH_PUT_CREDIT_SPREAD, symbol=symbol, legs=legs,
         net_credit_or_debit=net_credit, max_profit=max_profit, max_loss=max_loss,
         breakeven=breakeven, width=width,
         estimated_probability=_clamp_prob(1 - net_credit / width),
-        reason="vol overpriced + bullish -> sell put spread below price")
+        reason="vol overpriced + bullish -> sell put spread below price"), config)
 
 
 def build_bear_call_credit_spread(short_call: SpreadLeg, long_call: SpreadLeg,
@@ -357,12 +535,12 @@ def build_bear_call_credit_spread(short_call: SpreadLeg, long_call: SpreadLeg,
     if reason:
         return _no_trade(reason, symbol, legs)
 
-    return SpreadProposal(
+    return _scored(SpreadProposal(
         strategy_name=BEARISH_CALL_CREDIT_SPREAD, symbol=symbol, legs=legs,
         net_credit_or_debit=net_credit, max_profit=max_profit, max_loss=max_loss,
         breakeven=breakeven, width=width,
         estimated_probability=_clamp_prob(1 - net_credit / width),
-        reason="vol overpriced + bearish -> sell call spread above price")
+        reason="vol overpriced + bearish -> sell call spread above price"), config)
 
 
 def build_debit_call_spread(long_call: SpreadLeg, short_call: SpreadLeg,
@@ -391,12 +569,12 @@ def build_debit_call_spread(long_call: SpreadLeg, short_call: SpreadLeg,
     if reason:
         return _no_trade(reason, symbol, legs)
 
-    return SpreadProposal(
+    return _scored(SpreadProposal(
         strategy_name=DEBIT_CALL_SPREAD, symbol=symbol, legs=legs,
         net_credit_or_debit=-net_debit, max_profit=max_profit, max_loss=max_loss,
         breakeven=breakeven, width=width,
         estimated_probability=_clamp_prob(net_debit / width),
-        reason="vol underpriced + bullish -> buy call spread")
+        reason="vol underpriced + bullish -> buy call spread"), config)
 
 
 def build_debit_put_spread(long_put: SpreadLeg, short_put: SpreadLeg,
@@ -425,12 +603,12 @@ def build_debit_put_spread(long_put: SpreadLeg, short_put: SpreadLeg,
     if reason:
         return _no_trade(reason, symbol, legs)
 
-    return SpreadProposal(
+    return _scored(SpreadProposal(
         strategy_name=DEBIT_PUT_SPREAD, symbol=symbol, legs=legs,
         net_credit_or_debit=-net_debit, max_profit=max_profit, max_loss=max_loss,
         breakeven=breakeven, width=width,
         estimated_probability=_clamp_prob(net_debit / width),
-        reason="vol underpriced + bearish -> buy put spread")
+        reason="vol underpriced + bearish -> buy put spread"), config)
 
 
 def build_iron_condor(long_put: SpreadLeg, short_put: SpreadLeg,
@@ -470,12 +648,12 @@ def build_iron_condor(long_put: SpreadLeg, short_put: SpreadLeg,
     if reason:
         return _no_trade(reason, symbol, legs)
 
-    return SpreadProposal(
+    return _scored(SpreadProposal(
         strategy_name=IRON_CONDOR, symbol=symbol, legs=legs,
         net_credit_or_debit=net_credit, max_profit=max_profit, max_loss=max_loss,
         breakeven=breakeven, width=width,
         estimated_probability=_clamp_prob(1 - net_credit / width),
-        reason="vol overpriced + neutral -> iron condor")
+        reason="vol overpriced + neutral -> iron condor"), config)
 
 
 def build_spread(strategy_name: str, legs: List[SpreadLeg],
@@ -547,6 +725,7 @@ def format_proposal_log(proposal: SpreadProposal) -> str:
         f"max_profit={proposal.max_profit:.2f}\n"
         f"max_loss={proposal.max_loss:.2f}\n"
         f"breakeven={_fmt_breakeven(proposal.breakeven)}\n"
+        f"oracle_score={proposal.oracle_score:.1f}\n"
         f"reason={proposal.reason}"
     )
 

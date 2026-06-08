@@ -2696,8 +2696,10 @@ class SmartOptionsTrader:
         from spread_builder import (
             SpreadConfig, build_spread, classify_volatility, classify_trend,
             select_spread_strategy, format_proposal_log, no_trade_proposal,
+            compute_oracle_score, quality_check, map_reason_to_quality,
             BULLISH_PUT_CREDIT_SPREAD, BEARISH_CALL_CREDIT_SPREAD,
             DEBIT_CALL_SPREAD, DEBIT_PUT_SPREAD, IRON_CONDOR, NO_TRADE,
+            REASON_MISSING_CHAIN, REASON_WEAK_VOL_EDGE,
         )
 
         symbol = (ticker or self.ticker or '').upper()
@@ -2718,13 +2720,13 @@ class SmartOptionsTrader:
 
             contracts = self.get_option_contracts(symbol) or []
             if not contracts:
-                return no_trade_proposal("no_contracts", symbol)
+                return no_trade_proposal(REASON_MISSING_CHAIN, symbol)
 
             # Use the nearest available expiration as the structure's expiry.
             expirations = sorted({c.get('expiration_date') for c in contracts
                                   if c.get('expiration_date')})
             if not expirations:
-                return no_trade_proposal("no_contracts", symbol)
+                return no_trade_proposal(REASON_MISSING_CHAIN, symbol)
             target_exp = expirations[0]
             chain = [c for c in contracts if c.get('expiration_date') == target_exp]
 
@@ -2753,7 +2755,7 @@ class SmartOptionsTrader:
                   f"-> strategy={strategy}")
             if strategy == NO_TRADE:
                 return no_trade_proposal(
-                    f"no_edge vol={vol_state} trend={trend}", symbol)
+                    f"{REASON_WEAK_VOL_EDGE} vol={vol_state} trend={trend}", symbol)
 
             # 3) Snap target strikes to nearest available, then build legs.
             def near(strikes, target):
@@ -2763,49 +2765,49 @@ class SmartOptionsTrader:
             legs = []
             if strategy == BULLISH_PUT_CREDIT_SPREAD:
                 if len(put_strikes) < 2:
-                    return no_trade_proposal("no_strikes", symbol)
+                    return no_trade_proposal(REASON_MISSING_CHAIN, symbol)
                 short_k = near(put_strikes, price * 0.98)
                 long_k = near(put_strikes, short_k - W)
                 if long_k >= short_k:
-                    return no_trade_proposal("no_strikes", symbol)
+                    return no_trade_proposal(REASON_MISSING_CHAIN, symbol)
                 legs = [self._spread_leg_from_contract(puts[short_k], 'sell'),
                         self._spread_leg_from_contract(puts[long_k], 'buy')]
             elif strategy == BEARISH_CALL_CREDIT_SPREAD:
                 if len(call_strikes) < 2:
-                    return no_trade_proposal("no_strikes", symbol)
+                    return no_trade_proposal(REASON_MISSING_CHAIN, symbol)
                 short_k = near(call_strikes, price * 1.02)
                 long_k = near(call_strikes, short_k + W)
                 if long_k <= short_k:
-                    return no_trade_proposal("no_strikes", symbol)
+                    return no_trade_proposal(REASON_MISSING_CHAIN, symbol)
                 legs = [self._spread_leg_from_contract(calls[short_k], 'sell'),
                         self._spread_leg_from_contract(calls[long_k], 'buy')]
             elif strategy == DEBIT_CALL_SPREAD:
                 if len(call_strikes) < 2:
-                    return no_trade_proposal("no_strikes", symbol)
+                    return no_trade_proposal(REASON_MISSING_CHAIN, symbol)
                 long_k = near(call_strikes, price)
                 short_k = near(call_strikes, long_k + W)
                 if short_k <= long_k:
-                    return no_trade_proposal("no_strikes", symbol)
+                    return no_trade_proposal(REASON_MISSING_CHAIN, symbol)
                 legs = [self._spread_leg_from_contract(calls[long_k], 'buy'),
                         self._spread_leg_from_contract(calls[short_k], 'sell')]
             elif strategy == DEBIT_PUT_SPREAD:
                 if len(put_strikes) < 2:
-                    return no_trade_proposal("no_strikes", symbol)
+                    return no_trade_proposal(REASON_MISSING_CHAIN, symbol)
                 long_k = near(put_strikes, price)
                 short_k = near(put_strikes, long_k - W)
                 if short_k >= long_k:
-                    return no_trade_proposal("no_strikes", symbol)
+                    return no_trade_proposal(REASON_MISSING_CHAIN, symbol)
                 legs = [self._spread_leg_from_contract(puts[long_k], 'buy'),
                         self._spread_leg_from_contract(puts[short_k], 'sell')]
             elif strategy == IRON_CONDOR:
                 if len(put_strikes) < 2 or len(call_strikes) < 2:
-                    return no_trade_proposal("no_strikes", symbol)
+                    return no_trade_proposal(REASON_MISSING_CHAIN, symbol)
                 short_put_k = near(put_strikes, price * 0.97)
                 long_put_k = near(put_strikes, short_put_k - W)
                 short_call_k = near(call_strikes, price * 1.03)
                 long_call_k = near(call_strikes, short_call_k + W)
                 if not (long_put_k < short_put_k < short_call_k < long_call_k):
-                    return no_trade_proposal("no_strikes", symbol)
+                    return no_trade_proposal(REASON_MISSING_CHAIN, symbol)
                 legs = [self._spread_leg_from_contract(puts[long_put_k], 'buy'),
                         self._spread_leg_from_contract(puts[short_put_k], 'sell'),
                         self._spread_leg_from_contract(calls[short_call_k], 'sell'),
@@ -2815,6 +2817,20 @@ class SmartOptionsTrader:
 
             # 4) Build + validate (all hard safety gates live in the builder).
             proposal = build_spread(strategy, legs, cfg, symbol)
+
+            if proposal.is_tradeable:
+                # Recompute the oracle_score with the MEASURED vol_state/trend
+                # (the builder's default score assumes only selection-alignment).
+                proposal.oracle_score = compute_oracle_score(
+                    proposal, cfg, vol_state=vol_state, trend=trend)
+                # Phase 6B quality floors (no-ops unless configured).
+                q = quality_check(proposal, cfg)
+                if q:
+                    proposal = no_trade_proposal(q, symbol, proposal.legs)
+            else:
+                # Surface a Phase-6B quality reason for the hard-safety rejection.
+                proposal.reason = map_reason_to_quality(proposal.reason)
+
             # 5) Log the required [SPREAD_PROPOSAL] block.
             print(format_proposal_log(proposal))
             return proposal

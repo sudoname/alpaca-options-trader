@@ -13,11 +13,24 @@ is constructed against the local .env (paper keys) but its network-touching
 advisory services (news/sentiment) are disabled per-test.
 """
 
+import os
 import unittest
 from datetime import datetime, timedelta
+from unittest import mock
 
 from risk_engine import RiskEngine, RiskLimits, load_risk_limits_from_env
 from smart_trader import SmartOptionsTrader
+
+
+# Risk/limit keys that some other test modules (e.g. test_telegram, which calls
+# python-dotenv's load_dotenv at import) leak into os.environ from the real
+# .env. ConfigLoader treats os.environ as the highest-priority layer, so a
+# leaked value would shadow the code defaults these tests assert. We scrub them
+# for the duration of the env-default tests below.
+_LEAKABLE_RISK_KEYS = (
+    "MAX_BUDGET_PER_TRADE", "DAILY_LOSS_LIMIT", "MAX_CONCURRENT_POSITIONS",
+    "MIN_PDT_REMAINING", "KILL_SWITCH_LOSS", "MAX_POSITIONS_PER_UNDERLYING",
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -143,6 +156,18 @@ class TestRiskEngineCheck(unittest.TestCase):
 
 
 class TestPerUnderlyingCap(unittest.TestCase):
+    def setUp(self):
+        # Scrub risk-limit keys that sibling modules (e.g. test_telegram's
+        # load_dotenv) may have leaked into os.environ, so the .env-default
+        # assertions below see the code defaults, not the real .env values.
+        self._env_patch = mock.patch.dict(os.environ, {}, clear=False)
+        self._env_patch.start()
+        for key in _LEAKABLE_RISK_KEYS:
+            os.environ.pop(key, None)
+
+    def tearDown(self):
+        self._env_patch.stop()
+
     def test_default_is_no_op(self):
         """Default high limit never blocks, even with a count supplied."""
         eng = RiskEngine(RiskLimits())  # max_per_underlying defaults high
