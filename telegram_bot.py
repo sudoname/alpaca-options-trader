@@ -13,6 +13,16 @@ import random
 import re
 from datetime import datetime, timedelta
 
+
+def _is_number(token):
+    """True if ``token`` parses as a finite float (used by ANALYZE arg parsing)."""
+    try:
+        float(token)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
 class TelegramTradingBot:
     def __init__(self):
         self.load_config()
@@ -298,6 +308,14 @@ class TelegramTradingBot:
             symbol = parts[0].strip().upper() if parts else ''
             vix = parts[1] if len(parts) > 1 else None
             return self.vol_edge(symbol, vix, chat_id)
+
+        elif text.startswith('ANALYZE') or text.startswith('/ANALYZE'):
+            parts = text.replace('/ANALYZE', '').replace('ANALYZE', '', 1).split()
+            symbol = parts[0].strip().upper() if parts else ''
+            nums = [p for p in parts[1:] if _is_number(p)]
+            target = nums[0] if len(nums) >= 1 else None
+            days = nums[1] if len(nums) >= 2 else None
+            return self.analyze_move(symbol, target, days, chat_id)
 
         elif text == 'START':
             return self.start_monitoring()
@@ -1567,6 +1585,82 @@ Total symbols: `{len(self.supported_tickers)}`"""
             f"_(Advisory only — logged, does NOT alter trades.)_"
         )
 
+    def analyze_move(self, symbol, target=None, days=None, chat_id=None):
+        """Barrier touch-probability report: will SYMBOL reach TARGET in DAYS?
+
+        Usage: `ANALYZE SPY 710 30`  (symbol, target price, horizon days).
+        TARGET is optional — omit it and the report uses the symbol's own
+        1-sigma move at the horizon as the target. DAYS defaults to 30.
+
+        Pure observation layer: derives annualized vol from price history (via
+        the expected-move engine), folds the bot's own call/put signal in as a
+        directional drift, and prints touch probabilities across horizons plus
+        a plain-English verdict. Never places or alters a trade.
+        """
+        symbol = (symbol or '').strip().upper()
+        if not re.fullmatch(r'[A-Z]{1,5}', symbol):
+            return ("❌ Invalid symbol. Usage: `ANALYZE SPY 710 30`\n"
+                    "_(symbol, target price, days — target optional, days default 30)_")
+
+        # Parse numeric args (fail-open to defaults).
+        try:
+            days_i = int(float(days)) if days is not None else 30
+        except (TypeError, ValueError):
+            days_i = 30
+        days_i = max(1, min(days_i, 365))
+        try:
+            target_f = float(target) if target is not None else None
+        except (TypeError, ValueError):
+            target_f = None
+
+        try:
+            from expected_move_engine import (
+                ExpectedMoveConfig, ExpectedMoveEngine, gather_inputs_from_trader,
+            )
+            import barrier_engine as be
+            from smart_trader import SmartOptionsTrader
+        except Exception as e:
+            return f"❌ Barrier engine unavailable: {e}"
+
+        # 1) Live vol + spot from the expected-move engine.
+        try:
+            trader = SmartOptionsTrader(ticker=symbol)
+            inputs = gather_inputs_from_trader(trader, symbol)
+            result = ExpectedMoveEngine(ExpectedMoveConfig.from_env()).compute(
+                inputs, symbol=symbol)
+        except Exception as e:
+            return f"❌ Could not gather data for `{symbol}`: {e}"
+
+        spot = getattr(inputs, 'price', None)
+        sigma = getattr(result, 'forecast_vol', None)
+        if not spot or not sigma or sigma <= 0:
+            return (f"📭 *No barrier analysis for {symbol}*\n"
+                    f"Reason: insufficient price history (need vol + spot).\n"
+                    f"_(Advisory only — nothing was traded.)_")
+
+        # 2) Default target = 1-sigma move at the horizon (down-side, the common
+        #    "could it drop to" question) when the caller omits a target.
+        if target_f is None or target_f <= 0:
+            t_years = days_i / 365.0
+            move = spot * sigma * math.sqrt(t_years)
+            target_f = round(spot - move, 2)
+
+        # 3) Bot's directional signal -> drift (fail-open to neutral).
+        strategy = strength = momentum = None
+        try:
+            strategy = trader.determine_option_strategy(symbol)
+            strength = getattr(trader, 'last_signal_strength', None)
+            momentum = trader.calculate_momentum(symbol)
+        except Exception as e:
+            print(f"[ANALYZE] signal unavailable for {symbol} (neutral drift): {e}")
+
+        try:
+            return be.format_report(symbol, float(spot), float(target_f),
+                                    float(sigma), days_i, strategy=strategy,
+                                    strength=strength, momentum=momentum)
+        except Exception as e:
+            return f"❌ Could not build barrier report for `{symbol}`: {e}"
+
     def vol_edge(self, symbol, vix_arg=None, chat_id=None):
         """Phase 7A/8A: ADVISORY volatility edge + shadow recommendation.
 
@@ -2111,6 +2205,7 @@ Total symbols: `{len(self.supported_tickers)}`"""
 • `SPREAD_PAPER_POSITIONS` - List open simulated spreads
 • `SPREAD_PAPER_CLOSE ID` - Close a simulated spread (paper only)
 • `EXPECTED_MOVE TICKER [VIX]` - Expected move + vol edge (advisory)
+• `ANALYZE TICKER [TARGET] [DAYS]` - Barrier touch-probability: will it reach TARGET in DAYS? (advisory)
 • `VOL_EDGE TICKER [VIX]` - Volatility edge + shadow rec (advisory)
 • `ORACLE_DATASET_STATS` - Training dataset summary (advisory)
 • `ORACLE_STATS` - Oracle performance summary (analytics)
