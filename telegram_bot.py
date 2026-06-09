@@ -73,6 +73,24 @@ class TelegramTradingBot:
         self.spread_paper_enabled = env_vars.get(
             'USE_SPREAD_PAPER_TRADING', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
 
+        # Phase 8D: optional scheduled daily Oracle report. When
+        # ENABLE_DAILY_ORACLE_REPORT is on, a background watcher sends the
+        # analytics-only daily report once per day at HOUR:MINUTE (local time),
+        # de-duplicated across restarts via oracle_daily_report_state.json.
+        # Default off -> the command still works on demand; nothing is scheduled.
+        self.daily_oracle_report_enabled = env_vars.get(
+            'ENABLE_DAILY_ORACLE_REPORT', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
+        try:
+            self.daily_oracle_report_hour = int(env_vars.get('DAILY_ORACLE_REPORT_HOUR', '16'))
+        except (TypeError, ValueError):
+            self.daily_oracle_report_hour = 16
+        try:
+            self.daily_oracle_report_minute = int(env_vars.get('DAILY_ORACLE_REPORT_MINUTE', '15'))
+        except (TypeError, ValueError):
+            self.daily_oracle_report_minute = 15
+        self.daily_oracle_report_state_file = env_vars.get(
+            'DAILY_ORACLE_REPORT_STATE_FILE', 'oracle_daily_report_state.json')
+
         if not self.bot_token:
             print("\n❌ Missing TELEGRAM_BOT_TOKEN in .env file")
             print("1. Create bot with @BotFather on Telegram")
@@ -248,6 +266,12 @@ class TelegramTradingBot:
 
         elif text == 'DATA_COVERAGE' or text == '/DATA_COVERAGE':
             return self.data_coverage(chat_id)
+
+        elif text == 'ORACLE_DAILY_REPORT' or text == '/ORACLE_DAILY_REPORT':
+            return self.oracle_daily_report(chat_id)
+
+        elif text == 'HYPOTHESIS_REPORT' or text == '/HYPOTHESIS_REPORT':
+            return self.hypothesis_report(chat_id)
 
         elif text.startswith('EXPECTED_MOVE') or text.startswith('/EXPECTED_MOVE'):
             parts = text.replace('/EXPECTED_MOVE', '').replace('EXPECTED_MOVE', '', 1).split()
@@ -1835,6 +1859,62 @@ Total symbols: `{len(self.supported_tickers)}`"""
             f"_(Analytics only — nothing was traded.)_"
         )
 
+    def oracle_daily_report(self, chat_id=None):
+        """Phase 8D: on-demand daily Oracle report (analytics only).
+
+        Read-only summary of the simulated paper book, prediction accuracy,
+        top volatility-edge opportunities, spread performance, and advisory
+        threshold recommendations. Places no trades.
+        """
+        try:
+            from oracle_daily_report import generate_daily_report_text
+            return generate_daily_report_text()
+        except Exception as e:
+            return f"❌ Could not build the daily report: {e}"
+
+    def hypothesis_report(self, chat_id=None):
+        """Phase 8E: advisory hypothesis testing over the simulated book.
+
+        Read-only — compares A/B groups (score / edge / DTE / IV rank /
+        strategy) and reports which side outperformed, with sample-size
+        confidence. Changes no thresholds and places no trades.
+        """
+        try:
+            from hypothesis_engine import generate_hypothesis_report_text
+            return generate_hypothesis_report_text()
+        except Exception as e:
+            return f"❌ Could not build the hypothesis report: {e}"
+
+    def daily_oracle_report_watch(self):
+        """Phase 8D background watcher: send the daily Oracle report once per
+        day at the configured HOUR:MINUTE, de-duplicated across restarts via a
+        small JSON state file. Analytics only — never trades."""
+        if not self.daily_oracle_report_enabled:
+            return
+        try:
+            from oracle_daily_report import (
+                generate_daily_report_text, should_send_daily_report,
+                read_last_sent_date, write_last_sent_date,
+            )
+        except Exception as e:
+            print(f"[ORACLE_REPORT] could not start watcher: {e}")
+            return
+        print("[ORACLE_REPORT] daily report watcher started "
+              f"({self.daily_oracle_report_hour:02d}:{self.daily_oracle_report_minute:02d})")
+        while True:
+            try:
+                now = datetime.now()
+                last = read_last_sent_date(self.daily_oracle_report_state_file)
+                if should_send_daily_report(now, self.daily_oracle_report_hour,
+                                            self.daily_oracle_report_minute, last):
+                    self._broadcast(generate_daily_report_text())
+                    write_last_sent_date(now.strftime("%Y-%m-%d"),
+                                         self.daily_oracle_report_state_file)
+                    print("[ORACLE_REPORT] daily report sent")
+            except Exception as e:
+                print(f"[ORACLE_REPORT] watch error: {e}")
+            time.sleep(60)
+
     def _spread_paper_trader(self):
         """Build a SpreadPaperTrader from env (Phase 6C). No broker client."""
         from spread_paper_trader import SpreadPaperConfig, SpreadPaperTrader
@@ -1972,6 +2052,8 @@ Total symbols: `{len(self.supported_tickers)}`"""
 • `LEARNING_PERFORMANCE` - PnL by score/edge/DTE/IV buckets (analytics)
 • `THRESHOLD_RECOMMENDATIONS` - Suggested score/edge/DTE/IV/strategy cuts (advisory)
 • `DATA_COVERAGE` - Trades/symbols analyzed + prediction coverage (advisory)
+• `ORACLE_DAILY_REPORT` - Full daily Oracle report (analytics)
+• `HYPOTHESIS_REPORT` - A/B hypothesis findings (advisory)
 • `START` - Start monitoring
 • `STOP` - Stop monitoring
 
@@ -2286,6 +2368,11 @@ Position closed to limit losses"""
         # Start the end-of-day summary watcher (daemon; daily summary at close).
         if self.eod_summary_enabled:
             threading.Thread(target=self.eod_summary_watch, daemon=True).start()
+
+        # Start the daily Oracle report watcher (daemon; analytics-only report
+        # once per day at the configured time). Phase 8D; default off.
+        if self.daily_oracle_report_enabled:
+            threading.Thread(target=self.daily_oracle_report_watch, daemon=True).start()
 
         while True:
             try:

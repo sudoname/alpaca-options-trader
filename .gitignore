@@ -23,6 +23,7 @@ rl_qtable_backtest.json
 rl_experience.json
 sentiment_cache.json
 news_cache.json
+oracle_daily_report_state.json
 day_trades_log.json
 realized_pnl_log.json
 pending_order.json
