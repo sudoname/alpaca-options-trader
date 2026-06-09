@@ -41,6 +41,8 @@ spread_paper_trades.json
 expected_move_history.csv
 oracle_training_dataset.csv
 learning_shadow_log.csv
+learning_validation.csv
+advisory_attribution.json
 trade_*.json
 option_scan_*.json
 option_scan_*.txt

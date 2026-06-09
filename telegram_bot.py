@@ -273,6 +273,20 @@ class TelegramTradingBot:
         elif text == 'HYPOTHESIS_REPORT' or text == '/HYPOTHESIS_REPORT':
             return self.hypothesis_report(chat_id)
 
+        elif text == 'RL_PERFORMANCE' or text == '/RL_PERFORMANCE':
+            return self.rl_performance(chat_id)
+
+        elif text == 'VALIDATION_STATS' or text == '/VALIDATION_STATS':
+            return self.validation_stats(chat_id)
+
+        elif text == 'ADVISORY_PERFORMANCE' or text == '/ADVISORY_PERFORMANCE':
+            return self.advisory_performance(chat_id)
+
+        elif text.startswith('ADVISORY_CHECK') or text.startswith('/ADVISORY_CHECK'):
+            parts = text.replace('/ADVISORY_CHECK', '').replace('ADVISORY_CHECK', '', 1).split()
+            symbol = parts[0].strip().upper() if parts else ''
+            return self.advisory_check(symbol, chat_id)
+
         elif text.startswith('EXPECTED_MOVE') or text.startswith('/EXPECTED_MOVE'):
             parts = text.replace('/EXPECTED_MOVE', '').replace('EXPECTED_MOVE', '', 1).split()
             symbol = parts[0].strip().upper() if parts else ''
@@ -1885,6 +1899,59 @@ Total symbols: `{len(self.supported_tickers)}`"""
         except Exception as e:
             return f"❌ Could not build the hypothesis report: {e}"
 
+    def advisory_check(self, symbol, chat_id=None):
+        """Phase 9A: advisory verdict for a proposed setup (advisory only).
+
+        Compares the symbol's latest known features (oracle score, vol edge,
+        DTE, IV rank, strategy) against the data-driven thresholds and reports
+        STRONG_ACCEPT / ACCEPT / NEUTRAL / WEAK_SETUP / REJECT_CANDIDATE plus the
+        historical win rate / profit factor. Blocks nothing and trades nothing.
+        """
+        try:
+            from advisory_gate import generate_advisory_check_text
+            return generate_advisory_check_text(symbol)
+        except Exception as e:
+            return f"❌ Could not run the advisory check: {e}"
+
+    def rl_performance(self, chat_id=None):
+        """Phase 9B: Oracle-vs-RL performance over completed trades (advisory).
+
+        Read-only — win rate / profit factor for each decision policy plus the
+        agreement / disagreement rate and sample size. Changes nothing.
+        """
+        try:
+            from learning_validation import generate_rl_performance_text
+            return generate_rl_performance_text()
+        except Exception as e:
+            return f"❌ Could not build RL performance: {e}"
+
+    def validation_stats(self, chat_id=None):
+        """Phase 9B: learning-validation summary over completed trades.
+
+        Read-only — refreshes the derived learning_validation.csv dataset and
+        reports Oracle/RL decision counts, agreement and recent comparisons.
+        Places no trades.
+        """
+        try:
+            from learning_validation import generate_validation_stats_text
+            return generate_validation_stats_text()
+        except Exception as e:
+            return f"❌ Could not build validation stats: {e}"
+
+    def advisory_performance(self, chat_id=None):
+        """Phase 9C: predictive value of the advisory gate (advisory only).
+
+        Read-only — groups completed trades by the recommendation captured at
+        OPEN time (before the outcome was known) and reports trades / win rate /
+        profit factor / total + average PnL per category, with a sample-size
+        confidence. Measures predictive power; trades nothing.
+        """
+        try:
+            from advisory_attribution import generate_advisory_performance_text
+            return generate_advisory_performance_text()
+        except Exception as e:
+            return f"❌ Could not build advisory performance: {e}"
+
     def daily_oracle_report_watch(self):
         """Phase 8D background watcher: send the daily Oracle report once per
         day at the configured HOUR:MINUTE, de-duplicated across restarts via a
@@ -2054,6 +2121,10 @@ Total symbols: `{len(self.supported_tickers)}`"""
 • `DATA_COVERAGE` - Trades/symbols analyzed + prediction coverage (advisory)
 • `ORACLE_DAILY_REPORT` - Full daily Oracle report (analytics)
 • `HYPOTHESIS_REPORT` - A/B hypothesis findings (advisory)
+• `ADVISORY_CHECK TICKER` - Advisory accept/reject verdict for a setup (advisory)
+• `RL_PERFORMANCE` - Oracle vs RL win rate / PF / agreement (advisory)
+• `VALIDATION_STATS` - Oracle vs RL decision summary (advisory)
+• `ADVISORY_PERFORMANCE` - Win rate / PF / PnL by recommendation tier (advisory)
 • `START` - Start monitoring
 • `STOP` - Stop monitoring
 

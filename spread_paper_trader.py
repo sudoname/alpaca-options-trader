@@ -336,6 +336,15 @@ class SpreadPaperTrader:
               f"net={position['net_credit_or_debit']:+.2f} "
               f"entry_mark={entry_mark:+.4f} max_loss={position['max_loss']:.2f} "
               f"(paper only, no broker order)")
+
+        # Phase 9C: capture the advisory recommendation at OPEN time (before the
+        # outcome is known). Pure observer — fail-open, never affects the trade.
+        try:
+            import advisory_attribution
+            advisory_attribution.record_open(position)
+        except Exception as exc:
+            print(f"[ADVISORY_ATTRIBUTION] open hook ignored: {exc}")
+
         return {"allowed": True, "reason": REASON_OPENED, "position": position}
 
     @staticmethod
@@ -461,6 +470,15 @@ class SpreadPaperTrader:
               f"pnl={marked.get('pnl'):+.2f} "
               f"({marked.get('pnl_percent'):+.1f}% of max_loss) "
               f"(paper only, no broker order)")
+
+        # Phase 9C: append the realized outcome to the entry-time advisory
+        # snapshot (advisory fields are NOT recomputed). Fail-open observer.
+        try:
+            import advisory_attribution
+            advisory_attribution.record_close(marked)
+        except Exception as exc:
+            print(f"[ADVISORY_ATTRIBUTION] close hook ignored: {exc}")
+
         return marked
 
 
