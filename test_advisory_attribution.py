@@ -185,6 +185,22 @@ class TestFormatting(unittest.TestCase):
         self.assertEqual(aa._pf_str(float("inf")), "∞")
         self.assertEqual(aa._pf_str(2.4), "2.40")
 
+    def test_pnl_str(self):
+        self.assertEqual(aa._pnl_str(None), "n/a")
+        self.assertEqual(aa._pnl_str(81), "+$81")
+        self.assertEqual(aa._pnl_str(-540), "-$540")
+        # values past +/-1000 use a thousands separator (regression: the
+        # "%+,.0f" %% form raised ValueError on this branch)
+        self.assertEqual(aa._pnl_str(1820), "+$1,820")
+        self.assertEqual(aa._pnl_str(-3420.0), "-$3,420")
+
+    def test_format_large_pnl_does_not_raise(self):
+        snaps = [{"trade_id": str(i), "advisory_recommendation": ag.STRONG_ACCEPT,
+                  "pnl": 500.0} for i in range(5)]  # total 2500 -> >= 1000
+        txt = aa.format_advisory_performance(
+            aa.compute_advisory_performance(snapshots=snaps))
+        self.assertIn("+$2,500", txt)
+
 
 class TestTelegramCommand(unittest.TestCase):
     def test_generate_text(self):

@@ -321,7 +321,8 @@ def _pnl_str(value) -> str:
     v = oa._to_float(value)
     if v is None:
         return "n/a"
-    return "%+,.0f" % v if abs(v) >= 1000 else "%+.0f" % v
+    sign = "-" if v < 0 else "+"
+    return f"{sign}${abs(v):,.0f}"
 
 
 def _category_block(label: str, m: dict) -> str:
@@ -330,8 +331,8 @@ def _category_block(label: str, m: dict) -> str:
         f"Trades: `{m['trades']}`\n"
         f"Win Rate: `{m['win_rate'] * 100:.0f}%`\n"
         f"Profit Factor: `{_pf_str(m['profit_factor'])}`\n"
-        f"PnL: `${_pnl_str(m['total_pnl'])}`\n"
-        f"Avg PnL: `${_pnl_str(m['avg_pnl'])}`"
+        f"PnL: `{_pnl_str(m['total_pnl'])}`\n"
+        f"Avg PnL: `{_pnl_str(m['avg_pnl'])}`"
     )
 
 
