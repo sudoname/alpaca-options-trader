@@ -48,6 +48,8 @@ import time
 import argparse
 from datetime import datetime, date, time as dtime
 
+from exit_manager import enforce_exit
+
 ACTIVE_TRADES_FILE = "active_trades.json"
 STATUS_FILE = "scheduler_status.json"
 SCHEDULER_SOURCE = "alpaca_scheduler"
@@ -232,6 +234,100 @@ def _stamp_scheduler_trade(option_symbol):
     return stamped
 
 
+def _write_active_trades(trades):
+    """Persist the active-trades list (the survivors left after closes). Pairs
+    with `_read_active_trades`; both callers (EOD close + the fill-driven
+    reconcile) prune closed rows here so a sold position can't linger as
+    'tracked open'. Fail-open: a write error is logged, never raised."""
+    try:
+        with open(ACTIVE_TRADES_FILE, "w") as f:
+            json.dump(trades, f, indent=2, default=str)
+    except Exception as e:
+        log(f"[WARN] could not write {ACTIVE_TRADES_FILE}: {e}")
+
+
+def realized_from_fills(trade, fills):
+    """PURE: compute (exit_price, pnl_percent) for `trade` from its SELL `fills`.
+
+    `fills` is a list of activity dicts ({'qty','price','transaction_time'}) for
+    the trade's symbol. Uses a quantity-weighted average over the most-recent
+    sells that cover the open quantity, so a position closed in several fills
+    (e.g. 1+1) books at its true average exit. Returns (None, None) when there
+    is no usable entry price / quantity / fill — the caller then leaves the row
+    tracked rather than booking a bogus outcome. No network, unit-testable."""
+    try:
+        entry = float(trade.get("entry_price") or 0)
+        want = float(trade.get("quantity") or 0)
+    except (TypeError, ValueError):
+        return (None, None)
+    if entry <= 0 or want <= 0 or not fills:
+        return (None, None)
+    ordered = sorted(fills, key=lambda a: str(a.get("transaction_time") or ""),
+                     reverse=True)
+    filled_qty = 0.0
+    proceeds = 0.0
+    for a in ordered:
+        try:
+            q = float(a.get("qty") or 0)
+            p = float(a.get("price") or 0)
+        except (TypeError, ValueError):
+            continue
+        if q <= 0 or p <= 0:
+            continue
+        take = min(q, want - filled_qty)
+        if take <= 0:
+            break
+        filled_qty += take
+        proceeds += take * p
+        if filled_qty >= want:
+            break
+    if filled_qty <= 0:
+        return (None, None)
+    exit_price = proceeds / filled_qty
+    pnl_percent = (exit_price - entry) / entry * 100.0
+    return (exit_price, pnl_percent)
+
+
+def _fetch_sell_fills_by_symbol(trader):
+    """Pull recent FILL activities from the broker and group the SELL fills by
+    symbol. Fail-open: returns {} on any HTTP / parse error so the reconcile
+    simply does nothing rather than raising on the live path."""
+    import requests
+    try:
+        r = requests.get(
+            f"{trader.base_url}/v2/account/activities",
+            headers=trader.headers,
+            params={"activity_types": "FILL", "direction": "desc",
+                    "page_size": 100},
+            timeout=30,
+        )
+        if r.status_code != 200:
+            return {}
+        acts = r.json()
+    except Exception:
+        return {}
+    out = {}
+    for a in acts:
+        if a.get("side") in ("sell", "sell_to_close", "sell_to_open"):
+            out.setdefault(a.get("symbol"), []).append(a)
+    return out
+
+
+def _already_booked(trader, trade):
+    """True if `trade` (matched on symbol + entry_time) is already in the
+    trader's trading_history — guards the reconcile against double-counting a
+    close that the EOD/monitor path already recorded."""
+    sym = trade.get("symbol")
+    et = str(trade.get("entry_time") or "")
+    try:
+        for r in trader.trading_history.get("trades", []):
+            if r.get("symbol") == sym and str(r.get("entry_time") or "") == et:
+                return True
+    except Exception:
+        pass
+    return False
+
+
 # --------------------------------------------------------------------------- #
 # Scheduler
 # --------------------------------------------------------------------------- #
@@ -281,12 +377,20 @@ class IntradayScheduler:
 
     # -- exits --------------------------------------------------------------- #
     def force_close_scheduler_positions(self):
-        """Force-close (market sell) only positions this scheduler opened."""
+        """Force-close (market sell) only positions this scheduler opened.
+
+        Routes each close through the shared `enforce_exit` path so the outcome
+        is recorded EXACTLY like every other exit (trading_history + realized
+        P/L + RL/shadow), then prunes the closed rows from active_trades.json.
+        Previously this called `close_position` directly, which fired the sell
+        but never recorded the outcome or pruned the row — leaving sold
+        positions stuck as 'tracked open' and missing from realized P/L."""
         trades = _read_active_trades()
         if not trades:
             return
         positions = self.trader.get_positions() or []
         by_symbol = {p.get("symbol"): p for p in positions}
+        closed_syms = set()
         for trade in trades:
             if trade.get("source") != SCHEDULER_SOURCE:
                 continue
@@ -294,9 +398,67 @@ class IntradayScheduler:
             if pos:
                 log(f"[EOD] closing scheduler position {trade.get('symbol')}")
                 try:
-                    self.trader.close_position(trade, pos, "EOD_CLOSE")
+                    current_price = float(pos.get("current_price") or 0)
+                    entry_price = float(trade.get("entry_price") or 0)
+                    pnl_percent = (((current_price - entry_price) / entry_price
+                                    * 100.0) if entry_price else 0.0)
+                    enforce_exit(self.trader, trade, pos, "EOD_CLOSE",
+                                 pnl_percent, "scheduler", current_price)
+                    closed_syms.add(trade.get("symbol"))
                 except Exception as e:
                     log(f"[WARN] EOD close failed for {trade.get('symbol')}: {e}")
+        if closed_syms:
+            survivors = [t for t in trades
+                         if t.get("symbol") not in closed_syms]
+            _write_active_trades(survivors)
+
+    def reconcile_closed_from_fills(self):
+        """Fill-driven safety net: book any scheduler-owned tracked trade that is
+        no longer held at the broker, using its ACTUAL sell fill(s), then prune
+        it from active_trades.json.
+
+        This is the catch-all behind the EOD/monitor exit paths: it books closes
+        that happened through ANY route we don't own (a force-close that errored
+        mid-batch, a manual liquidation, expiry/auto-exercise), so realized P/L
+        and the kill-switch can't silently miss a close again. Idempotent via
+        `_already_booked`; fail-open — never raises on the live path."""
+        try:
+            trades = _read_active_trades()
+            if not trades:
+                return
+            positions = self.trader.get_positions() or []
+            held = {p.get("symbol") for p in positions}
+            orphans = [t for t in trades
+                       if t.get("source") == SCHEDULER_SOURCE
+                       and t.get("symbol") not in held]
+            if not orphans:
+                return
+            fills_by_symbol = _fetch_sell_fills_by_symbol(self.trader)
+            closed_syms = set()
+            for t in orphans:
+                sym = t.get("symbol")
+                if _already_booked(self.trader, t):
+                    closed_syms.add(sym)  # booked elsewhere; just prune it
+                    continue
+                exit_price, pnl_percent = realized_from_fills(
+                    t, fills_by_symbol.get(sym, []))
+                if exit_price is None:
+                    log(f"[RECONCILE] no sell fill for {sym}; leaving tracked")
+                    continue
+                log(f"[RECONCILE] booking missed close {sym} "
+                    f"exit={exit_price:.2f} pnl={pnl_percent:+.1f}%")
+                try:
+                    self.trader.record_trade_outcome(
+                        t, "reconciled_fill_close", pnl_percent)
+                    closed_syms.add(sym)
+                except Exception as e:
+                    log(f"[RECONCILE] record failed for {sym}: {e}")
+            if closed_syms:
+                survivors = [t for t in trades
+                             if t.get("symbol") not in closed_syms]
+                _write_active_trades(survivors)
+        except Exception as e:
+            log(f"[WARN] reconcile_closed_from_fills failed: {e}")
 
     def _has_live_position(self, sym):
         positions = self.trader.get_positions() or []
@@ -460,6 +622,10 @@ class IntradayScheduler:
             self.trader.monitor_positions()
         except Exception as e:
             log(f"[WARN] monitor_positions failed: {e}")
+
+        # 1b) fill-driven safety net: book + prune any tracked position that
+        # has already left the broker (closed via any path) from its real fill.
+        self.reconcile_closed_from_fills()
 
         # 2) EOD force-close window — close ours, do not open new
         if in_eod_window(parsed["now"], parsed["next_close"], eod_min=self.cfg.eod_close_min):
