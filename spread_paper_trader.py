@@ -59,6 +59,37 @@ REASON_DUPLICATE_POSITION = "duplicate_position"
 STATUS_OPEN = "open"
 STATUS_CLOSED = "closed"
 
+# Phase 8B: analytics fields every CLOSED trade record is guaranteed to carry.
+# Values are captured (best-effort) at open/close time; missing inputs store
+# None so the schema is stable for the analytics layer. This is metadata
+# capture only — it never alters open/mark/close math or any execution path.
+ANALYTICS_FIELDS = (
+    "symbol", "date", "strategy", "oracle_score", "volatility_edge",
+    "expected_move", "market_expected_move", "actual_move", "pnl",
+    "pnl_percent", "max_profit", "max_loss", "exit_reason", "dte", "iv_rank",
+)
+
+# Analytics fields supplied (optionally) at OPEN time, via ``context`` or as
+# attributes on the proposal. All default to None when unavailable.
+_OPEN_CONTEXT_FIELDS = (
+    "volatility_edge", "expected_move", "market_expected_move",
+    "dte", "iv_rank", "entry_underlying_price",
+)
+
+
+def _coerce_number(value):
+    """Best-effort float coercion; returns None for missing/bad values."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
 
 # --------------------------------------------------------------------------- #
 # Config
@@ -208,16 +239,40 @@ class SpreadPaperTrader:
         return None
 
     # -- open ------------------------------------------------------------- #
+    @staticmethod
+    def _open_context(proposal: "SpreadProposal",
+                      context: Optional[Mapping]) -> Dict[str, Optional[float]]:
+        """Resolve the optional analytics fields captured at open time.
+
+        Looks first in the explicit ``context`` mapping, then falls back to a
+        same-named attribute on the proposal, else None. Purely additive
+        metadata — does not influence any open/reject decision.
+        """
+        ctx = context or {}
+        out: Dict[str, Optional[float]] = {}
+        for field_name in _OPEN_CONTEXT_FIELDS:
+            if field_name in ctx:
+                out[field_name] = _coerce_number(ctx.get(field_name))
+            else:
+                out[field_name] = _coerce_number(getattr(proposal, field_name, None))
+        return out
+
     def open_position(
         self,
         proposal: "SpreadProposal",
         quotes: Optional[Mapping[str, Union[float, Mapping]]] = None,
+        context: Optional[Mapping] = None,
     ) -> dict:
         """Open a simulated spread position from a proposal.
 
         Returns a result dict: ``{'allowed': bool, 'reason': str,
         'position': dict|None}``. Performs ONLY simulation — no Alpaca order is
         ever submitted. All safety rejections (Req 4) happen here.
+
+        ``context`` (optional, Phase 8B) may carry analytics metadata to capture
+        on the record: ``volatility_edge``, ``expected_move``,
+        ``market_expected_move``, ``dte``, ``iv_rank``, ``entry_underlying_price``.
+        It NEVER affects whether/how a position opens.
         """
         if not self.config.enabled:
             return self._reject(REASON_DISABLED)
@@ -242,6 +297,7 @@ class SpreadPaperTrader:
 
         legs = [l.as_dict() for l in getattr(proposal, "legs", [])]
         entry_mark = compute_mark(legs, quotes)
+        analytics = self._open_context(proposal, context)
         position = {
             "id": uuid.uuid4().hex[:12],
             "timestamp": _now_iso(),
@@ -260,6 +316,14 @@ class SpreadPaperTrader:
             "pnl": 0.0,
             "pnl_percent": 0.0,
             "exit_reason": None,
+            # Phase 8B analytics metadata (captured at open; may be None).
+            "volatility_edge": analytics["volatility_edge"],
+            "expected_move": analytics["expected_move"],
+            "market_expected_move": analytics["market_expected_move"],
+            "dte": analytics["dte"],
+            "iv_rank": analytics["iv_rank"],
+            "entry_underlying_price": analytics["entry_underlying_price"],
+            "actual_move": None,   # finalized at close
         }
 
         rows = self.load_positions()
@@ -321,17 +385,49 @@ class SpreadPaperTrader:
         return pos
 
     # -- close ------------------------------------------------------------ #
+    @staticmethod
+    def _finalize_analytics(record: dict, context: Optional[Mapping]) -> None:
+        """Stamp ``date`` + ``actual_move`` and guarantee the analytics schema.
+
+        ``actual_move`` is taken from ``context['actual_move']`` if given, else
+        derived from ``context['exit_underlying_price']`` minus the position's
+        ``entry_underlying_price`` when both are known, else left None. Any
+        :data:`ANALYTICS_FIELDS` not already present are filled with None so the
+        closed-trade schema is stable for the analytics layer. Metadata only.
+        """
+        ctx = context or {}
+        # date: prefer the close timestamp, fall back to open timestamp.
+        stamp = record.get("closed_at") or record.get("timestamp") or _now_iso()
+        record["date"] = str(stamp)[:10]
+
+        actual_move = _coerce_number(ctx.get("actual_move"))
+        if actual_move is None:
+            exit_px = _coerce_number(ctx.get("exit_underlying_price"))
+            entry_px = _coerce_number(record.get("entry_underlying_price"))
+            if exit_px is not None and entry_px is not None:
+                actual_move = round(exit_px - entry_px, 4)
+        if actual_move is not None:
+            record["actual_move"] = actual_move
+
+        for field_name in ANALYTICS_FIELDS:
+            record.setdefault(field_name, None)
+
     def close_position(
         self,
         position_id: str,
         quotes: Optional[Mapping[str, Union[float, Mapping]]] = None,
         exit_reason: str = "manual_close",
+        context: Optional[Mapping] = None,
     ) -> Optional[dict]:
         """Close a simulated position: final MTM, move to trade history.
 
         Removes the position from the open store and appends the finalized record
         to the trades file. Returns the closed trade dict, or None if not found /
         already closed. No broker calls.
+
+        ``context`` (optional, Phase 8B) may carry ``actual_move`` or
+        ``exit_underlying_price`` so the closed record captures the realized
+        underlying move for prediction-accuracy analytics. Metadata only.
         """
         rows = self.load_positions()
         target = None
@@ -353,6 +449,7 @@ class SpreadPaperTrader:
         marked["status"] = STATUS_CLOSED
         marked["exit_reason"] = exit_reason
         marked["closed_at"] = _now_iso()
+        self._finalize_analytics(marked, context)
 
         self.save_positions(remaining)
         trades = self.load_trades()

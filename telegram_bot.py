@@ -231,6 +231,18 @@ class TelegramTradingBot:
         elif text == 'ORACLE_DATASET_STATS' or text == '/ORACLE_DATASET_STATS':
             return self.oracle_dataset_stats(chat_id)
 
+        elif text == 'ORACLE_STATS' or text == '/ORACLE_STATS':
+            return self.oracle_stats(chat_id)
+
+        elif text == 'VOL_EDGE_LEADERBOARD' or text == '/VOL_EDGE_LEADERBOARD':
+            return self.vol_edge_leaderboard(chat_id)
+
+        elif text == 'SPREAD_PERFORMANCE' or text == '/SPREAD_PERFORMANCE':
+            return self.spread_performance(chat_id)
+
+        elif text == 'LEARNING_PERFORMANCE' or text == '/LEARNING_PERFORMANCE':
+            return self.learning_performance(chat_id)
+
         elif text.startswith('EXPECTED_MOVE') or text.startswith('/EXPECTED_MOVE'):
             parts = text.replace('/EXPECTED_MOVE', '').replace('EXPECTED_MOVE', '', 1).split()
             symbol = parts[0].strip().upper() if parts else ''
@@ -1633,6 +1645,124 @@ Total symbols: `{len(self.supported_tickers)}`"""
             f"_(Advisory recorder — no trades are placed.)_"
         )
 
+    # ------------------------------------------------------------------ #
+    # Phase 8B — Oracle analytics & validation (read-only)
+    # ------------------------------------------------------------------ #
+    def oracle_stats(self, chat_id=None):
+        """Phase 8B: headline Oracle stats from the simulated paper book.
+
+        Read-only analytics over historical files — never trades.
+        """
+        try:
+            from oracle_analytics import compute_oracle_stats
+            s = compute_oracle_stats()
+        except Exception as e:
+            return f"❌ Could not compute Oracle stats: {e}"
+
+        def pct(x):
+            return f"{x * 100:.1f}%" if isinstance(x, (int, float)) else "n/a"
+
+        avg_os = (f"{s['avg_oracle_score']:.1f}"
+                  if isinstance(s['avg_oracle_score'], (int, float)) else "n/a")
+        avg_edge = (f"{s['avg_volatility_edge'] * 100:+.1f}%"
+                    if isinstance(s['avg_volatility_edge'], (int, float)) else "n/a")
+        eme = s["expected_move_error"]
+        return (
+            f"📊 *Oracle Stats* _(simulated paper book)_\n"
+            f"Trades: `{s['trades']}`\n"
+            f"Win Rate: `{pct(s['win_rate'])}`\n"
+            f"Total P/L: `${s['total_pnl']:+.2f}`\n"
+            f"Avg Oracle Score: `{avg_os}`\n"
+            f"Avg Volatility Edge: `{avg_edge}`\n\n"
+            f"*Expected Move Error (MAE):*\n"
+            f"1D: `{pct(eme.get('1d'))}`\n"
+            f"3D: `{pct(eme.get('3d'))}`\n"
+            f"7D: `{pct(eme.get('7d'))}`\n"
+            f"30D: `{pct(eme.get('30d'))}`\n\n"
+            f"*Paper Account Summary:*\n"
+            f"Open P/L: `${s['open_pnl']:+.2f}` ({s['open_positions']} open)\n"
+            f"Closed P/L: `${s['closed_pnl']:+.2f}`\n"
+            f"_(Analytics only — nothing was traded.)_"
+        )
+
+    def vol_edge_leaderboard(self, chat_id=None):
+        """Phase 8B: top symbols by current volatility edge (read-only)."""
+        try:
+            from oracle_analytics import compute_vol_edge_leaderboard
+            board = compute_vol_edge_leaderboard(top_n=10)
+        except Exception as e:
+            return f"❌ Could not compute leaderboard: {e}"
+
+        if not board:
+            return ("📭 *No volatility-edge data yet.*\n"
+                    "Run `EXPECTED_MOVE`/`VOL_EDGE` to populate history.\n"
+                    "_(Analytics only.)_")
+
+        lines = ["🏆 *Volatility Edge Leaderboard*\n"]
+        for i, e in enumerate(board, 1):
+            os_str = (f"{e['oracle_score']:.0f}"
+                      if isinstance(e['oracle_score'], (int, float)) else "n/a")
+            em = (f"{e['expected_move']:.2f}"
+                  if isinstance(e['expected_move'], (int, float)) else "n/a")
+            mem = (f"{e['market_expected_move']:.2f}"
+                   if isinstance(e['market_expected_move'], (int, float)) else "n/a")
+            lines.append(
+                f"{i}. `{e['symbol']}` {e['volatility_edge'] * 100:+.1f}%\n"
+                f"   em `{em}` · market_em `{mem}` · oracle `{os_str}`")
+        lines.append("\n_(Analytics only — nothing was traded.)_")
+        return "\n".join(lines)
+
+    def spread_performance(self, chat_id=None):
+        """Phase 8B: win rate + PnL by spread strategy (read-only)."""
+        try:
+            from oracle_analytics import compute_spread_performance
+            perf = compute_spread_performance()
+        except Exception as e:
+            return f"❌ Could not compute spread performance: {e}"
+
+        if not perf:
+            return ("📭 *No closed paper spreads yet.*\n"
+                    "_(Analytics only.)_")
+
+        lines = ["📈 *Spread Performance by Strategy*\n"]
+        for strat, a in perf.items():
+            lines.append(
+                f"*{strat}*\n"
+                f"Trades: `{a['trades']}`\n"
+                f"Win Rate: `{a['win_rate'] * 100:.0f}%`\n"
+                f"P/L: `${a['pnl']:+.2f}`\n")
+        lines.append("_(Analytics only — nothing was traded.)_")
+        return "\n".join(lines)
+
+    def learning_performance(self, chat_id=None):
+        """Phase 8B: bucketed PnL by oracle score, vol edge, DTE, IV rank."""
+        try:
+            from oracle_analytics import compute_learning_performance
+            lp = compute_learning_performance()
+        except Exception as e:
+            return f"❌ Could not compute learning performance: {e}"
+
+        if not lp.get("n_trades"):
+            return ("📭 *No closed paper spreads yet.*\n"
+                    "_(Analytics only.)_")
+
+        def block(title, buckets):
+            out = [f"*{title}*"]
+            for label, a in buckets.items():
+                out.append(
+                    f"{label}: `{a['trades']}` trades · "
+                    f"`{a['win_rate'] * 100:.0f}%` win · `${a['pnl']:+.2f}`")
+            return "\n".join(out)
+
+        return (
+            f"🧠 *Learning Performance* _(simulated)_\n\n"
+            f"{block('PnL by Oracle Score', lp['by_oracle_score'])}\n\n"
+            f"{block('PnL by Volatility Edge', lp['by_vol_edge'])}\n\n"
+            f"{block('PnL by DTE', lp['by_dte'])}\n\n"
+            f"{block('PnL by IV Rank', lp['by_iv_rank'])}\n\n"
+            f"_(Analytics only — nothing was traded.)_"
+        )
+
     def _spread_paper_trader(self):
         """Build a SpreadPaperTrader from env (Phase 6C). No broker client."""
         from spread_paper_trader import SpreadPaperConfig, SpreadPaperTrader
@@ -1764,6 +1894,10 @@ Total symbols: `{len(self.supported_tickers)}`"""
 • `EXPECTED_MOVE TICKER [VIX]` - Expected move + vol edge (advisory)
 • `VOL_EDGE TICKER [VIX]` - Volatility edge + shadow rec (advisory)
 • `ORACLE_DATASET_STATS` - Training dataset summary (advisory)
+• `ORACLE_STATS` - Oracle performance summary (analytics)
+• `VOL_EDGE_LEADERBOARD` - Top symbols by vol edge (analytics)
+• `SPREAD_PERFORMANCE` - Win rate & PnL by strategy (analytics)
+• `LEARNING_PERFORMANCE` - PnL by score/edge/DTE/IV buckets (analytics)
 • `START` - Start monitoring
 • `STOP` - Stop monitoring
 
