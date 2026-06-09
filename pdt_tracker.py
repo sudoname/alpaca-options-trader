@@ -15,7 +15,11 @@ load_dotenv()
 class PDTTracker:
     def __init__(self):
         self.log_file = 'day_trades_log.json'
-        self.pdt_limit = 3  # 3 day trades per 5 business days
+        # PDT self-limiter is opt-out via env. When disabled the tracker still
+        # logs day trades for visibility but never blocks a trade.
+        self.enabled = os.getenv('PDT_ENABLED', 'true').strip().lower() \
+            not in ('0', 'false', 'no', 'off')
+        self.pdt_limit = int(os.getenv('PDT_LIMIT', '3'))  # day trades / 5 business days
         self.account_threshold = 25000  # PDT exempt if >= $25k
 
     def load_day_trades(self):
@@ -86,6 +90,9 @@ class PDTTracker:
 
     def can_day_trade(self):
         """Check if we can make another day trade without PDT violation"""
+        if not self.enabled:
+            return True
+
         count = self.count_recent_day_trades()
 
         if count >= self.pdt_limit:
@@ -95,6 +102,9 @@ class PDTTracker:
 
     def get_remaining_day_trades(self):
         """Get number of day trades remaining"""
+        if not self.enabled:
+            return 9999  # PDT self-limiter disabled
+
         count = self.count_recent_day_trades()
         remaining = self.pdt_limit - count
         return max(0, remaining)
@@ -123,6 +133,15 @@ class PDTTracker:
         """Get PDT status message for display"""
         count = self.count_recent_day_trades()
         remaining = self.get_remaining_day_trades()
+
+        if not self.enabled:
+            return {
+                'count': count,
+                'remaining': remaining,
+                'limit': self.pdt_limit,
+                'status': "DISABLED - PDT self-limiter off (PDT_ENABLED=false)",
+                'can_trade': True,
+            }
 
         if count == 0:
             status = "SAFE - No day trades in last 5 days"
