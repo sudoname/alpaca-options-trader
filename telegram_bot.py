@@ -243,6 +243,12 @@ class TelegramTradingBot:
         elif text == 'LEARNING_PERFORMANCE' or text == '/LEARNING_PERFORMANCE':
             return self.learning_performance(chat_id)
 
+        elif text == 'THRESHOLD_RECOMMENDATIONS' or text == '/THRESHOLD_RECOMMENDATIONS':
+            return self.threshold_recommendations(chat_id)
+
+        elif text == 'DATA_COVERAGE' or text == '/DATA_COVERAGE':
+            return self.data_coverage(chat_id)
+
         elif text.startswith('EXPECTED_MOVE') or text.startswith('/EXPECTED_MOVE'):
             parts = text.replace('/EXPECTED_MOVE', '').replace('EXPECTED_MOVE', '', 1).split()
             symbol = parts[0].strip().upper() if parts else ''
@@ -1763,6 +1769,72 @@ Total symbols: `{len(self.supported_tickers)}`"""
             f"_(Analytics only — nothing was traded.)_"
         )
 
+    def threshold_recommendations(self, chat_id=None):
+        """Phase 8C: advisory threshold recommendations from historical data.
+
+        Read-only — surfaces which Oracle Score / Vol Edge / DTE / IV Rank /
+        Strategy cuts have produced the best simulated results. Recommends
+        nothing is applied automatically; this is advisory only.
+        """
+        try:
+            from threshold_engine import compute_recommendations
+            r = compute_recommendations()
+        except Exception as e:
+            return f"❌ Could not compute recommendations: {e}"
+
+        if not r.get("n_trades"):
+            return ("📭 *No closed paper spreads yet.*\n"
+                    "Recommendations need historical trades.\n"
+                    "_(Advisory only — nothing is applied.)_")
+
+        def score(v):
+            return f">= {v:.0f}" if isinstance(v, (int, float)) else "n/a"
+
+        def edge(v):
+            return f">= {v * 100:.1f}%" if isinstance(v, (int, float)) else "n/a"
+
+        def pretty(name):
+            return name.replace("_", " ").title() if name else "n/a"
+
+        return (
+            f"🎯 *Threshold Recommendations* _(advisory)_\n"
+            f"Recommended Oracle Score `{score(r['recommended_min_oracle_score'])}`\n"
+            f"Recommended Vol Edge `{edge(r['recommended_min_volatility_edge'])}`\n"
+            f"Recommended DTE `{r['recommended_dte_range'] or 'n/a'}`\n"
+            f"Recommended IV Rank `{r['recommended_iv_rank_range'] or 'n/a'}`\n\n"
+            f"*Best Strategy:*\n`{pretty(r['best_strategy'])}`\n"
+            f"*Worst Strategy:*\n`{pretty(r['worst_strategy'])}`\n\n"
+            f"Confidence: `{r['confidence']}` "
+            f"({r['n_trades']} trades)\n"
+            f"_(Advisory only — nothing is applied to live or paper trading.)_"
+        )
+
+    def data_coverage(self, chat_id=None):
+        """Phase 8C: how much data backs the analytics (read-only)."""
+        try:
+            from threshold_engine import compute_data_coverage
+            c = compute_data_coverage()
+        except Exception as e:
+            return f"❌ Could not compute data coverage: {e}"
+
+        cov = c.get("prediction_coverage", {})
+
+        def pct(h):
+            v = cov.get(h)
+            return f"{v * 100:.0f}%" if isinstance(v, (int, float)) else "n/a"
+
+        return (
+            f"🗂 *Data Coverage* _(advisory)_\n"
+            f"Trades analyzed: `{c.get('trades_analyzed', 0)}`\n"
+            f"Symbols analyzed: `{c.get('symbols_analyzed', 0)}`\n\n"
+            f"*Prediction coverage:*\n"
+            f"1D: `{pct('1d')}`\n"
+            f"3D: `{pct('3d')}`\n"
+            f"7D: `{pct('7d')}`\n"
+            f"30D: `{pct('30d')}`\n"
+            f"_(Analytics only — nothing was traded.)_"
+        )
+
     def _spread_paper_trader(self):
         """Build a SpreadPaperTrader from env (Phase 6C). No broker client."""
         from spread_paper_trader import SpreadPaperConfig, SpreadPaperTrader
@@ -1898,6 +1970,8 @@ Total symbols: `{len(self.supported_tickers)}`"""
 • `VOL_EDGE_LEADERBOARD` - Top symbols by vol edge (analytics)
 • `SPREAD_PERFORMANCE` - Win rate & PnL by strategy (analytics)
 • `LEARNING_PERFORMANCE` - PnL by score/edge/DTE/IV buckets (analytics)
+• `THRESHOLD_RECOMMENDATIONS` - Suggested score/edge/DTE/IV/strategy cuts (advisory)
+• `DATA_COVERAGE` - Trades/symbols analyzed + prediction coverage (advisory)
 • `START` - Start monitoring
 • `STOP` - Stop monitoring
 
