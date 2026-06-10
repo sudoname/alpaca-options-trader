@@ -184,7 +184,15 @@ def run_best_ev(symbols: Union[str, Sequence[str], None],
     cfg = config or BestEVConfig()
     universe = parse_symbols(symbols)[: cfg.max_symbols]
     results = scan_universe(universe, trader_factory, ev_config=ev_config)
-    return rank_candidates(results, cfg), len(universe)
+    ranked = rank_candidates(results, cfg)
+    # Phase 10G-E: persist every evaluated candidate for later resolution.
+    # Recording only — cannot affect the ranking or any trade. Fail-open.
+    try:
+        import candidate_resolution as cr
+        cr.record_candidates(ranked, source="best_ev_ranker")
+    except Exception as exc:
+        print(f"[BEST_EV] candidate recording skipped: {exc}")
+    return ranked, len(universe)
 
 
 # --------------------------------------------------------------------------- #

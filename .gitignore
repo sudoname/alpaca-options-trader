@@ -37,6 +37,7 @@ spy_hybrid_trades.json
 telegram_trades.json
 spread_paper_positions.json
 spread_paper_trades.json
+candidate_resolutions.json
 # Phase 7A/8A advisory layers (regenerated locally, never versioned)
 expected_move_history.csv
 oracle_training_dataset.csv

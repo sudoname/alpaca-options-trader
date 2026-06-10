@@ -244,6 +244,15 @@ def open_candidates(ranked: Sequence["ev_engine.EVResult"],
         else:
             log_decision(r, "skipped", why)
             skipped.append(_skip_row(r, why))
+    # Phase 10G-E: mark which evaluated candidates became paper trades and
+    # enrich them with strikes/expiry/entry price. Recording only; fail-open.
+    try:
+        import candidate_resolution as cr
+        selected, extras = cr.selection_context(opened)
+        cr.record_candidates(ranked, selected_keys=selected, extras=extras,
+                             source="best_ev_paper_runner")
+    except Exception as exc:
+        print(f"{LOG_TAG} candidate recording skipped: {exc}")
     return opened, skipped
 
 

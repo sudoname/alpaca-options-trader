@@ -292,6 +292,24 @@ class TelegramTradingBot:
         elif text == 'ADVISORY_PERFORMANCE' or text == '/ADVISORY_PERFORMANCE':
             return self.advisory_performance(chat_id)
 
+        elif text == 'EV_ATTRIBUTION' or text == '/EV_ATTRIBUTION':
+            return self.ev_attribution(chat_id)
+
+        elif text == 'BEST_EV_PERFORMANCE' or text == '/BEST_EV_PERFORMANCE':
+            return self.best_ev_performance(chat_id)
+
+        elif text == 'ORACLE_PROOF_REPORT' or text == '/ORACLE_PROOF_REPORT':
+            return self.oracle_proof_report(chat_id)
+
+        elif text == 'VOL_FORECAST_SCORECARD' or text == '/VOL_FORECAST_SCORECARD':
+            return self.vol_forecast_scorecard(chat_id)
+
+        elif text == 'POP_CALIBRATION' or text == '/POP_CALIBRATION':
+            return self.pop_calibration(chat_id)
+
+        elif text == 'EV_CALIBRATION' or text == '/EV_CALIBRATION':
+            return self.ev_calibration(chat_id)
+
         elif text.startswith('ADVISORY_CHECK') or text.startswith('/ADVISORY_CHECK'):
             parts = text.replace('/ADVISORY_CHECK', '').replace('ADVISORY_CHECK', '', 1).split()
             symbol = parts[0].strip().upper() if parts else ''
@@ -1753,6 +1771,85 @@ Total symbols: `{len(self.supported_tickers)}`"""
         except Exception as e:
             return f"❌ Could not run Best-EV paper trading: {e}"
 
+    def ev_attribution(self, chat_id=None):
+        """Phase 10E: do entry-time EV beliefs predict realized outcomes?
+
+        Buckets closed paper spread trades by Expected Value / EV-per-risk
+        (frozen at open) and reports per-bucket performance plus monotonicity
+        and separation predictiveness checks. ANALYTICS ONLY.
+        """
+        try:
+            from ev_attribution import generate_ev_attribution_text
+            return generate_ev_attribution_text()
+        except Exception as e:
+            return f"❌ Could not build EV attribution: {e}"
+
+    def best_ev_performance(self, chat_id=None):
+        """Phase 10F: realized performance of Best-EV paper runner trades.
+
+        Win rate / PnL / profit factor over the simulated trades the Phase 10D
+        runner opened, with average entry EV, EV/risk, oracle score and vol
+        edge, best/worst strategy, and an EV predictiveness verdict.
+        ANALYTICS ONLY.
+        """
+        try:
+            from best_ev_performance import generate_best_ev_performance_text
+            return generate_best_ev_performance_text()
+        except Exception as e:
+            return f"❌ Could not build Best-EV performance: {e}"
+
+    def oracle_proof_report(self, chat_id=None):
+        """Phase 10F/10G: null-anchored proof rollup — is Oracle predictive?
+
+        Combines Oracle Score, Volatility Edge, Expected Value and Advisory
+        Recommendation bucket evidence with the Phase 10G null-anchored
+        checks (vol forecast vs IV, excess win rate over predicted PoP, EV
+        calibration) into one verdict: PREDICTIVE /
+        PROMISING_BUT_INCONCLUSIVE / NOT_PREDICTIVE_YET / INSUFFICIENT_DATA.
+        ANALYTICS ONLY.
+        """
+        try:
+            from best_ev_performance import generate_oracle_proof_report_text
+            return generate_oracle_proof_report_text()
+        except Exception as e:
+            return f"❌ Could not build Oracle proof report: {e}"
+
+    def vol_forecast_scorecard(self, chat_id=None):
+        """Phase 10G-A: does forecast_vol beat market IV at predicting
+        realized volatility? MAE/RMSE, Mincer-Zarnowitz regressions, verdict
+        FORECAST_BEATS_IV / IV_BEATS_FORECAST / INCONCLUSIVE. ANALYTICS ONLY.
+        """
+        try:
+            from vol_forecast_scorecard import (
+                generate_vol_forecast_scorecard_text)
+            return generate_vol_forecast_scorecard_text()
+        except Exception as e:
+            return f"❌ Could not build vol forecast scorecard: {e}"
+
+    def pop_calibration(self, chat_id=None):
+        """Phase 10G-B: do trades win as often as the model's PoP promised?
+
+        Buckets closed paper spreads by predicted PoP and compares to actual
+        win rate. Verdict WELL_CALIBRATED / OVERCONFIDENT / UNDERCONFIDENT /
+        INSUFFICIENT_DATA. ANALYTICS ONLY.
+        """
+        try:
+            from pop_calibration import generate_pop_calibration_text
+            return generate_pop_calibration_text()
+        except Exception as e:
+            return f"❌ Could not build PoP calibration: {e}"
+
+    def ev_calibration(self, chat_id=None):
+        """Phase 10G-C: does predicted EV match realized PnL? Regression +
+        bucket calibration. Verdict EV_CALIBRATED / EV_RANKS_BUT_MISPRICES /
+        EV_NOT_PREDICTIVE / INSUFFICIENT_DATA. ANALYTICS ONLY.
+        """
+        try:
+            from ev_calibration import generate_ev_calibration_text
+            return generate_ev_calibration_text()
+        except Exception as e:
+            return f"❌ Could not build EV calibration: {e}"
+
     def vol_edge(self, symbol, vix_arg=None, chat_id=None):
         """Phase 7A/8A: ADVISORY volatility edge + shadow recommendation.
 
@@ -2315,6 +2412,12 @@ Total symbols: `{len(self.supported_tickers)}`"""
 • `EV_ANALYSIS TICKER` - Expected value, PoP & EV/risk for best spread (analytics)
 • `BEST_EV_TRADES [SYM,SYM,...]` - Top spreads ranked by EV/risk across the universe (analytics)
 • `BEST_EV_PAPER_RUN [SYM,SYM,...]` - Open top-EV spreads as SIMULATED paper trades (paper only)
+• `EV_ATTRIBUTION` - Do entry-time EV beliefs predict outcomes? Bucketed performance (analytics)
+• `BEST_EV_PERFORMANCE` - Realized results of Best-EV paper trades (analytics)
+• `ORACLE_PROOF_REPORT` - Null-anchored proof rollup: is Oracle's scoring predictive? (analytics)
+• `VOL_FORECAST_SCORECARD` - Does forecast vol beat market IV vs realized? (analytics)
+• `POP_CALIBRATION` - Predicted PoP vs actual win rate per bucket (analytics)
+• `EV_CALIBRATION` - Predicted EV vs realized PnL: regression + buckets (analytics)
 • `VOL_EDGE TICKER [VIX]` - Volatility edge + shadow rec (advisory)
 • `ORACLE_DATASET_STATS` - Training dataset summary (advisory)
 • `ORACLE_STATS` - Oracle performance summary (analytics)
