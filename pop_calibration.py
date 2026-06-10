@@ -150,7 +150,7 @@ def format_pop_calibration(report: dict) -> str:
             f"_{POP_QUESTION}_",
             "",
             "No closed trades carrying an entry PoP stamp yet.",
-            f"*Verdict:* {VERDICT_INSUFFICIENT}",
+            f"*Verdict:* `{VERDICT_INSUFFICIENT}`",
             "", footer,
         ])
     lines = [
@@ -175,7 +175,7 @@ def format_pop_calibration(report: dict) -> str:
         "",
         f"*Overall:* predicted `{_pp(o['predicted_avg_pop'])}` -> actual "
         f"`{_pp(o['actual_win_rate'])}` ({_err_pp(o['calibration_error'])})",
-        f"*Verdict:* {report['verdict']}",
+        f"*Verdict:* `{report['verdict']}`",
         f"Sample size: `{report['sample_size']}`",
         "", footer,
     ]

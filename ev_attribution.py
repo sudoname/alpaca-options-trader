@@ -374,7 +374,7 @@ def _predictiveness_lines(title: str, p: dict) -> List[str]:
         f"Worst bucket: `{p['worst_bucket']}`",
         f"Monotonicity: `{mono * 100:.0f}%` · "
         f"Separation: `{p['separation']:+.2f}`",
-        f"Higher buckets outperform lower buckets: *{p['verdict']}*",
+        f"Higher buckets outperform lower buckets: `{p['verdict']}`",
     ]
 
 

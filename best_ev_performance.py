@@ -171,7 +171,7 @@ def format_best_ev_performance(perf: dict) -> str:
         "",
         "*EV Predictiveness:*",
         f"Higher EV buckets outperform lower EV buckets: "
-        f"*{perf['ev_predictiveness']['verdict']}*",
+        f"`{perf['ev_predictiveness']['verdict']}`",
         "",
         f"Sample size: `{perf['sample_size']}` · "
         f"Confidence: *{perf['confidence']}*",
@@ -333,11 +333,13 @@ def compute_proof_report(records: Optional[List[dict]] = None,
 
 
 def _evidence_line(title: str, p: dict) -> str:
+    # Verdicts go in backticks: bare underscores (INSUFFICIENT_DATA) are
+    # unbalanced Markdown italics and make Telegram reject the message.
     if p.get("buckets_with_data", 0) < 2:
-        return f"*{title}:* insufficient data — {VERDICT_INCONCLUSIVE}"
+        return f"*{title}:* insufficient data — `{VERDICT_INCONCLUSIVE}`"
     return (f"*{title}:* separation `{p['separation']:+.2f}`, "
             f"monotonicity `{p['monotonicity'] * 100:.0f}%`, "
-            f"best `{p['best_bucket']}` → {p['verdict']}")
+            f"best `{p['best_bucket']}` → `{p['verdict']}`")
 
 
 def _vote_str(vote: int) -> str:
@@ -350,7 +352,7 @@ def _null_check_lines(checks: dict) -> List[str]:
     pop = checks.get("pop_excess") or {}
     evc = checks.get("ev_calibration") or {}
     lines = ["*Null-anchored checks:*"]
-    lines.append(f"*Vol forecast vs IV:* {vol.get('verdict', 'n/a')} "
+    lines.append(f"*Vol forecast vs IV:* `{vol.get('verdict', 'n/a')}` "
                  f"(`{vol.get('rows', 0)}` rows) — "
                  f"{_vote_str(vol.get('vote', 0))}")
     excess = pop.get("excess_win_rate")
@@ -363,7 +365,7 @@ def _null_check_lines(checks: dict) -> List[str]:
             f"(actual `{(pop.get('actual_win_rate') or 0) * 100:.0f}%` vs "
             f"promised `{(pop.get('predicted_avg_pop') or 0) * 100:.0f}%`) — "
             f"{_vote_str(pop.get('vote', 0))}")
-    lines.append(f"*EV calibration:* {evc.get('verdict', 'n/a')} "
+    lines.append(f"*EV calibration:* `{evc.get('verdict', 'n/a')}` "
                  f"(n=`{evc.get('sample_size', 0)}`) — "
                  f"{_vote_str(evc.get('vote', 0))}")
     return lines
@@ -379,7 +381,7 @@ def format_proof_report(report: dict) -> str:
             f"_{PROOF_QUESTION}_",
             "",
             "No closed paper spread trades yet — no evidence either way.",
-            f"*Overall conclusion:* {CONCLUSION_INSUFFICIENT}",
+            f"*Overall conclusion:* `{CONCLUSION_INSUFFICIENT}`",
             "", footer,
         ])
 
@@ -409,7 +411,7 @@ def format_proof_report(report: dict) -> str:
         lines.append("*Best-EV paper trades:* none closed yet")
     lines += [
         "",
-        f"*Overall conclusion:* {report['conclusion']} "
+        f"*Overall conclusion:* `{report['conclusion']}` "
         f"({report['supportive']} supportive / {report['opposing']} opposing)",
         f"Sample size: `{report['sample_size']}` · "
         f"Confidence: *{report['confidence']}*",

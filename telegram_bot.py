@@ -158,6 +158,16 @@ class TelegramTradingBot:
 
         try:
             response = requests.post(url, data=data)
+            if response.status_code == 200:
+                return True
+            # Telegram rejects unbalanced Markdown entities (e.g. a bare
+            # underscore in INSUFFICIENT_DATA) and over-long texts with 400.
+            # Never drop a reply silently: log the API error and retry once
+            # as plain text so the user always sees *something*.
+            print(f"Send message HTTP {response.status_code}: "
+                  f"{response.text[:200]}")
+            data.pop("parse_mode", None)
+            response = requests.post(url, data=data)
             return response.status_code == 200
         except Exception as e:
             print(f"Send message error: {e}")

@@ -159,7 +159,7 @@ def format_ev_calibration(report: dict) -> str:
             f"_{EV_CAL_QUESTION}_",
             "",
             "No closed trades carrying an entry EV stamp yet.",
-            f"*Verdict:* {VERDICT_INSUFFICIENT}",
+            f"*Verdict:* `{VERDICT_INSUFFICIENT}`",
             "", footer,
         ])
     reg = report["regression"]
@@ -193,11 +193,11 @@ def format_ev_calibration(report: dict) -> str:
     ranking = report["ranking"]
     lines += [
         "",
-        f"*Ranking:* higher EV buckets outperform: *{ranking['verdict']}*",
+        f"*Ranking:* higher EV buckets outperform: `{ranking['verdict']}`",
         f"*Magnitude:* expected `{eva._money(o['avg_expected_ev'])}` -> "
         f"realized `{eva._money(o['avg_realized_pnl'])}` "
         f"(err `{eva._money(o['calibration_error'])}`)",
-        f"*Verdict:* {report['verdict']}",
+        f"*Verdict:* `{report['verdict']}`",
         f"Sample size: `{report['sample_size']}`",
         "", footer,
     ]

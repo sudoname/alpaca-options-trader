@@ -197,7 +197,7 @@ class TestBestEvPerformanceOutput(unittest.TestCase):
         self.assertIn("Best Strategy:", text)
         self.assertIn("Worst Strategy:", text)
         self.assertIn("Higher EV buckets outperform lower EV buckets: "
-                      f"*{VERDICT_YES}*", text)
+                      f"`{VERDICT_YES}`", text)
         self.assertIn("Confidence: *Low*", text)
         self.assertIn(ANALYTICS_FOOTER, text)
 
@@ -332,7 +332,7 @@ class TestProofReportOutput(unittest.TestCase):
         self.assertIn("*Excess win rate vs PoP:*", text)
         self.assertIn("*EV calibration:*", text)
         self.assertIn("*Best-EV paper trades:* `4` trades", text)
-        self.assertIn(f"*Overall conclusion:* {CONCLUSION_PROMISING} "
+        self.assertIn(f"*Overall conclusion:* `{CONCLUSION_PROMISING}` "
                       "(4 supportive / 0 opposing)", text)
         self.assertIn("Confidence: *Low*", text)
         self.assertIn(ANALYTICS_FOOTER, text)
@@ -346,7 +346,7 @@ class TestProofReportOutput(unittest.TestCase):
         self.assertIn("`+10.0pp`", text)
         self.assertIn("actual `50%` vs promised `40%`", text)
         self.assertIn(vfs.VERDICT_FORECAST_BEATS_IV, text)
-        self.assertIn(f"*Overall conclusion:* {CONCLUSION_PREDICTIVE} "
+        self.assertIn(f"*Overall conclusion:* `{CONCLUSION_PREDICTIVE}` "
                       "(7 supportive / 0 opposing)", text)
 
     def test_insufficient_evidence_lines(self):

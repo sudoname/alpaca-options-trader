@@ -51,7 +51,9 @@ MIN_COVERAGE = 0.6
 YEAR_DAYS = 365.25
 YEAR_SECONDS = YEAR_DAYS * 86400.0
 
-SCORECARD_QUESTION = "Does forecast_vol beat market IV at predicting realized vol?"
+# No raw underscores here: this string is rendered inside _italics_ in
+# Telegram Markdown, and a bare underscore breaks entity parsing.
+SCORECARD_QUESTION = "Does forecast vol beat market IV at predicting realized vol?"
 
 
 # ---------------------------------------------------------------------------
@@ -316,7 +318,7 @@ def format_scorecard(card: dict) -> str:
             "",
             "No resolvable forecast/realized-vol pairs yet.",
             "They accrue as expected-move snapshots age past their horizons.",
-            f"*Verdict:* {VERDICT_INCONCLUSIVE}",
+            f"*Verdict:* `{VERDICT_INCONCLUSIVE}`",
             "", footer,
         ])
     lines = [
@@ -331,7 +333,7 @@ def format_scorecard(card: dict) -> str:
         f"Forecast improvement over IV (MAE): "
         f"`{_pct(card['forecast_vs_iv_improvement'])}`",
         "",
-        _mz_line("MZ forecast_vol", card["mz_forecast"]),
+        _mz_line("MZ forecast vol", card["mz_forecast"]),
         _mz_line("MZ market IV", card["mz_iv"]),
         "",
         "*By horizon (MAE forecast | IV):*",
@@ -343,7 +345,7 @@ def format_scorecard(card: dict) -> str:
                          f"(`{stats['rows']}` rows)")
     lines += [
         "",
-        f"*Verdict:* {card['verdict']}",
+        f"*Verdict:* `{card['verdict']}`",
         f"Rows: `{card['rows']}` · Confidence: *{card['confidence']}*",
         "", footer,
     ]

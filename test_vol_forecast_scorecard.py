@@ -252,10 +252,10 @@ class TestOutput(unittest.TestCase):
         self.assertIn("MAE — forecast", text)
         self.assertIn("RMSE — forecast", text)
         self.assertIn("Forecast improvement over IV", text)
-        self.assertIn("MZ forecast_vol", text)
+        self.assertIn("MZ forecast vol", text)
         self.assertIn("MZ market IV", text)
         self.assertIn("*By horizon (MAE forecast | IV):*", text)
-        self.assertIn(f"*Verdict:* {VERDICT_FORECAST_BEATS_IV}", text)
+        self.assertIn(f"*Verdict:* `{VERDICT_FORECAST_BEATS_IV}`", text)
         self.assertIn("Confidence: *Low*", text)
         self.assertIn(ANALYTICS_FOOTER, text)
 

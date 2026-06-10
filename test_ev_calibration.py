@@ -178,9 +178,9 @@ class TestOutput(unittest.TestCase):
         self.assertIn("`EV 0-10`: `6` trades, expected `+$5.00` -> "
                       "realized `+$2.50` (err `-$2.50`), PF `1.33`", text)
         self.assertIn("`EV < 0`: no trades", text)
-        self.assertIn("*Ranking:* higher EV buckets outperform: *YES*", text)
+        self.assertIn("*Ranking:* higher EV buckets outperform: `YES`", text)
         self.assertIn("*Magnitude:*", text)
-        self.assertIn(f"*Verdict:* {VERDICT_EV_CALIBRATED}", text)
+        self.assertIn(f"*Verdict:* `{VERDICT_EV_CALIBRATED}`", text)
         self.assertIn(ANALYTICS_FOOTER, text)
 
     def test_empty_report(self):
