@@ -346,15 +346,26 @@ cmd_screen() {
     exec "$PYTHON" -u stock_screener.py -s moved -n 10 --score ev --write-tickers
 }
 
+cmd_reconcile_pnl() {
+    require_env
+    # Fills-aware reconcile of realized_pnl_log.json (replaces the blind reset).
+    # Defaults to a dry-run; pass --apply to commit (backs the log up first).
+    # Extra args after 'reconcile-pnl' are forwarded (e.g. --apply, --date YYYY-MM-DD).
+    echo "==> Reconciling realized P/L from broker fills (python=$PYTHON)"
+    shift  # drop the 'reconcile-pnl' token
+    exec "$PYTHON" -X utf8 reconcile_realized.py "$@"
+}
+
 # --- dispatch --------------------------------------------------------------
 case "${1:-start}" in
-    start)   cmd_start ;;
-    stop)    cmd_stop ;;
-    restart) cmd_stop; cmd_start ;;
-    status)  cmd_status ;;
-    screen)  cmd_screen ;;
+    start)         cmd_start ;;
+    stop)          cmd_stop ;;
+    restart)       cmd_stop; cmd_start ;;
+    status)        cmd_status ;;
+    screen)        cmd_screen ;;
+    reconcile-pnl) cmd_reconcile_pnl "$@" ;;
     *)
-        echo "Usage: $0 {start|stop|restart|status|screen}" >&2
+        echo "Usage: $0 {start|stop|restart|status|screen|reconcile-pnl [--apply] [--date YYYY-MM-DD]}" >&2
         exit 2
         ;;
 esac
