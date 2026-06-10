@@ -246,5 +246,122 @@ class TestReconcileFromFills(_FileBackedCase):
         self.assertEqual(len(self._read()), 1)
 
 
+class TestEODScopeAudit(_FileBackedCase):
+    """Regression guards for the EOD force-close blast radius.
+
+    The EOD close must only ever touch intraday long-option rows the scheduler
+    itself opened (source == SCHEDULER_SOURCE in active_trades.json). It must
+    not close Telegram/manual rows (which carry no 'source' or a foreign one),
+    must not sweep broker positions it doesn't track (e.g. future live spread
+    legs), and must stay decoupled from the spread-paper / advisory / learning
+    stores, which have their own lifecycles.
+    """
+
+    def test_closes_only_scheduler_source_rows(self):
+        sched_row = {"symbol": "SCH...C", "entry_price": 2.0, "quantity": 1,
+                     "entry_time": "t1", "source": SCHEDULER_SOURCE}
+        no_source = {"symbol": "TG...C", "entry_price": 3.0, "quantity": 1,
+                     "entry_time": "t2"}  # telegram/manual default: no key
+        foreign = {"symbol": "FT...C", "entry_price": 4.0, "quantity": 1,
+                   "entry_time": "t3", "source": "telegram"}
+        self._write([sched_row, no_source, foreign])
+        trader = _FakeTrader([
+            {"symbol": "SCH...C", "qty": "1", "current_price": "1.5"},
+            {"symbol": "TG...C", "qty": "1", "current_price": "2.5"},
+            {"symbol": "FT...C", "qty": "1", "current_price": "3.5"},
+        ])
+        _scheduler(trader).force_close_scheduler_positions()
+        self.assertEqual(trader.closed, [("SCH...C", "EOD_CLOSE")])
+        self.assertEqual([r[0] for r in trader.recorded], ["SCH...C"])
+        self.assertEqual([t["symbol"] for t in self._read()],
+                         ["TG...C", "FT...C"])
+
+    def test_untracked_broker_positions_are_never_swept(self):
+        # A broker position with NO active_trades row (e.g. a future live
+        # spread leg) must be invisible to the EOD close, which iterates the
+        # tracked file — never raw broker positions.
+        sched_row = {"symbol": "SCH...C", "entry_price": 2.0, "quantity": 1,
+                     "entry_time": "t1", "source": SCHEDULER_SOURCE}
+        self._write([sched_row])
+        trader = _FakeTrader([
+            {"symbol": "SCH...C", "qty": "1", "current_price": "1.5"},
+            {"symbol": "SPRDLEG...P", "qty": "1", "current_price": "9.9"},
+        ])
+        _scheduler(trader).force_close_scheduler_positions()
+        self.assertEqual(trader.closed, [("SCH...C", "EOD_CLOSE")])
+
+    def test_spread_paper_positions_file_untouched(self):
+        # The simulated spread book lives in its own file with its own
+        # lifecycle; neither the EOD close nor the fill reconcile may open it.
+        spread_path = os.path.join(self._dir, "spread_paper_positions.json")
+        payload = json.dumps([{"id": "sp1", "symbol": "SPY", "legs": 2,
+                               "opened": "2026-06-08"}])
+        with open(spread_path, "w") as f:
+            f.write(payload)
+        self._write([{"symbol": "SCH...C", "entry_price": 2.0, "quantity": 1,
+                      "entry_time": "t1", "source": SCHEDULER_SOURCE}])
+        trader = _FakeTrader([{"symbol": "SCH...C", "qty": "1",
+                               "current_price": "1.5"}])
+        sched = _scheduler(trader)
+        sched.force_close_scheduler_positions()
+        orig_fetch = ri._fetch_sell_fills_by_symbol
+        ri._fetch_sell_fills_by_symbol = lambda trader: {}
+        try:
+            sched.reconcile_closed_from_fills()
+        finally:
+            ri._fetch_sell_fills_by_symbol = orig_fetch
+        with open(spread_path) as f:
+            self.assertEqual(f.read(), payload)
+
+    def test_eod_close_routes_through_enforce_exit(self):
+        # enforce_exit = close_position + record_trade_outcome, exactly once
+        # each, with the EOD_CLOSE reason — the recording contract.
+        self._write([{"symbol": "SCH...C", "entry_price": 2.0, "quantity": 1,
+                      "entry_time": "t1", "source": SCHEDULER_SOURCE}])
+        trader = _FakeTrader([{"symbol": "SCH...C", "qty": "1",
+                               "current_price": "1.5"}])
+        _scheduler(trader).force_close_scheduler_positions()
+        self.assertEqual(trader.closed, [("SCH...C", "EOD_CLOSE")])
+        self.assertEqual(len(trader.recorded), 1)
+        self.assertEqual(trader.recorded[0][1], "EOD_CLOSE")
+        self.assertEqual(len(trader.trading_history["trades"]), 1)
+
+    def test_reconcile_ignores_non_scheduler_orphans(self):
+        # Vanished rows that the scheduler does not own (no source / foreign
+        # source) are left alone even when a matching sell fill exists.
+        no_source = {"symbol": "TG...C", "entry_price": 3.0, "quantity": 1,
+                     "entry_time": "t2"}
+        foreign = {"symbol": "FT...C", "entry_price": 4.0, "quantity": 1,
+                   "entry_time": "t3", "source": "telegram"}
+        self._write([no_source, foreign])
+        orig_fetch = ri._fetch_sell_fills_by_symbol
+        ri._fetch_sell_fills_by_symbol = lambda trader: {
+            "TG...C": [{"qty": 1, "price": 2.0,
+                        "transaction_time": "2026-06-09T19:00:00"}],
+            "FT...C": [{"qty": 1, "price": 3.0,
+                        "transaction_time": "2026-06-09T19:00:00"}],
+        }
+        trader = _FakeTrader([])
+        try:
+            _scheduler(trader).reconcile_closed_from_fills()
+        finally:
+            ri._fetch_sell_fills_by_symbol = orig_fetch
+        self.assertEqual(trader.recorded, [])
+        self.assertEqual([t["symbol"] for t in self._read()],
+                         ["TG...C", "FT...C"])
+
+    def test_scheduler_module_has_no_advisory_or_spread_coupling(self):
+        # Static isolation guard: the scheduler module must not reference the
+        # spread-paper / advisory-attribution / learning-shadow stores, whose
+        # multi-day lifecycles are owned elsewhere. If a future change wires
+        # them in, this fails and forces an explicit scope review.
+        with open(ri.__file__, encoding="utf-8") as f:
+            src = f.read()
+        for needle in ("spread_paper", "advisory_attribution",
+                       "learning_shadow", "hypothesis_engine"):
+            self.assertNotIn(needle, src,
+                             f"run_alpaca_intraday must not couple to {needle}")
+
+
 if __name__ == "__main__":
     unittest.main()
