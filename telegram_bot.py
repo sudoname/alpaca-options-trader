@@ -317,6 +317,19 @@ class TelegramTradingBot:
             days = nums[1] if len(nums) >= 2 else None
             return self.analyze_move(symbol, target, days, chat_id)
 
+        elif text.startswith('EV_ANALYSIS') or text.startswith('/EV_ANALYSIS'):
+            parts = text.replace('/EV_ANALYSIS', '').replace('EV_ANALYSIS', '', 1).split()
+            symbol = parts[0].strip().upper() if parts else ''
+            return self.ev_analysis(symbol, chat_id)
+
+        elif text.startswith('BEST_EV_TRADES') or text.startswith('/BEST_EV_TRADES'):
+            rest = text.replace('/BEST_EV_TRADES', '').replace('BEST_EV_TRADES', '', 1)
+            return self.best_ev_trades(rest, chat_id)
+
+        elif text.startswith('BEST_EV_PAPER_RUN') or text.startswith('/BEST_EV_PAPER_RUN'):
+            rest = text.replace('/BEST_EV_PAPER_RUN', '').replace('BEST_EV_PAPER_RUN', '', 1)
+            return self.best_ev_paper_run(rest, chat_id)
+
         elif text == 'START':
             return self.start_monitoring()
 
@@ -1661,6 +1674,85 @@ Total symbols: `{len(self.supported_tickers)}`"""
         except Exception as e:
             return f"❌ Could not build barrier report for `{symbol}`: {e}"
 
+    def ev_analysis(self, symbol, chat_id=None):
+        """Phase 10A: Expected-Value analytics for the symbol's best spread.
+
+        Usage: `EV_ANALYSIS SPY`. Builds the defined-risk spread proposal the
+        bot would consider, estimates probability of profit from the terminal
+        price distribution, and reports EV, EV/max-loss and an advisory
+        recommendation tier.
+
+        ANALYTICS ONLY: never places, sizes, gates, filters or alters a trade.
+        """
+        symbol = (symbol or '').strip().upper()
+        if not re.fullmatch(r'[A-Z]{1,5}', symbol):
+            return "❌ Invalid symbol. Usage: `EV_ANALYSIS SPY`"
+
+        try:
+            import ev_engine
+            from smart_trader import SmartOptionsTrader
+        except Exception as e:
+            return f"❌ EV engine unavailable: {e}"
+
+        try:
+            trader = SmartOptionsTrader(ticker=symbol)
+            result = ev_engine.evaluate_for_symbol(
+                trader, symbol, config=ev_engine.EVConfig.from_env())
+            return ev_engine.format_ev_report(result)
+        except Exception as e:
+            return f"❌ Could not build EV analysis for `{symbol}`: {e}"
+
+    def best_ev_trades(self, symbols_arg=None, chat_id=None):
+        """Phase 10B: rank spread candidates by EV across the universe.
+
+        Usage: `BEST_EV_TRADES` (Oracle universe = SCHEDULER_SYMBOLS) or
+        `BEST_EV_TRADES SPY,QQQ,NVDA` for an ad-hoc list. Builds each symbol's
+        spread proposal, EV-scores it (Phase 10A), and shows the top candidates
+        by EV per dollar of risk.
+
+        ANALYTICS ONLY: never places, sizes, gates, filters or alters a trade.
+        """
+        try:
+            import best_ev_ranker as ber
+            import ev_engine
+            from smart_trader import SmartOptionsTrader
+        except Exception as e:
+            return f"❌ Best-EV ranker unavailable: {e}"
+
+        try:
+            cfg = ber.BestEVConfig.from_env()
+            symbols = ber.parse_symbols(symbols_arg) or ber.default_universe()
+            ranked, scanned = ber.run_best_ev(
+                symbols, lambda s: SmartOptionsTrader(ticker=s),
+                config=cfg, ev_config=ev_engine.EVConfig.from_env())
+            return ber.format_best_ev_report(ranked, scanned=scanned, config=cfg)
+        except Exception as e:
+            return f"❌ Could not build Best-EV ranking: {e}"
+
+    def best_ev_paper_run(self, symbols_arg=None, chat_id=None):
+        """Phase 10D: open SIMULATED spread paper trades from the Best-EV ranking.
+
+        Usage: `BEST_EV_PAPER_RUN` (Oracle universe = SCHEDULER_SYMBOLS) or
+        `BEST_EV_PAPER_RUN SPY,QQQ,NVDA` for an ad-hoc list. Ranks candidates
+        by EV (Phase 10B), applies the paper thresholds, and opens the top
+        candidates through the spread PAPER trader only.
+
+        SIMULATED ONLY: never places broker orders; default OFF via
+        `ENABLE_BEST_EV_PAPER_TRADING`.
+        """
+        try:
+            import best_ev_paper_runner as runner
+            from smart_trader import SmartOptionsTrader
+        except Exception as e:
+            return f"❌ Best-EV paper runner unavailable: {e}"
+
+        try:
+            summary = runner.run_paper_from_best_ev(
+                symbols_arg, lambda s: SmartOptionsTrader(ticker=s))
+            return runner.format_paper_run_report(summary)
+        except Exception as e:
+            return f"❌ Could not run Best-EV paper trading: {e}"
+
     def vol_edge(self, symbol, vix_arg=None, chat_id=None):
         """Phase 7A/8A: ADVISORY volatility edge + shadow recommendation.
 
@@ -2003,7 +2095,21 @@ Total symbols: `{len(self.supported_tickers)}`"""
         """
         try:
             from advisory_gate import generate_advisory_check_text
-            return generate_advisory_check_text(symbol)
+            # Phase 10C: best-effort EV computation for the EV section.
+            # Strictly fail-open — any error means "no EV data" and the
+            # advisory verdict behaves exactly as before.
+            ev_result = None
+            try:
+                import ev_engine
+                from smart_trader import SmartOptionsTrader
+                sym = str(symbol or "").strip().upper()
+                if sym:
+                    trader = SmartOptionsTrader(ticker=sym)
+                    ev_result = ev_engine.evaluate_for_symbol(
+                        trader, sym, config=ev_engine.EVConfig.from_env())
+            except Exception as ev_err:
+                print(f"[ADVISORY_CHECK] EV unavailable (ignored): {ev_err}")
+            return generate_advisory_check_text(symbol, ev_result=ev_result)
         except Exception as e:
             return f"❌ Could not run the advisory check: {e}"
 
@@ -2206,6 +2312,9 @@ Total symbols: `{len(self.supported_tickers)}`"""
 • `SPREAD_PAPER_CLOSE ID` - Close a simulated spread (paper only)
 • `EXPECTED_MOVE TICKER [VIX]` - Expected move + vol edge (advisory)
 • `ANALYZE TICKER [TARGET] [DAYS]` - Barrier touch-probability: will it reach TARGET in DAYS? (advisory)
+• `EV_ANALYSIS TICKER` - Expected value, PoP & EV/risk for best spread (analytics)
+• `BEST_EV_TRADES [SYM,SYM,...]` - Top spreads ranked by EV/risk across the universe (analytics)
+• `BEST_EV_PAPER_RUN [SYM,SYM,...]` - Open top-EV spreads as SIMULATED paper trades (paper only)
 • `VOL_EDGE TICKER [VIX]` - Volatility edge + shadow rec (advisory)
 • `ORACLE_DATASET_STATS` - Training dataset summary (advisory)
 • `ORACLE_STATS` - Oracle performance summary (analytics)

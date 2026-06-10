@@ -68,6 +68,9 @@ OPEN_FIELDS = (
     "advisory_recommendation", "advisory_confidence",
     "historical_win_rate", "historical_profit_factor",
     "threshold_checks",
+    # Phase 10C: EV belief at entry (never recomputed after close).
+    "expected_value", "ev_per_dollar_risk", "probability_of_profit",
+    "ev_recommendation",
 )
 
 # Fields appended at CLOSE time (the realized outcome only).
@@ -148,10 +151,22 @@ def build_open_snapshot(trade: dict, *,
     iv_rank = oa._trade_iv_rank(trade)
     strategy = trade.get("strategy")
 
+    # Phase 10C: EV belief at entry, read from the trade record if present
+    # (None when the opener didn't carry EV — fail-open, behavior unchanged).
+    expected_value = oa._to_float(trade.get("expected_value"))
+    ev_per_dollar_risk = oa._to_float(trade.get("ev_per_dollar_risk"))
+    probability_of_profit = oa._to_float(trade.get("probability_of_profit"))
+    ev_recommendation = trade.get("ev_recommendation")
+
     result = ag.evaluate_setup(
         oracle_score=oracle_score, volatility_edge=volatility_edge,
         dte=dte, iv_rank=iv_rank, strategy=strategy,
-        config=config, recommendations=recommendations, trades=trades)
+        config=config, recommendations=recommendations, trades=trades,
+        expected_value=expected_value,
+        ev_per_dollar_risk=ev_per_dollar_risk,
+        probability_of_profit=probability_of_profit,
+        estimated_costs=oa._to_float(trade.get("estimated_costs")),
+        ev_recommendation=ev_recommendation)
 
     return {
         "trade_id": _trade_id(trade),
@@ -167,6 +182,11 @@ def build_open_snapshot(trade: dict, *,
         "historical_win_rate": result.get("historical_win_rate"),
         "historical_profit_factor": result.get("historical_profit_factor"),
         "threshold_checks": result.get("checks"),
+        # Phase 10C: EV fields frozen at open (record_close never touches them).
+        "expected_value": expected_value,
+        "ev_per_dollar_risk": ev_per_dollar_risk,
+        "probability_of_profit": probability_of_profit,
+        "ev_recommendation": ev_recommendation,
         # Close-time fields are filled in later by record_close (None until then).
         "date_closed": None,
         "pnl": None,

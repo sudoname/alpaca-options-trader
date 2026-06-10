@@ -59,6 +59,22 @@ DEFAULT_MIN_ORACLE_SCORE = 60.0
 POOR_PF = 1.0
 POOR_MIN_TRADES = 5
 
+# ---- Phase 10C: EV thresholds (soft signals — NEVER a hard gate) ---------- #
+DEFAULT_MIN_EV = 0.00              # ADVISORY_MIN_EV
+DEFAULT_MIN_EV_PER_RISK = 0.05     # ADVISORY_MIN_EV_PER_RISK
+DEFAULT_MIN_POP = 0.50             # ADVISORY_MIN_POP
+
+# "Strong negative" EV (caps the verdict below STRONG_ACCEPT): EV-per-risk at
+# or below this, or the EV engine itself says REJECT_CANDIDATE.
+STRONG_NEGATIVE_EV_PER_RISK = -0.05
+
+# Costs are "reasonable" when they consume no more than this share of the
+# pre-cost edge (expected_value + estimated_costs).
+MAX_COST_SHARE_OF_EDGE = 0.50
+
+# Tier ladder used by the soft EV adjustment (one step up/down at most).
+_TIER_ORDER = (REJECT_CANDIDATE, WEAK_SETUP, NEUTRAL, ACCEPT, STRONG_ACCEPT)
+
 # Reuse the analytics bucket predicates so DTE / IV-rank membership checks match
 # exactly what threshold_engine recommends.
 _DTE_PRED = {label: pred for label, pred in oa._DTE_BUCKETS}
@@ -108,6 +124,120 @@ def _check_strategy(strategy, rec) -> bool:
         return True
     worst = rec.get("worst_strategy")
     return not (worst and strategy == worst)
+
+
+# --------------------------------------------------------------------------- #
+# Phase 10C — EV consumption (soft signal; advisory only, never a hard gate)
+# --------------------------------------------------------------------------- #
+def ev_thresholds(loader=None) -> dict:
+    """EV thresholds from env (ADVISORY_MIN_EV / _EV_PER_RISK / _POP).
+
+    Fail-open: any config problem returns the documented defaults.
+    """
+    try:
+        from config_loader import ConfigLoader
+        cfg = loader if loader is not None else ConfigLoader(path=".env")
+        return {
+            "min_ev": cfg.get_float("ADVISORY_MIN_EV", DEFAULT_MIN_EV),
+            "min_ev_per_risk": cfg.get_float("ADVISORY_MIN_EV_PER_RISK",
+                                             DEFAULT_MIN_EV_PER_RISK),
+            "min_pop": cfg.get_float("ADVISORY_MIN_POP", DEFAULT_MIN_POP),
+        }
+    except Exception:
+        return {"min_ev": DEFAULT_MIN_EV,
+                "min_ev_per_risk": DEFAULT_MIN_EV_PER_RISK,
+                "min_pop": DEFAULT_MIN_POP}
+
+
+def _costs_reasonable(expected_value, estimated_costs) -> bool:
+    """True when execution costs eat <= half of the pre-cost edge.
+
+    Unknown costs can't be failed (-> True). When the pre-cost edge
+    (EV + costs) is already non-positive the costs aren't the problem
+    (-> True; the EV checks themselves flag the setup).
+    """
+    ev = oa._to_float(expected_value)
+    costs = oa._to_float(estimated_costs)
+    if ev is None or costs is None:
+        return True
+    gross = ev + costs
+    if gross <= 0:
+        return True
+    return costs <= MAX_COST_SHARE_OF_EDGE * gross
+
+
+def _ev_checks(expected_value, ev_per_dollar_risk, probability_of_profit,
+               estimated_costs, thresholds: dict) -> dict:
+    """The four soft EV checks. Caller guarantees expected_value is numeric."""
+    ev = oa._to_float(expected_value)
+    ratio = oa._to_float(ev_per_dollar_risk)
+    pop = oa._to_float(probability_of_profit)
+    return {
+        "ev_positive": ev is not None and ev > float(thresholds["min_ev"]),
+        "ev_per_risk_ok": (ratio is not None
+                           and ratio >= float(thresholds["min_ev_per_risk"])),
+        "pop_ok": pop is not None and pop >= float(thresholds["min_pop"]),
+        "costs_reasonable": _costs_reasonable(expected_value, estimated_costs),
+    }
+
+
+def _apply_ev_adjustment(base: str, expected_value, ev_per_dollar_risk,
+                         ev_recommendation, checks: dict):
+    """Soft-adjust the base verdict by at most ONE tier (never a hard gate).
+
+    * all four EV checks pass        -> one tier stronger
+    * negative EV                    -> one tier weaker
+    * strong negative EV             -> additionally never STRONG_ACCEPT
+    Returns ``(adjusted_recommendation, note)``.
+    """
+    try:
+        idx = _TIER_ORDER.index(base)
+    except ValueError:
+        return base, "none"
+    ev = oa._to_float(expected_value)
+    ratio = oa._to_float(ev_per_dollar_risk)
+    note = "none"
+    if checks and all(checks.values()):
+        if idx < len(_TIER_ORDER) - 1:
+            idx += 1
+        note = "strengthened"
+    elif ev is not None and ev < 0:
+        if idx > 0:
+            idx -= 1
+        note = "weakened"
+    strong_negative = (ev is not None and ev < 0 and
+                       ((ratio is not None
+                         and ratio <= STRONG_NEGATIVE_EV_PER_RISK)
+                        or ev_recommendation == REJECT_CANDIDATE))
+    if strong_negative and _TIER_ORDER[idx] == STRONG_ACCEPT:
+        idx = _TIER_ORDER.index(ACCEPT)
+        note = "capped"
+    return _TIER_ORDER[idx], note
+
+
+def ev_fields_from_result(ev_result) -> dict:
+    """Extract the five advisory EV inputs from an ``ev_engine.EVResult``
+    (object or dict). Fail-open: None / errored results -> all-None fields,
+    which preserves pre-EV advisory behavior exactly.
+    """
+    out = {"expected_value": None, "ev_per_dollar_risk": None,
+           "probability_of_profit": None, "estimated_costs": None,
+           "ev_recommendation": None}
+    if ev_result is None:
+        return out
+    get = (ev_result.get if isinstance(ev_result, dict)
+           else lambda name, default=None: getattr(ev_result, name, default))
+    try:
+        status = get("status")
+        if status not in (None, "ok"):
+            return out
+        for name in ("expected_value", "ev_per_dollar_risk",
+                     "probability_of_profit", "estimated_costs"):
+            out[name] = get(name)
+        out["ev_recommendation"] = get("recommendation")
+    except Exception:  # pragma: no cover - extraction safety
+        pass
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -168,12 +298,24 @@ def evaluate_setup(oracle_score=None, volatility_edge=None, dte=None,
                    iv_rank=None, strategy=None, *,
                    config: Optional[AnalyticsConfig] = None,
                    recommendations: Optional[dict] = None,
-                   trades: Optional[List[dict]] = None) -> dict:
+                   trades: Optional[List[dict]] = None,
+                   expected_value=None, ev_per_dollar_risk=None,
+                   probability_of_profit=None, estimated_costs=None,
+                   ev_recommendation=None,
+                   ev_thresholds_override: Optional[dict] = None) -> dict:
     """Advisory verdict for a proposed setup.
 
     Returns a dict with ``recommendation``, ``confidence``, per-check booleans,
     ``historical_win_rate`` and ``historical_profit_factor`` (plus a few extras
     that are handy for logging / formatting). Never raises.
+
+    Phase 10C: optionally consumes the Phase 10A EV engine's numbers
+    (``expected_value`` / ``ev_per_dollar_risk`` / ``probability_of_profit`` /
+    ``estimated_costs`` / ``ev_recommendation``) as a SOFT signal: positive EV
+    strengthens the verdict by one tier, negative EV weakens it by one tier,
+    and a strongly negative EV can never produce STRONG_ACCEPT. Missing EV
+    (the default) leaves the pre-10C behavior byte-for-byte identical. EV is
+    never a hard gate and nothing here blocks or places trades.
     """
     config = config or AnalyticsConfig.from_env()
     closed = oa.load_closed_spread_trades(config, trades)
@@ -195,12 +337,37 @@ def evaluate_setup(oracle_score=None, volatility_edge=None, dte=None,
     passed = sum(1 for v in checks.values() if v)
 
     hist = _historical(closed, strategy)
-    recommendation = _classify(passed, strategy, rec, hist, n_trades)
+    base_recommendation = _classify(passed, strategy, rec, hist, n_trades)
+
+    # ---- Phase 10C: soft EV adjustment (advisory only; never a gate) ---- #
+    ev_available = oa._to_float(expected_value) is not None
+    if ev_available:
+        thresholds = ev_thresholds_override or ev_thresholds()
+        ev_check_map = _ev_checks(expected_value, ev_per_dollar_risk,
+                                  probability_of_profit, estimated_costs,
+                                  thresholds)
+        recommendation, ev_adjustment = _apply_ev_adjustment(
+            base_recommendation, expected_value, ev_per_dollar_risk,
+            ev_recommendation, ev_check_map)
+    else:
+        ev_check_map = {}
+        recommendation, ev_adjustment = base_recommendation, "none"
 
     return {
         "recommendation": recommendation,
         "confidence": _confidence(n_trades),
         "checks": checks,
+        "base_recommendation": base_recommendation,
+        "ev_available": ev_available,
+        "ev_adjustment": ev_adjustment,
+        "ev_checks": ev_check_map,
+        "ev_summary": {
+            "expected_value": expected_value,
+            "ev_per_dollar_risk": ev_per_dollar_risk,
+            "probability_of_profit": probability_of_profit,
+            "estimated_costs": estimated_costs,
+            "ev_recommendation": ev_recommendation,
+        },
         "historical_win_rate": hist["win_rate"],
         "historical_profit_factor": hist["profit_factor"],
         "passed_checks": passed,
@@ -292,15 +459,27 @@ def gather_symbol_features(symbol, config: Optional[AnalyticsConfig] = None,
 
 
 def advisory_check_for_symbol(symbol,
-                              config: Optional[AnalyticsConfig] = None):
-    """(features, result) for ``symbol`` — gather features then evaluate."""
+                              config: Optional[AnalyticsConfig] = None,
+                              ev_result=None):
+    """(features, result) for ``symbol`` — gather features then evaluate.
+
+    ``ev_result`` is an optional ``ev_engine.EVResult`` (object or dict)
+    computed by the CALLER; this module never imports the EV engine. Missing /
+    errored EV -> behavior identical to pre-10C.
+    """
     config = config or AnalyticsConfig.from_env()
     features = gather_symbol_features(symbol, config)
+    ev = ev_fields_from_result(ev_result)
     result = evaluate_setup(
         oracle_score=features["oracle_score"],
         volatility_edge=features["volatility_edge"],
         dte=features["dte"], iv_rank=features["iv_rank"],
-        strategy=features["strategy"], config=config)
+        strategy=features["strategy"], config=config,
+        expected_value=ev["expected_value"],
+        ev_per_dollar_risk=ev["ev_per_dollar_risk"],
+        probability_of_profit=ev["probability_of_profit"],
+        estimated_costs=ev["estimated_costs"],
+        ev_recommendation=ev["ev_recommendation"])
     return features, result
 
 
@@ -326,6 +505,23 @@ def _check_line(label: str, ok: bool) -> str:
     return f"{'✅' if ok else '❌'} {label}"
 
 
+def _money_str(value) -> str:
+    v = oa._to_float(value)
+    if v is None:
+        return "n/a"
+    return f"{'+' if v >= 0 else '-'}${abs(v):.2f}"
+
+
+def _ratio_str(value) -> str:
+    v = oa._to_float(value)
+    return "n/a" if v is None else "%.2f" % v
+
+
+def _pop_str(value) -> str:
+    v = oa._to_float(value)
+    return "n/a" if v is None else "%d%%" % round(v * 100.0)
+
+
 def format_advisory_check(symbol, features: dict, result: dict) -> str:
     """Telegram-ready advisory summary for one symbol."""
     checks = result["checks"]
@@ -345,6 +541,21 @@ def format_advisory_check(symbol, features: dict, result: dict) -> str:
                     checks["iv_rank"]),
         _check_line(f"Strategy ({features.get('strategy') or 'n/a'})",
                     checks["strategy"]),
+    ]
+    # Phase 10C: EV section (informational; soft signal already applied above).
+    ev_sum = result.get("ev_summary") or {}
+    lines += [
+        "",
+        "*EV analysis:*",
+        f"Expected Value: {_money_str(ev_sum.get('expected_value'))}",
+        f"EV/Risk: {_ratio_str(ev_sum.get('ev_per_dollar_risk'))}",
+        f"Probability of Profit: {_pop_str(ev_sum.get('probability_of_profit'))}",
+        f"EV Recommendation: {ev_sum.get('ev_recommendation') or 'n/a'}",
+    ]
+    if result.get("ev_available") and result.get("ev_adjustment") != "none":
+        lines.append(f"_EV {result['ev_adjustment']} the verdict "
+                     f"(base: {result.get('base_recommendation')})._")
+    lines += [
         "",
         f"Historical win rate: *{result['historical_win_rate'] * 100:.1f}%*",
         f"Historical profit factor: *{_pf_str(result['historical_profit_factor'])}*",
@@ -355,12 +566,17 @@ def format_advisory_check(symbol, features: dict, result: dict) -> str:
 
 
 def generate_advisory_check_text(symbol,
-                                 config: Optional[AnalyticsConfig] = None) -> str:
-    """Top-level entry for the ADVISORY_CHECK SYMBOL Telegram command."""
+                                 config: Optional[AnalyticsConfig] = None,
+                                 ev_result=None) -> str:
+    """Top-level entry for the ADVISORY_CHECK SYMBOL Telegram command.
+
+    ``ev_result`` (optional, caller-computed EVResult) adds the Phase 10C EV
+    section; without it the output matches pre-10C plus an n/a EV section.
+    """
     sym = str(symbol or "").strip().upper()
     if not sym:
         return "Usage: `ADVISORY_CHECK SYMBOL`"
-    features, result = advisory_check_for_symbol(sym, config)
+    features, result = advisory_check_for_symbol(sym, config, ev_result=ev_result)
     return format_advisory_check(sym, features, result)
 
 
