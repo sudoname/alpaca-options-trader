@@ -110,6 +110,51 @@ class TestStampFields(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# Wide-barrier edge cap (production bug: EV exceeded max loss)
+# --------------------------------------------------------------------------- #
+class TestWideBarrierEdgeCap(unittest.TestCase):
+    """Server runs tp up to 5.0 / sl 0.725; an uncapped +0.25 probability
+    tilt claimed gross EV of tilt*(tp+sl) > 100% of premium (observed live:
+    EV $+14,499 on $13,445 max loss). Gross EV must cap at MAX_EDGE."""
+
+    WIDE = {"take_profit_percent": 2.20, "stop_loss_percent": 0.60}
+
+    def test_gross_ev_capped_at_max_edge_of_premium(self):
+        s = stamp(option={"confidence": 50, "delta": 0.9}, levels=self.WIDE)
+        gross = s["expected_value"] + s["round_trip_costs"]
+        self.assertLessEqual(gross, es.MAX_EDGE * s["max_loss"] + 0.01)
+        self.assertLess(s["expected_value"], s["max_loss"])
+
+    def test_observed_live_case_now_sane(self):
+        # ~ the live SOFI-style stamp: premium $13,445, very wide barriers.
+        s = compute_entry_stamp({"confidence": 4, "delta": 0.6},
+                                {"take_profit_percent": 3.6,
+                                 "stop_loss_percent": 0.7},
+                                2.689, 50, bid=2.65, ask=2.689)
+        self.assertLessEqual(s["ev_per_dollar_risk"], es.MAX_EDGE)
+
+    def test_cap_inactive_at_default_barriers(self):
+        # tp+sl = 0.40 -> cap 0.625 > 0.25 tilt ceiling: behavior unchanged.
+        s = stamp(option={"confidence": 50, "delta": 0.9})
+        self.assertAlmostEqual(s["probability_of_profit"],
+                               0.15 / 0.40 + 0.25)
+
+    def test_wider_barriers_do_not_raise_ev_per_dollar(self):
+        narrow = stamp(option={"confidence": 50, "delta": 0.9})
+        wide = stamp(option={"confidence": 50, "delta": 0.9},
+                     levels=self.WIDE)
+        self.assertLessEqual(wide["ev_per_dollar_risk"],
+                             es.MAX_EDGE + 1e-9)
+        self.assertLessEqual(narrow["ev_per_dollar_risk"],
+                             es.MAX_EDGE + 1e-9)
+
+    def test_stamp_version_bumped(self):
+        # v1 stamps (uncapped) must be distinguishable from fixed ones.
+        self.assertGreaterEqual(es.STAMP_VERSION, 2)
+        self.assertEqual(stamp()["pop_model"], "tp_sl_race_v2")
+
+
+# --------------------------------------------------------------------------- #
 # Fail-open
 # --------------------------------------------------------------------------- #
 class TestFailOpen(unittest.TestCase):

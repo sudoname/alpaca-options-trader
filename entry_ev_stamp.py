@@ -18,7 +18,14 @@ Model (deterministic, unit-testable, no network):
                  p0 = sl / (tp + sl) (exactly EV-zero by construction). The
                  directional signal that justified the entry tilts that up:
                  tilt = min(0.25, 0.05 * signal_strength
-                                  + 0.10 * max(0, |delta| - 0.40)),
+                                  + 0.10 * max(0, |delta| - 0.40)).
+                 Because an absolute probability tilt buys a gross EV edge of
+                 tilt * (tp + sl) * premium, wide barriers (e.g. tp 2.2 /
+                 sl 0.6 in production) would let a +0.25 tilt claim more EV
+                 than the premium itself. So the applied tilt is also capped
+                 by the edge it creates: tilt <= MAX_EDGE / (tp + sl), keeping
+                 gross EV <= MAX_EDGE (25%) of premium. With the default
+                 0.25/0.15 barriers that cap (0.625) is inactive.
                  pop = clamp(p0 + tilt, 0.02, 0.98).
   * EV (gross) = (pop * tp - (1 - pop) * sl) * premium
   * EV (net)   = gross - round-trip costs (CostModel when available, else a
@@ -30,8 +37,13 @@ measure — the stamp only has to be frozen, deterministic, and honest.
 
 from typing import Dict, Optional
 
-STAMP_VERSION = 1
-POP_MODEL = "tp_sl_race_v1"
+STAMP_VERSION = 2
+POP_MODEL = "tp_sl_race_v2"
+
+# Gross EV may never exceed this fraction of the premium at risk. The signal
+# tilt is an absolute probability bump, so its EV edge scales with the barrier
+# width (tp + sl); this cap keeps the frozen belief honest at wide barriers.
+MAX_EDGE = 0.25
 
 # Fallback round-trip friction per contract (2 sides of slippage + OCC fees)
 # used only when the cost model itself is unavailable.
@@ -94,6 +106,9 @@ def compute_entry_stamp(option: Optional[Dict], dynamic_levels: Optional[Dict],
         strength = max(0, int(_f(opt.get("confidence"), 0) or 0))
         delta = abs(_f(opt.get("delta"), 0.0) or 0.0)
         tilt = min(0.25, 0.05 * strength + 0.10 * max(0.0, delta - 0.40))
+        # Edge cap: gross EV = tilt * (tp + sl) * premium, so bound the tilt
+        # by the edge it buys. Inactive at narrow barriers (tp + sl <= 1).
+        tilt = min(tilt, MAX_EDGE / (tp + sl))
         pop = min(0.98, max(0.02, p0 + tilt))
 
         gross_ev = (pop * tp - (1.0 - pop) * sl) * premium
