@@ -133,14 +133,20 @@ def _rid(row: dict):
 def load_closed_records(config: Optional[AnalyticsConfig] = None,
                         attribution_path: Optional[str] = None,
                         trades: Optional[List[dict]] = None,
-                        snapshots: Optional[List[dict]] = None) -> List[dict]:
-    """Closed paper-spread records with their frozen entry-time beliefs.
+                        snapshots: Optional[List[dict]] = None,
+                        history_trades: Optional[List[dict]] = None) -> List[dict]:
+    """Closed records with their frozen entry-time beliefs.
 
     Trade rows (have max_loss, and the EV stamp when runner-opened) are merged
     with attribution snapshots (have advisory_recommendation + EV at entry) by
     trade id: the snapshot fills any field the trade row is missing, and the
     snapshot's advisory_recommendation wins (it is the frozen entry belief).
     Snapshot-only records (e.g. rotated trades file) still count. Fail-open.
+
+    Phase 10H: single-leg scheduler trades from trading_history.json count
+    too — but ONLY rows carrying an entry EV/POP stamp plus a dollar pnl
+    (entry_ev_stamp.py via smart_trader). Legacy stampless history rows are
+    ignored so pre-10H files can never skew the calibrations.
     """
     cfg = config or AnalyticsConfig.from_env()
     if trades is None:
@@ -148,6 +154,11 @@ def load_closed_records(config: Optional[AnalyticsConfig] = None,
         trades = data if isinstance(data, list) else []
     if snapshots is None:
         snapshots = aa.load_snapshots(attribution_path)
+    if history_trades is None:
+        data = oa.read_json(cfg.trade_history_file)
+        history_trades = data.get("trades") if isinstance(data, dict) else None
+        if not isinstance(history_trades, list):
+            history_trades = []
 
     merged = {}
     order: List[str] = []
@@ -157,6 +168,14 @@ def load_closed_records(config: Optional[AnalyticsConfig] = None,
         key = str(_rid(row) or f"trade#{len(order)}")
         merged[key] = dict(row)
         order.append(key)
+    for i, row in enumerate(history_trades):
+        if (not isinstance(row, dict) or oa._trade_pnl(row) is None
+                or (_ev(row) is None and _pop(row) is None)):
+            continue
+        key = str(_rid(row) or f"hist#{i}")
+        if key not in merged:
+            merged[key] = dict(row)
+            order.append(key)
     for i, snap in enumerate(snapshots or []):
         if not isinstance(snap, dict) or oa._trade_pnl(snap) is None:
             continue

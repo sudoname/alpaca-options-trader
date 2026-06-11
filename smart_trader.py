@@ -1893,6 +1893,23 @@ class SmartOptionsTrader:
                 }
             }
 
+            # Phase 10H: freeze the entry-time belief (expected EV, POP,
+            # max loss) so the calibration analytics can score this trade
+            # when it closes. Analytics-only metadata — a failed stamp never
+            # affects the order that was just placed.
+            try:
+                from entry_ev_stamp import compute_entry_stamp
+                stamp = compute_entry_stamp(
+                    option, dynamic_levels, entry_price, order_quantity,
+                    bid=bid_price, ask=entry_ask)
+                if stamp:
+                    trade_info['metrics'] = stamp
+                    print(f"[EV STAMP] EV ${stamp['expected_value']:+.2f} "
+                          f"POP {stamp['probability_of_profit']:.0%} "
+                          f"max loss ${stamp['max_loss']:.0f}")
+            except Exception as e:
+                print(f"[EV STAMP] skipped: {e}")
+
             action = (option.get('type') or 'call').upper()  # CALL/PUT
             analysis_ctx = {
                 'direction': action,
@@ -2401,6 +2418,31 @@ class SmartOptionsTrader:
             'pnl_percent': pnl_percent,
             'metrics': trade.get('metrics', {})
         }
+
+        # Phase 10H: when the entry carried an EV stamp, flatten the frozen
+        # beliefs plus the realized DOLLAR P/L onto the record so the
+        # ev_calibration / pop_calibration loaders can read scheduler trades
+        # directly (they key on top-level expected_value / probability_of_
+        # profit / pnl). Records without a stamp keep their legacy shape.
+        try:
+            stamp = trade.get('metrics') or {}
+            if isinstance(stamp, dict) and stamp.get('expected_value') is not None:
+                pnl_dollars = None
+                entry_price = trade.get('entry_price')
+                qty = trade.get('quantity', 1) or 1
+                if entry_price:
+                    pnl_dollars = (float(entry_price) * 100.0 * float(qty)
+                                   * (float(pnl_percent) / 100.0))
+                trade_record.update({
+                    'pnl': pnl_dollars,
+                    'expected_value': stamp.get('expected_value'),
+                    'probability_of_profit': stamp.get('probability_of_profit'),
+                    'max_loss': stamp.get('max_loss'),
+                    'ev_per_dollar_risk': stamp.get('ev_per_dollar_risk'),
+                    'order_id': trade.get('order_id'),
+                })
+        except Exception as e:
+            print(f"[EV STAMP] close flatten skipped: {e}")
 
         self.trading_history['trades'].append(trade_record)
 

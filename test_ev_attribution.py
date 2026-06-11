@@ -279,7 +279,8 @@ class TestLoadClosedRecords(unittest.TestCase):
             spread_trades_file="/nonexistent/evat_t.json",
             spread_positions_file="/nonexistent/evat_p.json",
             expected_move_file="/nonexistent/evat_e.csv",
-            training_dataset_file="/nonexistent/evat_d.csv")
+            training_dataset_file="/nonexistent/evat_d.csv",
+            trade_history_file="/nonexistent/evat_h.json")
         records = load_closed_records(
             config=cfg, attribution_path="/nonexistent/evat_a.json")
         self.assertEqual(records, [])

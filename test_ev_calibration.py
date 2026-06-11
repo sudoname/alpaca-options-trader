@@ -159,7 +159,8 @@ class TestVerdicts(unittest.TestCase):
             spread_trades_file="/nonexistent/ec_t.json",
             spread_positions_file="/nonexistent/ec_p.json",
             expected_move_file="/nonexistent/ec_e.csv",
-            training_dataset_file="/nonexistent/ec_d.csv")
+            training_dataset_file="/nonexistent/ec_d.csv",
+            trade_history_file="/nonexistent/ec_h.json")
         report = compute_ev_calibration(config=cfg,
                                         attribution_path="/nonexistent/a.json")
         self.assertEqual(report["sample_size"], 0)

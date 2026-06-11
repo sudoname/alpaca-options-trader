@@ -128,7 +128,8 @@ class TestVerdicts(unittest.TestCase):
             spread_trades_file="/nonexistent/pc_t.json",
             spread_positions_file="/nonexistent/pc_p.json",
             expected_move_file="/nonexistent/pc_e.csv",
-            training_dataset_file="/nonexistent/pc_d.csv")
+            training_dataset_file="/nonexistent/pc_d.csv",
+            trade_history_file="/nonexistent/pc_h.json")
         report = compute_pop_calibration(config=cfg,
                                          attribution_path="/nonexistent/a.json")
         self.assertEqual(report["sample_size"], 0)
