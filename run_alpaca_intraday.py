@@ -37,7 +37,13 @@ Env overrides (read from .env via the same manual parse smart_trader uses):
   SCHEDULER_INCLUDE_SCREENER=1   SCHEDULER_MAX_SYMBOLS=12
   SCAN_INTERVAL_MIN=15        ENTRY_START_ET=09:45
   ENTRY_CUTOFF_MIN_BEFORE_CLOSE=60   EOD_CLOSE_MIN_BEFORE_CLOSE=15
+  EOD_CLOSE_ENABLED=1         MAX_HOLD_DAYS=0
   MAX_NEW_TRADES_PER_DAY=4    SCHEDULER_ARMED=0
+
+EOD_CLOSE_ENABLED=0 switches to hold-overnight mode: the final-minutes window
+still blocks new entries but leaves positions running to their TP/SL across
+sessions; pair it with MAX_HOLD_DAYS=N so anything unresolved after N calendar
+days is force-closed (TIME_STOP) instead of rotting.
 """
 
 import os
@@ -109,6 +115,13 @@ class Config:
         self.entry_start_et = _parse_hhmm(get("ENTRY_START_ET", "09:45"))
         self.entry_cutoff_min = float(get("ENTRY_CUTOFF_MIN_BEFORE_CLOSE", "60"))
         self.eod_close_min = float(get("EOD_CLOSE_MIN_BEFORE_CLOSE", "15"))
+        # Hold-overnight mode: when EOD_CLOSE_ENABLED=0 the end-of-day window
+        # stops opening new trades but leaves positions running to their
+        # TP/SL (monitored every scan, across sessions). MAX_HOLD_DAYS is the
+        # companion time stop: scheduler positions older than this many
+        # CALENDAR days are force-closed on the next scan (0 = no time stop).
+        self.eod_close_enabled = _truthy(get("EOD_CLOSE_ENABLED", "1"))
+        self.max_hold_days = float(get("MAX_HOLD_DAYS", "0"))
         self.max_new_trades_per_day = int(get("MAX_NEW_TRADES_PER_DAY", "4"))
         if armed_override is None:
             self.armed = _truthy(get("SCHEDULER_ARMED", "0"))
@@ -182,6 +195,20 @@ def in_eod_window(now, next_close, *, eod_min):
         return False
     m = minutes_to_close(now, next_close)
     return 0 < m <= eod_min
+
+
+def held_past_max_days(entry_time, now, max_days):
+    """True when a tracked trade's entry is more than `max_days` CALENDAR days
+    old — the hold-overnight time stop. Date-only comparison so timezone
+    offsets can't shave a day. Fail-open False on a missing/garbled stamp or a
+    disabled (<= 0) limit, so a bad row is never force-closed by accident."""
+    if not max_days or max_days <= 0 or now is None:
+        return False
+    try:
+        entry = datetime.fromisoformat(str(entry_time)[:19])
+        return (now.date() - entry.date()).days > max_days
+    except (TypeError, ValueError):
+        return False
 
 
 def session_key(next_close):
@@ -376,7 +403,7 @@ class IntradayScheduler:
             log(f"[SESSION] new session {sk}: counters reset")
 
     # -- exits --------------------------------------------------------------- #
-    def force_close_scheduler_positions(self):
+    def force_close_scheduler_positions(self, reason="EOD_CLOSE", only=None):
         """Force-close (market sell) only positions this scheduler opened.
 
         Routes each close through the shared `enforce_exit` path so the outcome
@@ -384,7 +411,11 @@ class IntradayScheduler:
         P/L + RL/shadow), then prunes the closed rows from active_trades.json.
         Previously this called `close_position` directly, which fired the sell
         but never recorded the outcome or pruned the row — leaving sold
-        positions stuck as 'tracked open' and missing from realized P/L."""
+        positions stuck as 'tracked open' and missing from realized P/L.
+
+        `only` optionally narrows the sweep to trades matching a predicate
+        (e.g. the MAX_HOLD_DAYS time stop); `reason` is recorded as the exit
+        outcome ('EOD_CLOSE', 'TIME_STOP')."""
         trades = _read_active_trades()
         if not trades:
             return
@@ -394,19 +425,21 @@ class IntradayScheduler:
         for trade in trades:
             if trade.get("source") != SCHEDULER_SOURCE:
                 continue
+            if only is not None and not only(trade):
+                continue
             pos = by_symbol.get(trade.get("symbol"))
             if pos:
-                log(f"[EOD] closing scheduler position {trade.get('symbol')}")
+                log(f"[{reason}] closing scheduler position {trade.get('symbol')}")
                 try:
                     current_price = float(pos.get("current_price") or 0)
                     entry_price = float(trade.get("entry_price") or 0)
                     pnl_percent = (((current_price - entry_price) / entry_price
                                     * 100.0) if entry_price else 0.0)
-                    enforce_exit(self.trader, trade, pos, "EOD_CLOSE",
+                    enforce_exit(self.trader, trade, pos, reason,
                                  pnl_percent, "scheduler", current_price)
                     closed_syms.add(trade.get("symbol"))
                 except Exception as e:
-                    log(f"[WARN] EOD close failed for {trade.get('symbol')}: {e}")
+                    log(f"[WARN] {reason} failed for {trade.get('symbol')}: {e}")
         if closed_syms:
             survivors = [t for t in trades
                          if t.get("symbol") not in closed_syms]
@@ -627,10 +660,28 @@ class IntradayScheduler:
         # has already left the broker (closed via any path) from its real fill.
         self.reconcile_closed_from_fills()
 
-        # 2) EOD force-close window — close ours, do not open new
+        # 1c) time stop (hold-overnight mode): positions held past
+        # MAX_HOLD_DAYS calendar days are force-closed so nothing rots while
+        # waiting on a TP/SL that never resolves. No-op when disabled (0).
+        if self.cfg.max_hold_days > 0:
+            try:
+                self.force_close_scheduler_positions(
+                    reason="TIME_STOP",
+                    only=lambda t: held_past_max_days(
+                        t.get("entry_time"), parsed["now"],
+                        self.cfg.max_hold_days))
+            except Exception as e:
+                log(f"[WARN] time-stop sweep failed: {e}")
+
+        # 2) EOD window — never open new trades this late; close ours only
+        # when EOD_CLOSE_ENABLED (hold-overnight mode leaves them running
+        # to their TP/SL/time stop, monitored again next session).
         if in_eod_window(parsed["now"], parsed["next_close"], eod_min=self.cfg.eod_close_min):
             log(f"[EOD] within {self.cfg.eod_close_min:g} min of close")
-            self.force_close_scheduler_positions()
+            if self.cfg.eod_close_enabled:
+                self.force_close_scheduler_positions()
+            else:
+                log("[EOD] hold-overnight mode: leaving positions open")
             self._write_status(parsed)
             return parsed
 
@@ -747,6 +798,21 @@ def _selftest():
     check("late: not entry while in eod",
           in_entry_window(late["now"], late["next_close"], start_et=start, cutoff_min=60) is False)
 
+    # hold-overnight time stop
+    now = parse_clock(clk("12:00"))["now"]  # 2026-04-01
+    check("timestop: fresh trade not past max days",
+          held_past_max_days("2026-04-01T10:00:00", now, 5) is False)
+    check("timestop: exactly max days old is kept",
+          held_past_max_days("2026-03-27T10:00:00", now, 5) is False)
+    check("timestop: older than max days triggers",
+          held_past_max_days("2026-03-26T10:00:00", now, 5) is True)
+    check("timestop: disabled (0) never triggers",
+          held_past_max_days("2020-01-01T10:00:00", now, 0) is False)
+    check("timestop: garbage entry_time fails open",
+          held_past_max_days("not-a-date", now, 5) is False)
+    check("timestop: missing entry_time fails open",
+          held_past_max_days(None, now, 5) is False)
+
     # session_key / underlying_of
     check("session_key is the close date",
           session_key(parse_clock(clk("12:00"))["next_close"]) == date(2026, 4, 1))
@@ -772,6 +838,13 @@ def _selftest():
     # config dry-run default
     check("config defaults to dry-run", Config(env={}).armed is False)
     check("config arms via env", Config(env={"SCHEDULER_ARMED": "1"}).armed is True)
+    check("config eod close enabled by default",
+          Config(env={}).eod_close_enabled is True)
+    check("config eod close disables via env",
+          Config(env={"EOD_CLOSE_ENABLED": "0"}).eod_close_enabled is False)
+    check("config max_hold_days default off", Config(env={}).max_hold_days == 0)
+    check("config max_hold_days via env",
+          Config(env={"MAX_HOLD_DAYS": "7"}).max_hold_days == 7.0)
     check("config symbols default SPY,QQQ", Config(env={}).symbols == ["SPY", "QQQ"])
 
     # universe: screener-merge logic (deterministic; screener disabled -> no read)

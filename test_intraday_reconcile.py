@@ -177,6 +177,65 @@ class TestForceClose(_FileBackedCase):
         self.assertEqual(len(self._read()), 1)
 
 
+class TestTimeStop(_FileBackedCase):
+    """Hold-overnight mode: force_close with reason + `only` predicate."""
+
+    def _rows(self):
+        old = {"symbol": "OLD...C", "entry_price": 2.0, "quantity": 1,
+               "entry_time": "2026-06-01T10:00:00",
+               "source": SCHEDULER_SOURCE}
+        fresh = {"symbol": "NEW...C", "entry_price": 2.0, "quantity": 1,
+                 "entry_time": "2026-06-09T10:00:00",
+                 "source": SCHEDULER_SOURCE}
+        manual_old = {"symbol": "MAN...C", "entry_price": 2.0, "quantity": 1,
+                      "entry_time": "2026-06-01T10:00:00", "source": "manual"}
+        return old, fresh, manual_old
+
+    def test_closes_only_aged_scheduler_rows(self):
+        from datetime import datetime
+        old, fresh, manual_old = self._rows()
+        self._write([old, fresh, manual_old])
+        trader = _FakeTrader([
+            {"symbol": "OLD...C", "qty": "1", "current_price": "1.5"},
+            {"symbol": "NEW...C", "qty": "1", "current_price": "2.5"},
+            {"symbol": "MAN...C", "qty": "1", "current_price": "2.5"},
+        ])
+        now = datetime.fromisoformat("2026-06-10T15:00:00")
+        _scheduler(trader).force_close_scheduler_positions(
+            reason="TIME_STOP",
+            only=lambda t: ri.held_past_max_days(
+                t.get("entry_time"), now, 5))
+        # Only the aged scheduler row closes, recorded as TIME_STOP.
+        self.assertEqual(trader.closed, [("OLD...C", "TIME_STOP")])
+        self.assertEqual([r[:2] for r in trader.recorded],
+                         [("OLD...C", "TIME_STOP")])
+        # Fresh scheduler row and the manual row survive in the file.
+        self.assertEqual([t["symbol"] for t in self._read()],
+                         ["NEW...C", "MAN...C"])
+
+    def test_default_reason_still_eod_close(self):
+        old, _, _ = self._rows()
+        self._write([old])
+        trader = _FakeTrader([{"symbol": "OLD...C", "qty": "1",
+                               "current_price": "1.5"}])
+        _scheduler(trader).force_close_scheduler_positions()
+        self.assertEqual(trader.closed, [("OLD...C", "EOD_CLOSE")])
+
+
+class TestHeldPastMaxDays(unittest.TestCase):
+    def test_boundaries_and_fail_open(self):
+        from datetime import datetime
+        now = datetime.fromisoformat("2026-06-10T15:00:00")
+        held = ri.held_past_max_days
+        self.assertFalse(held("2026-06-10T09:00:00", now, 5))  # same day
+        self.assertFalse(held("2026-06-05T09:00:00", now, 5))  # exactly 5
+        self.assertTrue(held("2026-06-04T09:00:00", now, 5))   # 6 days
+        self.assertFalse(held("2020-01-01T09:00:00", now, 0))  # disabled
+        self.assertFalse(held("garbage", now, 5))              # fail-open
+        self.assertFalse(held(None, now, 5))
+        self.assertFalse(held("2020-01-01T09:00:00", None, 5))
+
+
 class TestReconcileFromFills(_FileBackedCase):
     def _patch_fills(self, mapping):
         self._orig_fetch = ri._fetch_sell_fills_by_symbol
