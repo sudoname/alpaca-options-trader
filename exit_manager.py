@@ -62,6 +62,26 @@ def _parse_dt(value) -> Optional[datetime]:
     return None
 
 
+def should_arm_trailing(entry_price, current_price,
+                        arm_profit_pct: float = 0.0) -> bool:
+    """Should the trailing stop arm at this price?
+
+    Arms only once the trade is up at least ``arm_profit_pct`` (fraction of
+    entry, e.g. 0.25 = +25%) so a one-tick blip above entry doesn't convert
+    a long-barrier trade into a -5% scratch. 0 preserves legacy behavior
+    (any price above entry arms). Pure; fail-open to False on bad inputs.
+    """
+    try:
+        entry = float(entry_price or 0)
+        cur = float(current_price or 0)
+        arm = float(arm_profit_pct or 0)
+    except (TypeError, ValueError):
+        return False
+    if entry <= 0 or cur <= 0:
+        return False
+    return cur > entry * (1.0 + max(0.0, arm))
+
+
 def evaluate_exit(
     trade: Dict,
     current_price: float,
@@ -264,6 +284,19 @@ def _self_test() -> int:
     d = evaluate_exit({'entry_price': 0}, 1.0, levels)
     if d.should_exit:
         print("FAIL: bad entry price should hold", d); ok = False
+
+    # Trailing arm threshold: legacy (0) arms on any uptick; with a threshold
+    # the price must clear entry*(1+arm); bad inputs never arm.
+    if not should_arm_trailing(1.00, 1.01, 0.0):
+        print("FAIL: arm=0 should arm on any uptick"); ok = False
+    if should_arm_trailing(1.00, 1.01, 0.25):
+        print("FAIL: +1% must not arm at 25% threshold"); ok = False
+    if not should_arm_trailing(1.00, 1.26, 0.25):
+        print("FAIL: +26% should arm at 25% threshold"); ok = False
+    if should_arm_trailing(1.00, 1.25, 0.25):
+        print("FAIL: exactly +25% should not arm (strict >)"); ok = False
+    if should_arm_trailing(None, 1.0, 0.0) or should_arm_trailing(1.0, "x", 0.0):
+        print("FAIL: bad inputs must not arm"); ok = False
 
     # Log line contains all required fields.
     line = format_exit_log('scheduler',

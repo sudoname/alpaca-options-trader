@@ -12,11 +12,83 @@ No creds / no network. Covers:
 import unittest
 from datetime import datetime, timedelta
 
-from exit_manager import evaluate_exit, format_exit_log, enforce_exit, ExitDecision
+from exit_manager import (evaluate_exit, format_exit_log, enforce_exit,
+                          ExitDecision, should_arm_trailing)
 
 
 LEVELS = {'stop_loss_percent': 10.0, 'take_profit_percent': 20.0,
           'trailing_stop_distance': 0.05}
+
+
+class TestShouldArmTrailing(unittest.TestCase):
+    """TRAILING_ARM_PROFIT_PCT gate: trailing protection must be earned.
+
+    With the legacy arm-on-any-uptick, a one-tick blip above entry plus the
+    5% trailing distance scratched long-barrier trades at ~-4% (June 11:
+    20/30 closes were dynamic_trailing_stop, 10% win rate vs 23% promised).
+    """
+
+    def test_zero_threshold_is_legacy_any_uptick(self):
+        self.assertTrue(should_arm_trailing(1.00, 1.0001, 0.0))
+        self.assertFalse(should_arm_trailing(1.00, 1.00, 0.0))  # strict >
+        self.assertFalse(should_arm_trailing(1.00, 0.99, 0.0))
+
+    def test_threshold_requires_real_profit(self):
+        self.assertFalse(should_arm_trailing(1.00, 1.01, 0.25))
+        self.assertFalse(should_arm_trailing(1.00, 1.25, 0.25))  # strict >
+        self.assertTrue(should_arm_trailing(1.00, 1.2501, 0.25))
+        self.assertTrue(should_arm_trailing(2.689, 2.689 * 1.30, 0.25))
+
+    def test_negative_threshold_treated_as_zero(self):
+        self.assertTrue(should_arm_trailing(1.00, 1.01, -0.5))
+        self.assertFalse(should_arm_trailing(1.00, 0.99, -0.5))
+
+    def test_bad_inputs_never_arm(self):
+        for entry, cur, arm in ((None, 1.0, 0.0), (1.0, None, 0.0),
+                                (0, 1.0, 0.0), (1.0, 0, 0.0),
+                                ("junk", 1.0, 0.0), (1.0, 1.5, "junk"),
+                                (-1.0, 1.0, 0.0)):
+            self.assertFalse(should_arm_trailing(entry, cur, arm),
+                             (entry, cur, arm))
+
+
+class TestSignalExitGate(unittest.TestCase):
+    def test_disabled_gate_skips_condition_exits_without_network(self):
+        # Unbound call with a duck-typed self: with the gate off and no
+        # near-expiry, should_exit_dynamically returns False BEFORE any
+        # market-data call (a network attempt here would raise).
+        from types import SimpleNamespace
+        from smart_trader import SmartOptionsTrader
+        fake = SimpleNamespace(signal_exits_enabled=False, ticker="SPY")
+        out = SmartOptionsTrader.should_exit_dynamically(
+            fake, {'entry_price': 1.0, 'highest_price': 2.0}, {}, 0.5)
+        self.assertFalse(out)
+
+
+class TestWiringGuards(unittest.TestCase):
+    """The hair-trigger exits must stay behind their knobs in both callers."""
+
+    def _src(self, name):
+        import os
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, name), "r", encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_smart_trader_uses_arm_gate_and_signal_exit_knob(self):
+        src = self._src("smart_trader.py")
+        self.assertIn("should_arm_trailing", src)
+        self.assertIn("TRAILING_ARM_PROFIT_PCT", src)
+        self.assertIn("SIGNAL_EXITS_ENABLED", src)
+        self.assertIn("signal_exits_enabled", src)
+        # The legacy unconditional arm must not come back.
+        self.assertNotIn(
+            "trade['highest_price'] = current_price\n"
+            "                trade['trailing_stop_active'] = True", src)
+
+    def test_telegram_monitor_uses_arm_gate(self):
+        src = self._src("telegram_bot.py")
+        self.assertIn("should_arm_trailing", src)
+        self.assertIn("trailing_arm_profit_pct", src)
 
 
 class TestEvaluateExit(unittest.TestCase):

@@ -245,6 +245,17 @@ class SmartOptionsTrader:
         self.max_stop_loss = float(env_vars.get('MAX_STOP_LOSS', '0.25'))
         self.max_take_profit = float(env_vars.get('MAX_TAKE_PROFIT', '0.50'))
         self.trailing_stop_distance = float(env_vars.get('TRAILING_STOP_DISTANCE', '0.05'))
+        # Trailing stop arms only after this much profit (fraction of entry).
+        # 0 = legacy: any tick above entry arms it, which converts long-barrier
+        # trades into ~-trailing_distance scratches on the first wobble.
+        self.trailing_arm_profit_pct = float(
+            env_vars.get('TRAILING_ARM_PROFIT_PCT', '0'))
+        # Signal-based exits (momentum reversal / vol spike / regime change /
+        # profit giveback / pullback-from-high) in should_exit_dynamically.
+        # Disable (=0) to let positions run their stop/target race.
+        self.signal_exits_enabled = str(
+            env_vars.get('SIGNAL_EXITS_ENABLED', 'true')
+        ).strip().lower() in ('1', 'true', 'yes', 'on')
 
         # Operational safety controls (duplicate guard / stale-quote / fill readback).
         self.quote_max_age_sec = float(env_vars.get('QUOTE_MAX_AGE_SEC', '30'))
@@ -2025,9 +2036,14 @@ class SmartOptionsTrader:
 
             pnl_percent = ((current_price - entry_price) / entry_price) * 100
 
-            # Update highest price for trailing stop
+            # Update highest price for trailing stop. Arming is gated by
+            # TRAILING_ARM_PROFIT_PCT so the trade must earn protection first
+            # (legacy 0 = any uptick arms).
+            from exit_manager import should_arm_trailing
             if current_price > trade['highest_price']:
                 trade['highest_price'] = current_price
+            if not trade.get('trailing_stop_active') and should_arm_trailing(
+                    entry_price, current_price, self.trailing_arm_profit_pct):
                 trade['trailing_stop_active'] = True
 
             # Use dynamic levels or fallback to static
@@ -2349,6 +2365,13 @@ class SmartOptionsTrader:
             if days_to_expiry <= 2:
                 print("[EXIT] Near expiration")
                 return True
+
+        # SIGNAL_EXITS_ENABLED=0: skip every condition-based exit below
+        # (momentum reversal, vol spike, regime change, profit giveback,
+        # pullback-from-high) so the position runs its stop/target race.
+        # Near-expiration above still applies.
+        if not getattr(self, 'signal_exits_enabled', True):
+            return False
 
         # Get current market conditions
         current_dynamic = self.calculate_dynamic_levels(underlying_symbol)

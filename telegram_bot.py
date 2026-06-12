@@ -2550,17 +2550,22 @@ Total symbols: `{len(self.supported_tickers)}`"""
                     # closes the position and records the outcome exactly once.
                     if self.unified_exit_enabled:
                         try:
-                            from exit_manager import evaluate_exit, enforce_exit
+                            from exit_manager import (evaluate_exit, enforce_exit,
+                                                      should_arm_trailing)
                             dyn = trader.calculate_dynamic_levels(trade['ticker'])
                             levels = {
                                 'stop_loss_percent': dyn['stop_loss_percent'] * 100,
                                 'take_profit_percent': dyn['take_profit_percent'] * 100,
                                 'trailing_stop_distance': dyn['trailing_stop_distance'],
                             }
-                            # Track the running high so the trailing stop can arm,
-                            # mirroring the scheduler's highest_price bookkeeping.
+                            # Track the running high; arming mirrors the
+                            # scheduler's TRAILING_ARM_PROFIT_PCT gate.
                             if current_price > trade.get('highest_price', 0):
                                 trade['highest_price'] = current_price
+                            if (not trade.get('trailing_stop_active')
+                                    and should_arm_trailing(
+                                        trade.get('entry_price'), current_price,
+                                        getattr(trader, 'trailing_arm_profit_pct', 0.0))):
                                 trade['trailing_stop_active'] = True
                             decision = evaluate_exit(
                                 trade, current_price, levels, check_expiration=True)
