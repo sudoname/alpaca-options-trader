@@ -347,17 +347,17 @@ class TestApplyRealGreeks(unittest.TestCase):
 class TestRealGreeksWiring(unittest.TestCase):
     def setUp(self):
         self.t = _make_trader()
-        self.t.get_option_price = lambda sym: {"bid": 1.0, "ask": 1.1,
-                                               "mid": 1.05, "ts": None}
+        self.t.get_option_prices = lambda syms: {
+            s: {"bid": 1.0, "ask": 1.1, "mid": 1.05, "ts": None} for s in syms}
 
     def test_disabled_by_default_does_not_fetch_snapshot(self):
         self.t.use_real_greeks = False
         called = {"n": 0}
 
-        def _boom(sym):
+        def _boom(syms):
             called["n"] += 1
             return {}
-        self.t.get_option_snapshot = _boom
+        self.t.get_option_snapshots = _boom
 
         best = self.t.select_best_option([_real_call(145)], current_price=150.0,
                                          strategy="call")
@@ -369,8 +369,9 @@ class TestRealGreeksWiring(unittest.TestCase):
 
     def test_enabled_uses_real_values(self):
         self.t.use_real_greeks = True
-        self.t.get_option_snapshot = lambda sym: {
-            "delta": 0.58, "gamma": 0.03, "theta": -0.02, "vega": 0.25, "iv": 0.40}
+        self.t.get_option_snapshots = lambda syms: {s: {
+            "delta": 0.58, "gamma": 0.03, "theta": -0.02, "vega": 0.25,
+            "iv": 0.40} for s in syms}
         best = self.t.select_best_option([_real_call(145)], current_price=150.0,
                                          strategy="call")
         self.assertIsNotNone(best)
@@ -382,7 +383,7 @@ class TestRealGreeksWiring(unittest.TestCase):
 
     def test_enabled_but_missing_snapshot_falls_back(self):
         self.t.use_real_greeks = True
-        self.t.get_option_snapshot = lambda sym: {}   # snapshot unavailable
+        self.t.get_option_snapshots = lambda syms: {}   # snapshot unavailable
         best = self.t.select_best_option([_real_call(145)], current_price=150.0,
                                          strategy="call")
         self.assertIsNotNone(best)
@@ -585,8 +586,8 @@ def _real_call_exp(strike, days):
 class TestPhase2Integration(unittest.TestCase):
     def setUp(self):
         self.t = _make_trader()
-        self.t.get_option_price = lambda sym: {"bid": 1.00, "ask": 1.05,
-                                               "mid": 1.025, "ts": None}
+        self.t.get_option_prices = lambda syms: {
+            s: {"bid": 1.00, "ask": 1.05, "mid": 1.025, "ts": None} for s in syms}
 
     def test_dte_preference_picks_closer_to_target(self):
         self.t.use_dte_targeting = True            # target 45, window 30-90
@@ -606,14 +607,15 @@ class TestPhase2Integration(unittest.TestCase):
 
     def test_delta_targeting_falls_back_when_missing(self):
         self.t.use_delta_targeting = True
-        self.t.get_option_snapshot = lambda sym: {}   # no real delta
+        self.t.get_option_snapshots = lambda syms: {}   # no real delta
         best = self.t.select_best_option([_real_call_exp(145, 45)],
                                          current_price=150.0, strategy="call")
         self.assertIsNotNone(best)                  # fell back, not rejected
 
     def test_delta_targeting_rejects_far_real_delta(self):
         self.t.use_delta_targeting = True
-        self.t.get_option_snapshot = lambda sym: {"delta": 0.90}  # far from 0.40
+        self.t.get_option_snapshots = lambda syms: {
+            s: {"delta": 0.90} for s in syms}  # far from 0.40
         best = self.t.select_best_option([_real_call_exp(145, 45)],
                                          current_price=150.0, strategy="call")
         self.assertIsNone(best)                     # bad_delta -> rejected
@@ -621,8 +623,9 @@ class TestPhase2Integration(unittest.TestCase):
     def test_cost_ev_gate_rejects_wide_spread(self):
         self.t.use_cost_ev_gate = True
         self.t.max_option_spread_pct = 0.15
-        self.t.get_option_price = lambda sym: {"bid": 1.0, "ask": 2.0,
-                                               "mid": 1.5, "ts": None}  # 50%
+        self.t.get_option_prices = lambda syms: {
+            s: {"bid": 1.0, "ask": 2.0, "mid": 1.5, "ts": None}
+            for s in syms}  # 50%
         best = self.t.select_best_option([_real_call_exp(145, 45)],
                                          current_price=150.0, strategy="call")
         self.assertIsNone(best)

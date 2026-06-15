@@ -1039,6 +1039,73 @@ class SmartOptionsTrader:
             print(f"[GREEKS ERROR] {symbol}: {e}")
             return {}
 
+    def get_option_prices(self, symbols):
+        """Batched latest-quote fetch: {symbol: {bid,ask,mid,ts}}.
+
+        Same data as get_option_price but one HTTP request per chunk of
+        symbols instead of one per symbol. Pricing every strike one-by-one
+        made a 50+ symbol scan take 15-20 min and triggered HTTP 429 storms;
+        the quotes endpoint accepts comma-separated `symbols`, so the whole
+        option chain is fetched up front here. Fail-open: symbols without a
+        usable quote (or on any error/non-200) are simply absent from the map;
+        callers fall back to the existing "no quote -> skip" path. Never raises.
+        """
+        out: Dict = {}
+        syms = [s for s in dict.fromkeys(symbols) if s]  # dedupe, keep order
+        for i in range(0, len(syms), 100):
+            chunk = syms[i:i + 100]
+            try:
+                response = requests.get(
+                    f"{self.data_url}/v1beta1/options/quotes/latest",
+                    headers=self.headers,
+                    params={'symbols': ','.join(chunk), 'feed': 'indicative'},
+                )
+                if response.status_code != 200:
+                    print(f"[OPTION PRICE] batch status {response.status_code} "
+                          f"for {len(chunk)} symbol(s)")
+                    continue
+                quotes = (response.json() or {}).get('quotes') or {}
+                for sym, quote in quotes.items():
+                    bid = float(quote.get('bp', 0))
+                    ask = float(quote.get('ap', 0))
+                    if bid > 0 or ask > 0:
+                        out[sym] = {
+                            'bid': bid,
+                            'ask': ask,
+                            'mid': (bid + ask) / 2 if (bid > 0 and ask > 0) else (ask if ask > 0 else bid),
+                            'ts': quote.get('t'),
+                        }
+            except Exception as e:
+                print(f"[OPTION PRICE ERROR] batch: {e}")
+        return out
+
+    def get_option_snapshots(self, symbols):
+        """Batched snapshot fetch: {symbol: {delta,gamma,theta,vega,iv}}.
+
+        Greeks/IV for many contracts in one (chunked) request, mirroring
+        get_option_snapshot. Only present numeric fields are returned per
+        symbol; missing symbols are absent so callers keep their fallbacks.
+        Fail-open; never raises.
+        """
+        out: Dict = {}
+        syms = [s for s in dict.fromkeys(symbols) if s]
+        for i in range(0, len(syms), 100):
+            chunk = syms[i:i + 100]
+            try:
+                response = requests.get(
+                    f"{self.data_url}/v1beta1/options/snapshots",
+                    headers=self.headers,
+                    params={'symbols': ','.join(chunk), 'feed': 'indicative'},
+                )
+                if response.status_code != 200:
+                    continue
+                snaps = (response.json() or {}).get('snapshots') or {}
+                for sym, snap in snaps.items():
+                    out[sym] = self._parse_snapshot_greeks(snap or {})
+            except Exception as e:
+                print(f"[GREEKS ERROR] batch: {e}")
+        return out
+
     @staticmethod
     def _parse_snapshot_greeks(snapshot: Dict) -> Dict:
         """Pure parser: extract {delta,gamma,theta,vega,iv} from a snapshot dict.
@@ -1420,6 +1487,18 @@ class SmartOptionsTrader:
             except Exception as e:
                 print(f"[NEWS] ranking error (ignored): {e}")
 
+        # Batched market-data prefetch (rate-limit fix). Price the whole chain
+        # in one (chunked) request instead of a quote+snapshot call per strike;
+        # the per-strike pattern made a 50+ symbol scan take 15-20 min and set
+        # off HTTP 429 storms. Snapshots are only pulled when real-greeks or
+        # delta targeting need them. Fail-open: a symbol missing from a map
+        # falls through the same "no quote -> skip" / heuristic-fallback paths.
+        chain_symbols = [c['symbol'] for c in contracts if not c.get('mock', False)]
+        quote_map = self.get_option_prices(chain_symbols) if chain_symbols else {}
+        snap_map = {}
+        if chain_symbols and (self.use_real_greeks or self.use_delta_targeting):
+            snap_map = self.get_option_snapshots(chain_symbols)
+
         for contract in contracts:
             strike = float(contract['strike_price'])
             contract_type = contract.get('type', 'call').lower()
@@ -1483,8 +1562,8 @@ class SmartOptionsTrader:
                 validated_count += 1
                 print(f"[MOCK] ${strike:.2f} {contract_type.upper()} exp {expiration} - Bid: ${bid_price:.2f}, Ask: ${ask_price:.2f} (Black-Scholes)")
             else:
-                # Try to get real quote from API
-                option_quote = self.get_option_price(option_symbol)
+                # Real quote from the batched prefetch (see chain prefetch above)
+                option_quote = quote_map.get(option_symbol)
                 if not option_quote or option_quote['ask'] <= 0:
                     print(f"[SKIP] No valid quote for {option_symbol} (Strike: ${strike:.2f}, Exp: {expiration})")
                     continue
@@ -1540,7 +1619,7 @@ class SmartOptionsTrader:
             # fields the snapshot returns are used; missing ones keep fallbacks.
             snap_greeks = {}
             if (self.use_real_greeks or self.use_delta_targeting) and not contract.get('mock', False):
-                snap_greeks = self.get_option_snapshot(option_symbol)
+                snap_greeks = snap_map.get(option_symbol, {})
                 if self.use_real_greeks:
                     log = self._apply_real_greeks(option_data, snap_greeks)
                     print(f"[GREEKS] {self.ticker} {option_symbol} {log}")
