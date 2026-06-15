@@ -2668,8 +2668,11 @@ class SmartOptionsTrader:
             print(f"[OPTIONS] Generating mock option contracts for {ticker}")
             return self.generate_mock_option_contracts(ticker)
 
-        expiration_start = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d')
-        expiration_end = (datetime.now() + timedelta(days=90)).strftime('%Y-%m-%d')
+        # Fetch window is driven by the DTE knobs (OPTION_MIN_DTE / OPTION_MAX_DTE,
+        # defaults 30/90) so the chain we pull and the DTE-targeting gate share one
+        # source of truth. Set them in .env to trade shorter/longer expirations.
+        expiration_start = (datetime.now() + timedelta(days=self.option_min_dte)).strftime('%Y-%m-%d')
+        expiration_end = (datetime.now() + timedelta(days=self.option_max_dte)).strftime('%Y-%m-%d')
 
         # Bound strikes to a window around the current price. Without this the
         # endpoint returns the lowest strikes first (deep ITM), so for a
