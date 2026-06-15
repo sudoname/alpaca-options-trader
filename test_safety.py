@@ -57,6 +57,7 @@ def _make_trader(ticker="AAPL"):
     t.option_target_call_delta = 0.40
     t.option_target_put_delta = -0.40
     t.option_max_delta_distance = 0.20
+    t.option_fallback_delta_slack = 1.5
     t.use_cost_ev_gate = False
     t.min_post_cost_edge = 0.00
     t.max_option_spread_pct = 0.15
@@ -452,10 +453,24 @@ class TestPhase2Delta(unittest.TestCase):
         self.t.use_delta_targeting = False
         self.assertEqual(self._eval(0.99, True)[0], None)  # far, but gate off
 
-    def test_missing_real_delta_falls_back(self):
+    def test_missing_real_delta_gates_on_wider_band(self):
+        # has_real_delta False -> still gated, but on the wider fallback band
+        # (0.20 * 1.5 = 0.30 around the 0.40 call target -> [0.10, 0.70]).
         self.t.use_delta_targeting = True
-        # has_real_delta False -> no targeting even though delta is far off.
-        self.assertEqual(self._eval(0.99, False), (None, 1.0))
+        self.t.option_fallback_delta_slack = 1.5
+        # In the wider band: passes, but with NO score nudge (proxy untrusted).
+        self.assertEqual(self._eval(0.55, False, "call"), (None, 1.0))
+        # Far outside even the wider band: rejected.
+        self.assertEqual(self._eval(0.99, False, "call")[0], "bad_delta")
+        self.t.use_delta_targeting = False
+
+    def test_fallback_slack_zero_disables_fallback_gating(self):
+        # Slack <= 0 reverts to legacy real-delta-only gating: a far heuristic
+        # delta passes untouched.
+        self.t.use_delta_targeting = True
+        self.t.option_fallback_delta_slack = 0.0
+        self.assertEqual(self._eval(0.99, False, "call"), (None, 1.0))
+        self.t.option_fallback_delta_slack = 1.5
         self.t.use_delta_targeting = False
 
     def test_call_near_target_ok(self):
@@ -605,12 +620,25 @@ class TestPhase2Integration(unittest.TestCase):
                                          strategy="call")
         self.assertIsNone(best)
 
-    def test_delta_targeting_falls_back_when_missing(self):
+    def test_delta_targeting_inband_heuristic_passes_when_missing(self):
+        # No real delta: a near-ATM strike's heuristic delta (~0.52) is inside
+        # the wider fallback band [0.10, 0.70], so it passes (no score nudge).
         self.t.use_delta_targeting = True
         self.t.get_option_snapshots = lambda syms: {}   # no real delta
         best = self.t.select_best_option([_real_call_exp(145, 45)],
                                          current_price=150.0, strategy="call")
-        self.assertIsNotNone(best)                  # fell back, not rejected
+        self.assertIsNotNone(best)
+
+    def test_delta_targeting_rejects_far_heuristic_when_missing(self):
+        # No real delta + a deep-OTM strike whose heuristic delta falls outside
+        # the wider fallback band must be rejected (closes the ~40% bypass).
+        self.t.use_delta_targeting = True
+        self.t.get_option_snapshots = lambda syms: {}   # no real delta
+        # strike 100 vs price 150 -> heuristic call delta ~0.73, outside the
+        # wider fallback band's 0.70 upper edge.
+        best = self.t.select_best_option([_real_call_exp(100, 45)],
+                                         current_price=150.0, strategy="call")
+        self.assertIsNone(best)
 
     def test_delta_targeting_rejects_far_real_delta(self):
         self.t.use_delta_targeting = True
@@ -629,6 +657,62 @@ class TestPhase2Integration(unittest.TestCase):
         best = self.t.select_best_option([_real_call_exp(145, 45)],
                                          current_price=150.0, strategy="call")
         self.assertIsNone(best)
+
+
+# --------------------------------------------------------------------------- #
+# EV entry gate: block entries whose ev_per_dollar_risk is below the floor.
+# Drives place_order_with_stops with all network primitives monkeypatched and
+# the order POST guarded by a fake _risk_check that stops execution right after
+# the gate (so a "risk engine" block proves the EV gate let the trade through).
+# --------------------------------------------------------------------------- #
+class TestEVEntryGate(unittest.TestCase):
+    def _trader(self):
+        t = _make_trader()
+        t.news_service = None
+        t.sentiment_service = None
+        t.use_portfolio_greek_limits = False
+        t.max_budget_per_trade = 100000.0
+        t._has_open_or_pending = lambda sym: False
+        t._quote_is_fresh = lambda q: True
+        t.get_option_price = lambda sym: {
+            "bid": 1.00, "ask": 1.05, "mid": 1.025, "ts": "now"}
+        t.calculate_dynamic_levels = lambda underlying=None: {
+            "market_regime": "ranging", "volatility": 0.20, "momentum": 0.0,
+            "stop_loss_percent": 0.30, "take_profit_percent": 2.20,
+            "trailing_stop_distance": 0.15, "confidence": 1}
+        # The fail-closed risk gate sits immediately after the EV gate; making it
+        # block lets us assert the EV gate's pass/skip behavior without a network
+        # order POST.
+        t._risk_check = lambda total_cost, qty=1: {
+            "allowed": False, "reason": "test-stop"}
+        return t
+
+    _OPT = {"symbol": "AAPL260821C00150000", "type": "call",
+            "underlying": "AAPL", "delta": 0.50, "confidence": 1}
+
+    def test_blocks_when_below_floor(self):
+        t = self._trader()
+        t.use_ev_entry_gate = True
+        t.min_ev_per_dollar_risk = 99.0     # nothing can clear this
+        self.assertIsNone(t.place_order_with_stops(dict(self._OPT), quantity=1))
+        self.assertIn("EV gate", t.last_block_reason)
+
+    def test_passes_when_above_floor(self):
+        t = self._trader()
+        t.use_ev_entry_gate = True
+        t.min_ev_per_dollar_risk = -99.0    # everything clears this
+        self.assertIsNone(t.place_order_with_stops(dict(self._OPT), quantity=1))
+        # Reached the risk gate -> EV gate let it through.
+        self.assertIn("risk engine", t.last_block_reason)
+        self.assertNotIn("EV gate", t.last_block_reason)
+
+    def test_disabled_skips_gate(self):
+        t = self._trader()
+        t.use_ev_entry_gate = False
+        t.min_ev_per_dollar_risk = 99.0     # would block if the gate ran
+        self.assertIsNone(t.place_order_with_stops(dict(self._OPT), quantity=1))
+        self.assertIn("risk engine", t.last_block_reason)
+        self.assertNotIn("EV gate", t.last_block_reason)
 
 
 # --------------------------------------------------------------------------- #

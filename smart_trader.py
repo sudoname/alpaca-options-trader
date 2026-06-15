@@ -174,11 +174,17 @@ class SmartOptionsTrader:
         self.option_target_dte = _i2('OPTION_TARGET_DTE', 45)
         self.use_dte_targeting = _flag('USE_DTE_TARGETING')
 
-        # 2) Delta targeting (needs a real delta; otherwise falls back to the
-        #    existing behavior). Gated by USE_DELTA_TARGETING.
+        # 2) Delta targeting. Gated by USE_DELTA_TARGETING. With a REAL snapshot
+        #    delta the gate is tight (OPTION_MAX_DELTA_DISTANCE). When only the
+        #    heuristic (moneyness) delta is available it still gates, but on a
+        #    wider band (distance * OPTION_FALLBACK_DELTA_SLACK) so far-OTM /
+        #    deep-ITM contracts can't slip through ungated while the noisier
+        #    proxy isn't over-trusted. Slack <= 0 disables fallback gating
+        #    (legacy behavior: real-delta-only).
         self.option_target_call_delta = _f2('OPTION_TARGET_CALL_DELTA', 0.40)
         self.option_target_put_delta = _f2('OPTION_TARGET_PUT_DELTA', -0.40)
         self.option_max_delta_distance = _f2('OPTION_MAX_DELTA_DISTANCE', 0.20)
+        self.option_fallback_delta_slack = _f2('OPTION_FALLBACK_DELTA_SLACK', 1.5)
         self.use_delta_targeting = _flag('USE_DELTA_TARGETING')
 
         # 3) Cost/EV gate: reject wide spreads and negative post-cost edge using
@@ -197,6 +203,18 @@ class SmartOptionsTrader:
 
         # Lazily-built cost model for the EV gate (fail-open if unavailable).
         self._phase2_cm = None
+
+        # EV entry gate (opt-in via USE_EV_ENTRY_GATE). The Phase-2 cost-EV gate
+        # only compares the +220% take target to ~8% round-trip cost (edge ~212%
+        # always), so it never rejects on expected value. This gate instead uses
+        # the frozen entry-time belief (entry_ev_stamp) computed PRE-ORDER, and
+        # blocks entries whose ev_per_dollar_risk is below MIN_EV_PER_DOLLAR_RISK.
+        # Default floor 0.0 -> rejects only negative-expectancy entries (the
+        # historical ev/$risk <= 0 bucket won 0% / averaged -12%). Computed with
+        # the SAME inputs as the recorded stamp so the floor maps directly onto
+        # the recorded ev_per_dollar_risk distribution. Fail-open on any error.
+        self.use_ev_entry_gate = _flag('USE_EV_ENTRY_GATE')
+        self.min_ev_per_dollar_risk = _f2('MIN_EV_PER_DOLLAR_RISK', 0.0)
 
         # --- Phase 3: direction quality + sizing safety -------------------- #
         # All OFF by default so default behavior is byte-for-byte unchanged.
@@ -1414,13 +1432,24 @@ class SmartOptionsTrader:
                 return ('bad_dte', 1.0)
             score_mult *= self._dte_distance_mult(dte)
 
-        # 2) Delta targeting (only with a REAL delta; missing -> fall back).
-        if self.use_delta_targeting and has_real_delta and delta is not None:
+        # 2) Delta targeting. A REAL snapshot delta gates tightly and nudges the
+        #    score; a heuristic (moneyness) delta gates on a wider band so
+        #    far-OTM/deep-ITM contracts can't slip through ungated when greeks
+        #    are missing (~40% of contracts), without trusting the noisier proxy
+        #    enough to nudge ranking. OPTION_FALLBACK_DELTA_SLACK<=0 reverts to
+        #    real-delta-only gating.
+        if self.use_delta_targeting and delta is not None:
             target = (self.option_target_call_delta if strategy == 'call'
                       else self.option_target_put_delta)
-            if abs(delta - target) > self.option_max_delta_distance:
-                return ('bad_delta', 1.0)
-            score_mult *= self._delta_distance_mult(delta, target)
+            if has_real_delta:
+                if abs(delta - target) > self.option_max_delta_distance:
+                    return ('bad_delta', 1.0)
+                score_mult *= self._delta_distance_mult(delta, target)
+            elif self.option_fallback_delta_slack > 0:
+                fallback_dist = (self.option_max_delta_distance
+                                 * self.option_fallback_delta_slack)
+                if abs(delta - target) > fallback_dist:
+                    return ('bad_delta', 1.0)
 
         # 3) Cost / EV gate. Fail-open on any computation error.
         if self.use_cost_ev_gate:
@@ -1858,6 +1887,35 @@ class SmartOptionsTrader:
                           f"contract(s), cost: ${total_cost:.2f}")
             except Exception as e:
                 print(f"[NEWS] gate error (ignored): {e}")
+
+        # ---- EV entry gate (opt-in, fail-open) --------------------------------
+        # Runs AFTER sizing so the stamp's premium reflects the final size, and
+        # BEFORE the order is sent. Computes the frozen entry-time belief on the
+        # pre-trade quote and blocks entries whose expected value per dollar at
+        # risk is below the floor. Always logs the value so the floor can be
+        # calibrated from live data. Any error -> no effect (trade proceeds).
+        if getattr(self, 'use_ev_entry_gate', False):
+            try:
+                from entry_ev_stamp import compute_entry_stamp
+                gate_stamp = compute_entry_stamp(
+                    option, dynamic_levels, entry_price, order_quantity,
+                    bid=bid_price, ask=current_option_price['ask'])
+                evpdr = gate_stamp.get('ev_per_dollar_risk') if gate_stamp else None
+                if evpdr is not None:
+                    print(f"[EV GATE] ev/$risk={evpdr:+.4f} "
+                          f"floor={self.min_ev_per_dollar_risk:+.4f} "
+                          f"(EV ${gate_stamp['expected_value']:+.2f} "
+                          f"POP {gate_stamp['probability_of_profit']:.0%})")
+                    if evpdr < self.min_ev_per_dollar_risk:
+                        print(f"[EV GATE] BLOCKED: ev/$risk {evpdr:+.4f} "
+                              f"below floor {self.min_ev_per_dollar_risk:+.4f}")
+                        self.last_block_reason = (
+                            f"EV gate: expected value per dollar at risk "
+                            f"({evpdr:+.4f}) is below the floor "
+                            f"({self.min_ev_per_dollar_risk:+.4f})")
+                        return None
+            except Exception as e:
+                print(f"[EV GATE] error (ignored): {e}")
 
         # ---- Phase 4: portfolio-level greek gate (opt-in, fail-open) ----------
         # Runs AFTER sizing so the projection uses the final contract count, and
