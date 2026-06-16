@@ -70,6 +70,12 @@ def _make_trader(ticker="AAPL"):
     t.min_direction_signals = 2
     t.use_normalized_confidence = False
     t.last_skip_reason = None
+    # Pin directional-signal thresholds to the historical defaults so the
+    # Phase 3 signal tests don't depend on local .env tuning.
+    t.signal_momentum_moderate = 0.01
+    t.signal_momentum_strong = 0.03
+    t.signal_short_trend = 0.02
+    t.signal_medium_trend = 0.03
     # Pin Phase 4 flags OFF so default behavior is unchanged unless a test opts in.
     t.use_portfolio_greek_limits = False
     t.portfolio_limits = None
@@ -779,6 +785,40 @@ class TestPhase3Skip(unittest.TestCase):
         _pin_direction_inputs(t, momentum=0.05,
                               prices=[100, 100, 100, 100, 100, 110])
         self.assertEqual(t.determine_option_strategy("AAPL"), "call")
+
+
+# --------------------------------------------------------------------------- #
+# Env-tunable directional-signal thresholds (SIGNAL_MOMENTUM_*/SIGNAL_*_TREND).
+# A mild ~1.2% move registers ZERO votes at the historical defaults but fires a
+# directional vote once the thresholds are lowered -> wider entry breadth.
+# --------------------------------------------------------------------------- #
+class TestSignalThresholdTuning(unittest.TestCase):
+    # short_trend = (p[-1]-p[-3])/p[-3] = +1.2%; medium = (p[-1]-p[-5])/p[-5]
+    # = +1.6%; momentum +0.6%. All below the historical defaults
+    # (0.02 / 0.03 / 0.01) -> zero votes; all above the lowered bars below.
+    _MILD = dict(momentum=0.006,
+                 prices=[100.0, 99.6, 100.0, 100.0, 100.0, 101.2])
+
+    def test_mild_move_is_flat_at_default_thresholds(self):
+        t = _make_trader()
+        t.use_skip_on_weak_signal = True
+        t.min_direction_signals = 1
+        _pin_direction_inputs(t, **self._MILD)
+        self.assertEqual(t.determine_option_strategy("AAPL"), "skip")
+        self.assertIn("below_min_signals", t.last_skip_reason)
+
+    def test_mild_move_fires_when_thresholds_lowered(self):
+        t = _make_trader()
+        t.use_skip_on_weak_signal = True
+        t.min_direction_signals = 1
+        # Lower the bars so a ~1% move counts.
+        t.signal_momentum_moderate = 0.005
+        t.signal_momentum_strong = 0.015
+        t.signal_short_trend = 0.01
+        t.signal_medium_trend = 0.015
+        _pin_direction_inputs(t, **self._MILD)
+        self.assertEqual(t.determine_option_strategy("AAPL"), "call")
+        self.assertGreaterEqual(t.last_signal_strength, 1)
 
 
 # --------------------------------------------------------------------------- #

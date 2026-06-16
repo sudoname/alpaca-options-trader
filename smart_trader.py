@@ -233,6 +233,20 @@ class SmartOptionsTrader:
         # the scheduler and Telegram so the operator sees *why* nothing traded.
         self.last_skip_reason = None
 
+        # Directional-signal trigger thresholds (env-tunable). Defaults equal the
+        # historical hardcoded values so behavior is unchanged unless overridden.
+        # These set how big a move must be to register a vote in
+        # determine_option_strategy; lowering them widens entry breadth on calm
+        # days (most large-caps sit in the +/-0.5-1.5% band that fired ZERO
+        # signals -> below_min_signals SKIP). The contract-level delta + EV gates
+        # provide the quality filter downstream.
+        #   momentum: |mom| > moderate -> +1 vote, > strong -> +2 votes
+        #   trend:    |3-day| > short_trend, |5-day| > medium_trend -> +1 each
+        self.signal_momentum_moderate = _f2('SIGNAL_MOMENTUM_MODERATE', 0.01)
+        self.signal_momentum_strong = _f2('SIGNAL_MOMENTUM_STRONG', 0.03)
+        self.signal_short_trend = _f2('SIGNAL_SHORT_TREND', 0.02)
+        self.signal_medium_trend = _f2('SIGNAL_MEDIUM_TREND', 0.03)
+
         # --- Phase 4: portfolio-level options risk controls ---------------- #
         # All OFF by default so default behavior is byte-for-byte unchanged.
         #  * USE_PORTFOLIO_GREEK_LIMITS: when on, an aggregate-exposure gate runs
@@ -1265,25 +1279,27 @@ class SmartOptionsTrader:
         bearish_signals = 0
         bullish_signals = 0
 
-        # Momentum analysis
-        if momentum < -0.03:  # Strong negative momentum
+        # Momentum analysis (thresholds env-tunable via SIGNAL_MOMENTUM_*)
+        mom_mod = self.signal_momentum_moderate
+        mom_strong = self.signal_momentum_strong
+        if momentum < -mom_strong:  # Strong negative momentum
             bearish_signals += 2
-        elif momentum < -0.01:  # Moderate negative momentum
+        elif momentum < -mom_mod:  # Moderate negative momentum
             bearish_signals += 1
-        elif momentum > 0.03:  # Strong positive momentum
+        elif momentum > mom_strong:  # Strong positive momentum
             bullish_signals += 2
-        elif momentum > 0.01:  # Moderate positive momentum
+        elif momentum > mom_mod:  # Moderate positive momentum
             bullish_signals += 1
 
-        # Trend analysis
-        if short_trend < -0.02:  # Short-term downtrend
+        # Trend analysis (thresholds env-tunable via SIGNAL_SHORT/MEDIUM_TREND)
+        if short_trend < -self.signal_short_trend:  # Short-term downtrend
             bearish_signals += 1
-        elif short_trend > 0.02:  # Short-term uptrend
+        elif short_trend > self.signal_short_trend:  # Short-term uptrend
             bullish_signals += 1
 
-        if medium_trend < -0.03:  # Medium-term downtrend
+        if medium_trend < -self.signal_medium_trend:  # Medium-term downtrend
             bearish_signals += 1
-        elif medium_trend > 0.03:  # Medium-term uptrend
+        elif medium_trend > self.signal_medium_trend:  # Medium-term uptrend
             bullish_signals += 1
 
         # Volatility consideration (high vol favors direction plays)
