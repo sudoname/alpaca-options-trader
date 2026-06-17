@@ -186,6 +186,18 @@ class EpisodeStore:
             )
         return self._rows("SELECT * FROM episodes WHERE outcome IS NULL ORDER BY as_of")
 
+    def open_skips(self) -> List[Dict]:
+        """Open SKIP decisions awaiting a counterfactual outcome.
+
+        Returns the columns the skip_counterfactual resolver needs:
+        decision_id, underlying, rule_action, features_json, created_at.
+        """
+        return self._rows(
+            "SELECT decision_id, underlying, rule_action, features_json, created_at "
+            "FROM episodes WHERE chosen_action='SKIP' AND outcome IS NULL "
+            "ORDER BY created_at"
+        )
+
     def completed(
         self, *, strat: Optional[str] = None, since: Optional[str] = None,
         until: Optional[str] = None,

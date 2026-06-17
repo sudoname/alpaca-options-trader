@@ -1011,6 +1011,88 @@ class TestPerUnderlyingCap(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# SKIP-counterfactual capture: a blocked entry is recorded as a SKIP episode
+# --------------------------------------------------------------------------- #
+class TestEnterCandidateSkipCapture(unittest.TestCase):
+    """When place_order_with_stops returns None (EV-gate/portfolio/risk/budget/
+    duplicate/broker reject), _enter_candidate must record a SKIP decision
+    carrying the underlying price -- and must never crash if no recorder."""
+
+    def _cand(self):
+        return {"sym": "SPY", "direction": "call",
+                "opt": {"symbol": "SPY260101C00500000", "ask": 1.0, "score": 42.0},
+                "score": 42.0, "underlying_price": 123.45}
+
+    def _fake_self(self, trader):
+        import types
+        from run_alpaca_intraday import IntradayScheduler
+
+        class _FakeSched:
+            pass
+        fs = _FakeSched()
+        fs.trader = trader
+        fs.entered_today = set()
+        fs.trades_today = 0
+        fs.cfg = types.SimpleNamespace(armed=True, qty=1)
+        fs._enter_candidate = IntradayScheduler._enter_candidate.__get__(fs)
+        return fs
+
+    def _blocking_trader(self, recorder):
+        class _BlockTrader:
+            def __init__(self):
+                self.ticker = None
+                self.last_block_reason = "risk engine: position cap"
+                self.shadow_recorder = recorder
+            def place_order_with_stops(self, opt, quantity=None):
+                return None  # always blocked
+        return _BlockTrader()
+
+    def test_capture_records_skip_with_underlying_price(self):
+        import run_alpaca_intraday
+        from unittest import mock
+
+        captured = {}
+
+        class _Rec:
+            def on_decision(self, **kw):
+                captured.update(kw)
+                return "did-1"
+
+        fs = self._fake_self(self._blocking_trader(_Rec()))
+        with mock.patch.object(run_alpaca_intraday, "log"):
+            fs._enter_candidate(self._cand())
+        self.assertEqual(captured.get("underlying"), "SPY")
+        self.assertEqual(captured.get("mode"), "live-paper-blocked")
+        analysis = captured.get("analysis") or {}
+        self.assertIs(analysis.get("should_trade"), False)
+        self.assertEqual(analysis.get("direction"), "call")
+        self.assertEqual(analysis.get("underlying_price"), 123.45)
+        self.assertEqual((captured.get("risk") or {}).get("block_reason"),
+                         "risk engine: position cap")
+
+    def test_no_recorder_does_not_crash(self):
+        import run_alpaca_intraday
+        from unittest import mock
+
+        fs = self._fake_self(self._blocking_trader(None))  # recorder absent
+        with mock.patch.object(run_alpaca_intraday, "log"):
+            fs._enter_candidate(self._cand())  # must not raise
+        self.assertEqual(fs.trades_today, 0)
+
+    def test_recorder_exception_is_swallowed(self):
+        import run_alpaca_intraday
+        from unittest import mock
+
+        class _BoomRec:
+            def on_decision(self, **kw):
+                raise RuntimeError("store down")
+
+        fs = self._fake_self(self._blocking_trader(_BoomRec()))
+        with mock.patch.object(run_alpaca_intraday, "log"):
+            fs._enter_candidate(self._cand())  # must not raise
+
+
+# --------------------------------------------------------------------------- #
 # Phase 3: Telegram honors SKIP (no trade message, no contract lookup)
 # --------------------------------------------------------------------------- #
 class TestPhase3TelegramSkip(unittest.TestCase):

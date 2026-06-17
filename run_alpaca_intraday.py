@@ -129,6 +129,10 @@ class Config:
         # enforces). Default 1 preserves the old one-per-underlying behavior
         # when the env is unset (keeps --selftest deterministic).
         self.max_per_underlying = int(get("MAX_POSITIONS_PER_UNDERLYING", "1"))
+        # SKIP-counterfactual horizon: how many wall-clock minutes after a
+        # declined setup is logged before its forward-underlying-return outcome
+        # is resolved. ~390 = one trading day, so skips resolve next session.
+        self.skip_cf_horizon_min = int(get("SKIP_CF_HORIZON_MIN", "390"))
         if armed_override is None:
             self.armed = _truthy(get("SCHEDULER_ARMED", "0"))
         else:
@@ -504,6 +508,25 @@ class IntradayScheduler:
         positions = self.trader.get_positions() or []
         return sum(1 for p in positions if underlying_of(p.get("symbol")) == sym)
 
+    def _resolve_skip_counterfactuals(self, now=None):
+        """Score any due SKIP episodes with their forward-underlying return.
+
+        No-op unless the shadow recorder's episode store is active. Runs inside
+        the scan (market open only), so a skip logged late in a session resolves
+        on the next session once its ~390-min horizon has elapsed."""
+        store = getattr(self.trader, "_episode_store", None)
+        if not store:
+            return
+        try:
+            from skip_counterfactual import resolve_due_skips
+            n = resolve_due_skips(
+                store, self.trader.get_current_price,
+                horizon_min=self.cfg.skip_cf_horizon_min, now=now)
+            if n:
+                log(f"[SKIP-CF] resolved {n} counterfactual skips")
+        except Exception as e:
+            log(f"[WARN] skip-counterfactual resolve failed: {e}")
+
     # -- entries ------------------------------------------------------------- #
     def _evaluate(self, sym):
         """Score a symbol's best contract WITHOUT entering. Returns a candidate
@@ -565,7 +588,8 @@ class IntradayScheduler:
                 log(f"[WARN] portfolio preview failed for {sym} (ignored): {e}")
 
         return {"sym": sym, "direction": direction, "opt": opt,
-                "score": float(opt.get("score") or 0)}
+                "score": float(opt.get("score") or 0),
+                "underlying_price": price}
 
     def _enter_candidate(self, cand):
         """Place (or, in dry-run, log) the entry for a pre-scored candidate."""
@@ -592,6 +616,29 @@ class IntradayScheduler:
         else:
             log(f"[ARMED] order NOT placed for {opt.get('symbol')} "
                 f"(blocked by risk/budget/duplicate or broker rejection)")
+            # Capture the declined setup as a SKIP episode (counterfactual class).
+            # Single capture point for every non-placement -- EV-gate, portfolio,
+            # risk engine, budget, duplicate, or broker rejection -- carrying the
+            # underlying price so the resolver can score the forward return later.
+            rec = getattr(self.trader, "shadow_recorder", None)
+            if rec:
+                try:
+                    rec.on_decision(
+                        symbol=opt.get("symbol"),
+                        underlying=sym,
+                        analysis={
+                            "should_trade": False,
+                            "direction": direction,
+                            "underlying_price": cand.get("underlying_price"),
+                            "confidence": cand.get("score"),
+                        },
+                        quote=None,
+                        mode="live-paper-blocked",
+                        risk={"block_reason": getattr(self.trader,
+                                                      "last_block_reason", None)},
+                    )
+                except Exception as e:
+                    log(f"[SKIP-CF] capture failed for {sym}: {e}")
 
     def _rank_and_enter(self):
         """Evaluate the whole universe, rank by score (desc), then enter in that
@@ -672,6 +719,12 @@ class IntradayScheduler:
         # 1b) fill-driven safety net: book + prune any tracked position that
         # has already left the broker (closed via any path) from its real fill.
         self.reconcile_closed_from_fills()
+
+        # 1d) resolve any SKIP episodes whose counterfactual horizon has elapsed
+        # (forward underlying return in the would-be direction). No-op unless the
+        # shadow recorder is active. Uses naive datetime.now() to match the naive
+        # created_at the episode store stamps at decision time (no tz drift).
+        self._resolve_skip_counterfactuals()
 
         # 1c) time stop (hold-overnight mode): positions held past
         # MAX_HOLD_DAYS calendar days are force-closed so nothing rots while
@@ -896,6 +949,33 @@ def _selftest():
           s_cnt._underlying_position_count("QQQ") == 1)
     check("count helper zero when unheld",
           s_cnt._underlying_position_count("AAPL") == 0)
+
+    # SKIP-counterfactual: config knob + resolver end-to-end (no network).
+    check("config skip_cf_horizon_min default 390",
+          Config(env={}).skip_cf_horizon_min == 390)
+    check("config skip_cf_horizon_min via env",
+          Config(env={"SKIP_CF_HORIZON_MIN": "120"}).skip_cf_horizon_min == 120)
+
+    from episode_store import EpisodeStore
+    from skip_counterfactual import resolve_due_skips
+    _store = EpisodeStore(":memory:")
+    _did = _store.log_decision(
+        symbol="SPY260101C00500000", underlying="SPY", strat="t",
+        features={"raw": {"underlying_price": 100.0}, "state_key": "k"},
+        quote=None, modeled_cost=None, rule_action="CALL", rule_confidence=0.0,
+        gate=None, chosen_action="SKIP", qty=1, mode="live-paper-blocked")
+    check("open_skips finds the logged skip",
+          len(_store.open_skips()) == 1 and _store.open_skips()[0]["decision_id"] == _did)
+    # horizon_min=0 -> immediately due; price 100->90 on a CALL skip = +10%.
+    _n = resolve_due_skips(_store, lambda s: 90.0, horizon_min=0)
+    _rows = _store._rows("SELECT * FROM episodes WHERE decision_id=?", (_did,))
+    check("resolve_due_skips resolves a due skip", _n == 1)
+    check("resolve_due_skips sets skip_resolved outcome",
+          _rows and _rows[0]["outcome"] == "skip_resolved")
+    check("resolve_due_skips computes +10% for CALL 100->90",
+          _rows and abs((_rows[0]["net_pnl_pct"] or 0) - 10.0) < 1e-9)
+    check("resolved skip no longer open", len(_store.open_skips()) == 0)
+    _store.close()
 
     if failures:
         print(f"\nSELFTEST FAILED ({len(failures)} failed)")

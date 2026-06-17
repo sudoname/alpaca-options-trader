@@ -1954,10 +1954,10 @@ class SmartOptionsTrader:
         risk_verdict = self._risk_check(total_cost, qty=order_quantity)
         if not risk_verdict.get('allowed', False):
             print(f"[RISK] BLOCKED: {risk_verdict.get('reason')}")
-            self._record_blocked_decision(
-                option, underlying_symbol, dynamic_levels,
-                current_option_price, order_quantity, risk_verdict,
-            )
+            # NOTE: SKIP-episode capture for blocked entries now happens once at
+            # the scheduler (run_alpaca_intraday._enter_candidate), which records
+            # the underlying + its price for the counterfactual resolver. The old
+            # trader-side _record_blocked_decision is retired to avoid double rows.
             self.last_block_reason = (
                 "risk engine: " + self._humanize_risk_breaches(risk_verdict)
             )

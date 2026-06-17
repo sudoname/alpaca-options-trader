@@ -63,6 +63,9 @@ class ShadowRecorder:
                 "intraday_position": analysis.get("intraday_position"),
                 "confidence": analysis.get("confidence"),
                 "momentum": analysis.get("momentum"),
+                # Underlying price at decision time: the entry reference the
+                # SKIP counterfactual resolver compares the forward price against.
+                "underlying_price": analysis.get("underlying_price"),
             },
             "discrete": disc,
             "state_key": skey,
