@@ -887,13 +887,15 @@ class TestPhase3NormalizedConfidence(unittest.TestCase):
 # Phase 3: scheduler honors SKIP (no contract lookup / no order)
 # --------------------------------------------------------------------------- #
 class TestPhase3SchedulerSkip(unittest.TestCase):
-    def _fake_self(self, trader):
+    def _fake_self(self, trader, held=0, cap=10):
+        import types
         class _FakeSched:
             pass
         fs = _FakeSched()
         fs.trader = trader
         fs.entered_today = set()
-        fs._has_live_position = lambda sym: False
+        fs.cfg = types.SimpleNamespace(max_per_underlying=cap)
+        fs._underlying_position_count = lambda sym: held
         return fs
 
     def _trader(self, direction, reason=None):
@@ -939,6 +941,73 @@ class TestPhase3SchedulerSkip(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result["direction"], "call")
         self.assertEqual(result["score"], 42.0)
+
+
+# --------------------------------------------------------------------------- #
+# Per-underlying capacity gate (replaces the old one-per-underlying boolean)
+# --------------------------------------------------------------------------- #
+class TestPerUnderlyingCap(unittest.TestCase):
+    """_evaluate must let a name accrue up to cfg.max_per_underlying positions,
+    skip once it reaches the cap, and reproduce the old one-per-underlying
+    behavior when cap == 1 (the default)."""
+
+    def _ok_trader(self):
+        class _OkTrader:
+            def __init__(self):
+                self.ticker = None
+                self.last_skip_reason = None
+            def get_current_price(self, sym):
+                return 100.0
+            def get_option_contracts(self, sym):
+                return [{"symbol": "X"}]
+            def determine_option_strategy(self, sym):
+                return "call"
+            def select_best_option(self, contracts, price, strategy=None):
+                return {"symbol": "AAPL260821C00150000", "ask": 1.0, "score": 42.0}
+        return _OkTrader()
+
+    def _fake_self(self, trader, held, cap):
+        import types
+        class _FakeSched:
+            pass
+        fs = _FakeSched()
+        fs.trader = trader
+        fs.entered_today = set()
+        fs.cfg = types.SimpleNamespace(max_per_underlying=cap)
+        fs._underlying_position_count = lambda sym: held
+        return fs
+
+    def test_below_cap_proceeds_to_selection(self):
+        from run_alpaca_intraday import IntradayScheduler
+        fs = self._fake_self(self._ok_trader(), held=3, cap=10)
+        result = IntradayScheduler._evaluate(fs, "SPY")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["score"], 42.0)
+
+    def test_at_cap_skips_and_logs(self):
+        import run_alpaca_intraday
+        from run_alpaca_intraday import IntradayScheduler
+        from unittest import mock
+        fs = self._fake_self(self._ok_trader(), held=10, cap=10)
+        with mock.patch.object(run_alpaca_intraday, "log") as mlog:
+            result = IntradayScheduler._evaluate(fs, "SPY")
+        self.assertIsNone(result)
+        logged = " ".join(str(c.args[0]) for c in mlog.call_args_list if c.args)
+        self.assertIn("at per-underlying cap", logged)
+        self.assertIn("10/10", logged)
+
+    def test_over_cap_skips(self):
+        from run_alpaca_intraday import IntradayScheduler
+        fs = self._fake_self(self._ok_trader(), held=11, cap=10)
+        self.assertIsNone(IntradayScheduler._evaluate(fs, "SPY"))
+
+    def test_cap_one_reproduces_one_per_underlying(self):
+        from run_alpaca_intraday import IntradayScheduler
+        # cap == 1: zero held -> proceeds; one held -> skips (legacy behavior).
+        fs0 = self._fake_self(self._ok_trader(), held=0, cap=1)
+        self.assertIsNotNone(IntradayScheduler._evaluate(fs0, "SPY"))
+        fs1 = self._fake_self(self._ok_trader(), held=1, cap=1)
+        self.assertIsNone(IntradayScheduler._evaluate(fs1, "SPY"))
 
 
 # --------------------------------------------------------------------------- #

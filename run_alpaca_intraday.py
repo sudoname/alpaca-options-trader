@@ -123,6 +123,12 @@ class Config:
         self.eod_close_enabled = _truthy(get("EOD_CLOSE_ENABLED", "1"))
         self.max_hold_days = float(get("MAX_HOLD_DAYS", "0"))
         self.max_new_trades_per_day = int(get("MAX_NEW_TRADES_PER_DAY", "4"))
+        # Per-underlying position cap. The scheduler used to allow exactly one
+        # open position per underlying; this lets a name accrue up to
+        # MAX_POSITIONS_PER_UNDERLYING positions (the same cap the risk engine
+        # enforces). Default 1 preserves the old one-per-underlying behavior
+        # when the env is unset (keeps --selftest deterministic).
+        self.max_per_underlying = int(get("MAX_POSITIONS_PER_UNDERLYING", "1"))
         if armed_override is None:
             self.armed = _truthy(get("SCHEDULER_ARMED", "0"))
         else:
@@ -493,9 +499,10 @@ class IntradayScheduler:
         except Exception as e:
             log(f"[WARN] reconcile_closed_from_fills failed: {e}")
 
-    def _has_live_position(self, sym):
+    def _underlying_position_count(self, sym):
+        """Number of open positions whose OCC root matches this underlying."""
         positions = self.trader.get_positions() or []
-        return any(underlying_of(p.get("symbol")) == sym for p in positions)
+        return sum(1 for p in positions if underlying_of(p.get("symbol")) == sym)
 
     # -- entries ------------------------------------------------------------- #
     def _evaluate(self, sym):
@@ -505,11 +512,17 @@ class IntradayScheduler:
         Selection is split from entry so the entry loop can rank candidates by
         score and let the daily cap fill with the strongest setups (not just
         whatever comes first in universe order)."""
-        if sym in self.entered_today:
-            return None
-        if self._has_live_position(sym):
-            log(f"[SKIP] {sym}: already holding a position")
-            self.entered_today.add(sym)
+        # Per-underlying capacity gate. A name may accrue up to
+        # cfg.max_per_underlying open positions (the contract-level
+        # _has_open_or_pending guard still blocks stacking the identical
+        # contract, so growth only happens on a different strike/expiry/side).
+        # entered_today is no longer a gate -- it stays populated on entry only
+        # for the heartbeat/status display -- so a below-cap name is re-evaluated
+        # across scans instead of being one-and-done for the day.
+        cap = getattr(self.cfg, "max_per_underlying", 1)
+        held = self._underlying_position_count(sym)
+        if cap and held >= cap:
+            log(f"[SKIP] {sym}: at per-underlying cap ({held}/{cap})")
             return None
 
         self.trader.ticker = sym  # keep direction/underlying defaults correct
@@ -865,6 +878,24 @@ def _selftest():
     s_cap.symbols = []
     s_cap._refresh_universe()
     check("universe respects max_symbols cap", s_cap.symbols == ["SPY", "QQQ"])
+
+    # per-underlying cap: config default + count helper
+    check("config max_per_underlying default 1", Config(env={}).max_per_underlying == 1)
+    check("config max_per_underlying via env",
+          Config(env={"MAX_POSITIONS_PER_UNDERLYING": "10"}).max_per_underlying == 10)
+
+    class _CountTrader:
+        def get_positions(self):
+            return [{"symbol": "SPY240705C00540000"},
+                    {"symbol": "SPY260101P00400000"},
+                    {"symbol": "QQQ260101P00400000"}]
+    s_cnt = IntradayScheduler(Config(env={}), trader=_CountTrader(), pdt=None)
+    check("count helper tallies multiple per underlying",
+          s_cnt._underlying_position_count("SPY") == 2)
+    check("count helper isolates other underlyings",
+          s_cnt._underlying_position_count("QQQ") == 1)
+    check("count helper zero when unheld",
+          s_cnt._underlying_position_count("AAPL") == 0)
 
     if failures:
         print(f"\nSELFTEST FAILED ({len(failures)} failed)")
