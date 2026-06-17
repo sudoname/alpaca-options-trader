@@ -3,17 +3,17 @@ SKIP counterfactual resolver.
 
 A SKIP decision (the bot declined a setup: EV-gate / portfolio / risk / budget /
 duplicate) has no fill, so it cannot have a realized P/L. To give the abstention
-class a learnable label we attach a *counterfactual* outcome: a signed "skip
-quality" score derived from the forward UNDERLYING move, where POSITIVE means
-skipping was the right call (we avoided an adverse move) and negative means we
-missed a winner.
+class a learnable label we attach a *counterfactual* outcome: the signed forward
+return the WOULD-BE position would have earned, i.e. the forward underlying move
+in the direction we declined.
 
-    CALL skip -> (entry - now) / entry * 100     (good/positive if price fell)
-    PUT  skip -> (now - entry) / entry * 100     (good/positive if price rose)
+    CALL skip -> (now - entry) / entry * 100     (the foregone call's return)
+    PUT  skip -> (entry - now) / entry * 100     (the foregone put's return)
 
-This sign convention keeps every action on one scale for the RL/ML loop: higher
-is better for CALL, PUT, *and* SKIP alike, so a SKIP earns positive reward in
-exactly the states where trading would have lost money.
+Read as "what we left on the table": positive means the trade we skipped would
+have gained, negative means skipping avoided a loss. Downstream consumers that
+want a "skip was correct" reward simply negate it; the stored value is the raw
+counterfactual P/L of the foregone trade.
 
 The episode row already carries the would-be direction (`rule_action`) and the
 underlying price at decision time (`features.raw.underlying_price`, stamped by
@@ -32,12 +32,12 @@ from typing import Callable, Dict, List, Optional
 
 
 def counterfactual_return(direction, entry_px, now_px) -> Optional[float]:
-    """Signed "skip quality" (%) from the forward underlying move.
+    """Signed forward return (%) of the WOULD-BE position (the foregone trade).
 
-    Positive => skipping was correct (we avoided an adverse move); negative =>
-    we missed a winner. CALL skip is good when the price fell; PUT skip is good
-    when it rose. Returns None on missing/non-positive entry, missing now price,
-    or an unrecognised direction.
+    CALL: (now - entry) / entry * 100; PUT: (entry - now) / entry * 100. Positive
+    means the skipped trade would have gained, negative means skipping avoided a
+    loss. Returns None on missing/non-positive entry, missing now price, or an
+    unrecognised direction.
     """
     try:
         entry = float(entry_px)
@@ -48,9 +48,9 @@ def counterfactual_return(direction, entry_px, now_px) -> Optional[float]:
         return None
     d = str(direction or "").upper()
     if d == "CALL":
-        return (entry - now) / entry * 100.0
-    if d == "PUT":
         return (now - entry) / entry * 100.0
+    if d == "PUT":
+        return (entry - now) / entry * 100.0
     return None
 
 
@@ -150,15 +150,15 @@ def _self_test() -> int:
 
     ok = True
 
-    # --- pure math (positive == skipping was correct) --------------------- #
-    if not (counterfactual_return("CALL", 100.0, 95.0) > 0):
-        print("FAIL: CALL skip with price falling should be good (positive)"); ok = False
-    if not (counterfactual_return("CALL", 100.0, 105.0) < 0):
-        print("FAIL: CALL skip with price rising should be bad (negative)"); ok = False
-    if not (counterfactual_return("PUT", 100.0, 105.0) > 0):
-        print("FAIL: PUT skip with price rising should be good (positive)"); ok = False
-    if not (counterfactual_return("PUT", 100.0, 95.0) < 0):
-        print("FAIL: PUT skip with price falling should be bad (negative)"); ok = False
+    # --- pure math (would-be position return) ----------------------------- #
+    if not (counterfactual_return("CALL", 100.0, 105.0) > 0):
+        print("FAIL: CALL would-be return should be positive when price rises"); ok = False
+    if not (counterfactual_return("CALL", 100.0, 95.0) < 0):
+        print("FAIL: CALL would-be return should be negative when price falls"); ok = False
+    if not (counterfactual_return("PUT", 100.0, 95.0) > 0):
+        print("FAIL: PUT would-be return should be positive when price falls"); ok = False
+    if not (counterfactual_return("PUT", 100.0, 105.0) < 0):
+        print("FAIL: PUT would-be return should be negative when price rises"); ok = False
     for bad in (
         counterfactual_return("CALL", None, 105.0),
         counterfactual_return("CALL", 0.0, 105.0),
@@ -174,7 +174,7 @@ def _self_test() -> int:
     def feats(px):
         return {"feature_version": "t", "raw": {"underlying_price": px}, "state_key": "k"}
 
-    # An old CALL skip on SPY (entry 100); price now 90 -> skip was good (+10%).
+    # An old CALL skip on SPY (entry 100); price now 90 -> foregone call -10%.
     old_skip = store.log_decision(
         symbol="SPY", underlying="SPY", strat="t", features=feats(100.0),
         quote=None, modeled_cost=None, rule_action="CALL", rule_confidence=0.0,
@@ -209,8 +209,8 @@ def _self_test() -> int:
     rows = {r["decision_id"]: r for r in store._rows("SELECT * FROM episodes")}
     if rows[old_skip]["outcome"] != "skip_resolved":
         print("FAIL: old skip should be resolved"); ok = False
-    if abs((rows[old_skip]["net_pnl_pct"] or 0) - 10.0) > 1e-9:
-        print("FAIL: CALL skip with price 100->90 should be +10%",
+    if abs((rows[old_skip]["net_pnl_pct"] or 0) - (-10.0)) > 1e-9:
+        print("FAIL: CALL would-be return for price 100->90 should be -10%",
               rows[old_skip]["net_pnl_pct"]); ok = False
     if rows[fresh_skip]["outcome"] is not None:
         print("FAIL: fresh skip should stay open"); ok = False

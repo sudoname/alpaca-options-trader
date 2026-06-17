@@ -13,27 +13,27 @@ from skip_counterfactual import counterfactual_return, resolve_due_skips
 
 
 class TestCounterfactualReturn(unittest.TestCase):
-    """Positive == skipping was correct (avoided an adverse move)."""
+    """Value == the would-be position's forward return (the foregone trade)."""
 
     def test_call_sign(self):
-        # CALL skip is good when the price falls, bad when it rises.
-        self.assertGreater(counterfactual_return("CALL", 100.0, 95.0), 0)
-        self.assertLess(counterfactual_return("CALL", 100.0, 105.0), 0)
+        # The foregone CALL would gain when price rises, lose when it falls.
+        self.assertGreater(counterfactual_return("CALL", 100.0, 105.0), 0)
+        self.assertLess(counterfactual_return("CALL", 100.0, 95.0), 0)
 
     def test_put_inverted(self):
-        # PUT skip is good when the price rises, bad when it falls.
-        self.assertGreater(counterfactual_return("PUT", 100.0, 105.0), 0)
-        self.assertLess(counterfactual_return("PUT", 100.0, 95.0), 0)
+        # The foregone PUT would gain when price falls, lose when it rises.
+        self.assertGreater(counterfactual_return("PUT", 100.0, 95.0), 0)
+        self.assertLess(counterfactual_return("PUT", 100.0, 105.0), 0)
 
     def test_magnitude(self):
-        # CALL skip, price 100->90 (fell): good skip => +10%.
-        self.assertAlmostEqual(counterfactual_return("CALL", 100.0, 90.0), 10.0)
-        # PUT skip, price 100->90 (fell): missed a winner => -10%.
-        self.assertAlmostEqual(counterfactual_return("PUT", 100.0, 90.0), -10.0)
+        # CALL, price 100->90 (fell): foregone call would have lost => -10%.
+        self.assertAlmostEqual(counterfactual_return("CALL", 100.0, 90.0), -10.0)
+        # PUT, price 100->90 (fell): foregone put would have gained => +10%.
+        self.assertAlmostEqual(counterfactual_return("PUT", 100.0, 90.0), 10.0)
 
     def test_case_insensitive(self):
-        # CALL skip, price 100->110 (rose): missed a winner => -10%.
-        self.assertAlmostEqual(counterfactual_return("call", 100.0, 110.0), -10.0)
+        # CALL, price 100->110 (rose): foregone call would have gained => +10%.
+        self.assertAlmostEqual(counterfactual_return("call", 100.0, 110.0), 10.0)
 
     def test_bad_input_returns_none(self):
         self.assertIsNone(counterfactual_return("CALL", None, 105.0))
@@ -77,8 +77,9 @@ class TestResolveDueSkips(unittest.TestCase):
         self.assertEqual(n, 1)
         row = self._row(did)
         self.assertEqual(row["outcome"], "skip_resolved")
-        self.assertAlmostEqual(row["net_pnl_pct"], 10.0)   # CALL 100->90 = +10%
-        self.assertAlmostEqual(row["gross_pnl_pct"], 10.0)
+        # Foregone CALL, price 100->90: would have lost => -10%.
+        self.assertAlmostEqual(row["net_pnl_pct"], -10.0)
+        self.assertAlmostEqual(row["gross_pnl_pct"], -10.0)
         self.assertEqual(row["exit_price"], 90.0)
 
     def test_too_recent_skip_left_open(self):
@@ -131,8 +132,8 @@ class TestResolveDueSkips(unittest.TestCase):
         n = resolve_due_skips(self.store, lambda s: prices.get(s), horizon_min=390)
         self.assertEqual(n, 1)
         self.assertEqual(self._row(due)["outcome"], "skip_resolved")
-        # CALL skip, 100->90 (price fell): skipping was correct => +10%.
-        self.assertAlmostEqual(self._row(due)["net_pnl_pct"], 10.0)
+        # Foregone CALL, 100->90 (price fell): would have lost => -10%.
+        self.assertAlmostEqual(self._row(due)["net_pnl_pct"], -10.0)
         self.assertIsNone(self._row(fresh)["outcome"])
 
     def test_open_skips_helper(self):

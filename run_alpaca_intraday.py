@@ -966,14 +966,14 @@ def _selftest():
         gate=None, chosen_action="SKIP", qty=1, mode="live-paper-blocked")
     check("open_skips finds the logged skip",
           len(_store.open_skips()) == 1 and _store.open_skips()[0]["decision_id"] == _did)
-    # horizon_min=0 -> immediately due; price 100->90 on a CALL skip = +10%.
+    # horizon_min=0 -> immediately due; foregone CALL return for 100->90 = -10%.
     _n = resolve_due_skips(_store, lambda s: 90.0, horizon_min=0)
     _rows = _store._rows("SELECT * FROM episodes WHERE decision_id=?", (_did,))
     check("resolve_due_skips resolves a due skip", _n == 1)
     check("resolve_due_skips sets skip_resolved outcome",
           _rows and _rows[0]["outcome"] == "skip_resolved")
-    check("resolve_due_skips computes +10% for CALL 100->90",
-          _rows and abs((_rows[0]["net_pnl_pct"] or 0) - 10.0) < 1e-9)
+    check("resolve_due_skips computes -10% for CALL 100->90",
+          _rows and abs((_rows[0]["net_pnl_pct"] or 0) - (-10.0)) < 1e-9)
     check("resolved skip no longer open", len(_store.open_skips()) == 0)
     _store.close()
 
