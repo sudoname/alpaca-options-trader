@@ -320,6 +320,15 @@ class TelegramTradingBot:
         elif text == 'EV_CALIBRATION' or text == '/EV_CALIBRATION':
             return self.ev_calibration(chat_id)
 
+        elif text == 'TRIPLE_GAP_REPORT' or text == '/TRIPLE_GAP_REPORT':
+            return self.triple_gap_report(chat_id)
+
+        elif text == 'SIGNAL_SEPARATION' or text == '/SIGNAL_SEPARATION':
+            return self.signal_separation(chat_id)
+
+        elif text == 'CANDLESTICK_REPORT' or text == '/CANDLESTICK_REPORT':
+            return self.candlestick_report(chat_id)
+
         elif text.startswith('ADVISORY_CHECK') or text.startswith('/ADVISORY_CHECK'):
             parts = text.replace('/ADVISORY_CHECK', '').replace('ADVISORY_CHECK', '', 1).split()
             symbol = parts[0].strip().upper() if parts else ''
@@ -1534,6 +1543,28 @@ Total symbols: `{len(self.supported_tickers)}`"""
         else:
             be_str = f"{be:.2f}"
         kind = "credit" if proposal.is_credit else "debit"
+
+        # Phase 11A: fail-open analytics stamp of this evaluated candidate into
+        # the append-only ledger. Cannot affect the proposal or any trade path.
+        try:
+            import candidate_resolution as _cr
+            _strikes = sorted(l.strike for l in proposal.legs
+                              if getattr(l, "strike", None) is not None)
+            _expiry = next((l.expiration for l in proposal.legs
+                            if getattr(l, "expiration", None)), None)
+            _cr.stamp_candidates([{
+                "symbol": symbol,
+                "strategy": proposal.strategy_name,
+                "strikes": _strikes or None,
+                "expiry": _expiry,
+                "oracle_score": proposal.oracle_score,
+                "probability_of_profit": proposal.estimated_probability,
+                "max_profit": proposal.max_profit,
+                "max_loss": proposal.max_loss,
+            }], source_command="SPREAD_PROPOSAL")
+        except Exception:
+            pass
+
         return (
             f"🧪 *Spread Proposal — {symbol}*\n"
             f"Strategy: `{proposal.strategy_name}`\n"
@@ -1859,6 +1890,42 @@ Total symbols: `{len(self.supported_tickers)}`"""
             return generate_ev_calibration_text()
         except Exception as e:
             return f"❌ Could not build EV calibration: {e}"
+
+    def triple_gap_report(self, chat_id=None):
+        """Phase 11A: does model-vs-market disagreement (the Triple Gap)
+        predict profit? Buckets EVERY stamped candidate by Triple-Gap score —
+        selected AND rejected — and reports win rate, profit factor and the
+        bucket separation over resolved candidates. ANALYTICS ONLY.
+        """
+        try:
+            from calibration_reports import generate_triple_gap_report_text
+            return generate_triple_gap_report_text()
+        except Exception as e:
+            return f"❌ Could not build Triple Gap report: {e}"
+
+    def signal_separation(self, chat_id=None):
+        """Phase 11A: which entry signal best separates winners from losers?
+        Profit-factor separation across Triple Gap, EV, EV/Risk, Oracle Score,
+        Volatility Edge and Advisory Recommendation over resolved candidates.
+        ANALYTICS ONLY.
+        """
+        try:
+            from calibration_reports import generate_signal_separation_text
+            return generate_signal_separation_text()
+        except Exception as e:
+            return f"❌ Could not build signal separation: {e}"
+
+    def candlestick_report(self, chat_id=None):
+        """Phase 11B: per-candlestick-pattern calibration — occurrences, win
+        rate, profit factor and EV impact over resolved candidates, with
+        low-sample warnings. Patterns are market-behaviour features only; they
+        never trigger, block or alter any trade. ANALYTICS ONLY.
+        """
+        try:
+            from candlestick_calibration import generate_candlestick_report_text
+            return generate_candlestick_report_text()
+        except Exception as e:
+            return f"❌ Could not build candlestick report: {e}"
 
     def vol_edge(self, symbol, vix_arg=None, chat_id=None):
         """Phase 7A/8A: ADVISORY volatility edge + shadow recommendation.
@@ -2216,6 +2283,38 @@ Total symbols: `{len(self.supported_tickers)}`"""
                         trader, sym, config=ev_engine.EVConfig.from_env())
             except Exception as ev_err:
                 print(f"[ADVISORY_CHECK] EV unavailable (ignored): {ev_err}")
+            # Phase 11A: fail-open analytics stamp of this evaluated candidate
+            # into the append-only ledger. Cannot affect the advisory output
+            # below or any trade path.
+            try:
+                import candidate_resolution as _cr
+                from advisory_gate import advisory_check_for_symbol
+                _sym = str(symbol or "").strip().upper()
+                if _sym:
+                    _feat, _res = advisory_check_for_symbol(
+                        _sym, ev_result=ev_result)
+                    _ev = (ev_result.to_dict()
+                           if hasattr(ev_result, "to_dict")
+                           else (ev_result or {}))
+                    _cr.stamp_candidates([{
+                        "symbol": _sym,
+                        "strategy": (_feat.get("strategy")
+                                     or _ev.get("strategy")),
+                        "oracle_score": _feat.get("oracle_score"),
+                        "volatility_edge": _feat.get("volatility_edge"),
+                        "dte": _feat.get("dte"),
+                        "expected_value": _ev.get("expected_value"),
+                        "probability_of_profit":
+                            _ev.get("probability_of_profit"),
+                        "ev_per_dollar_risk": _ev.get("ev_per_dollar_risk"),
+                        "ev_recommendation": _ev.get("recommendation"),
+                        "max_profit": _ev.get("max_profit"),
+                        "max_loss": _ev.get("max_loss"),
+                        "advisory_recommendation": _res.get("recommendation"),
+                        "advisory_confidence": _res.get("confidence"),
+                    }], source_command="ADVISORY_CHECK")
+            except Exception:
+                pass
             return generate_advisory_check_text(symbol, ev_result=ev_result)
         except Exception as e:
             return f"❌ Could not run the advisory check: {e}"
@@ -2428,6 +2527,9 @@ Total symbols: `{len(self.supported_tickers)}`"""
 • `VOL_FORECAST_SCORECARD` - Does forecast vol beat market IV vs realized? (analytics)
 • `POP_CALIBRATION` - Predicted PoP vs actual win rate per bucket (analytics)
 • `EV_CALIBRATION` - Predicted EV vs realized PnL: regression + buckets (analytics)
+• `TRIPLE_GAP_REPORT` - Does model-vs-market disagreement predict profit? Per-bucket WR/PF over all candidates (analytics)
+• `SIGNAL_SEPARATION` - Which entry signal best separates winners from losers? PF separation per signal (analytics)
+• `CANDLESTICK_REPORT` - Per-candlestick-pattern win rate / profit factor / EV impact over resolved candidates (analytics)
 • `VOL_EDGE TICKER [VIX]` - Volatility edge + shadow rec (advisory)
 • `ORACLE_DATASET_STATS` - Training dataset summary (advisory)
 • `ORACLE_STATS` - Oracle performance summary (analytics)

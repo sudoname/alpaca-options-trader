@@ -54,15 +54,28 @@ TOP_VOL_EDGE = 5
 # --------------------------------------------------------------------------- #
 # Report assembly
 # --------------------------------------------------------------------------- #
+def _candlestick_summary() -> dict:
+    """Fail-open candlestick daily summary (analytics only). ``{}`` on any
+    failure so the daily report never breaks when the feature is unused."""
+    try:
+        import candlestick_calibration as cc
+        return cc.compute_daily_candlestick_summary() or {}
+    except Exception:
+        return {}
+
+
 def build_daily_report(config: Optional[AnalyticsConfig] = None,
                        now: Optional[datetime] = None,
                        trades: Optional[List[dict]] = None,
                        positions: Optional[List[dict]] = None,
                        em_rows: Optional[List[dict]] = None,
-                       dataset_rows: Optional[List[dict]] = None) -> dict:
+                       dataset_rows: Optional[List[dict]] = None,
+                       candlestick: Optional[dict] = None) -> dict:
     """Assemble the daily report dict from the analytics + threshold layers.
 
-    Pure read-only aggregation; never raises on missing/empty data.
+    Pure read-only aggregation; never raises on missing/empty data. The
+    ``candlestick`` summary may be injected (tests) or is derived fail-open
+    from the candlestick calibration layer.
     """
     config = config or AnalyticsConfig.from_env()
     now = now or datetime.now()
@@ -104,6 +117,8 @@ def build_daily_report(config: Optional[AnalyticsConfig] = None,
         "worst_strategy": strat["worst_strategy"],
         "confidence": recs["confidence"],
         "n_trades": recs["n_trades"],
+        "candlestick": (candlestick if candlestick is not None
+                        else _candlestick_summary()),
     }
 
 
@@ -210,6 +225,27 @@ def format_daily_report(report: dict) -> str:
     lines.append(f"*Data Confidence:* `{report.get('confidence', 'Low')}` "
                  f"({report.get('n_trades', 0)} trades)")
     lines.append("")
+
+    # 8) Candlestick patterns (analytics only — never alters any decision).
+    cs = report.get("candlestick") or {}
+    tops = cs.get("top_patterns") or []
+    if tops:
+        lines.append("*Candlestick Patterns (analytics):*")
+        for p in tops:
+            wr = p.get("win_rate")
+            wr_s = f"{wr * 100:.0f}%" if isinstance(wr, (int, float)) else "n/a"
+            flag = " ⚠️ low sample" if p.get("low_sample") else ""
+            lines.append(
+                f"  • `{p.get('pattern_name', '?')}`: "
+                f"{p.get('occurrences', 0)} seen · win `{wr_s}` · "
+                f"{p.get('ev_impact', 'Neutral')}{flag}")
+        improved = cs.get("improved_ev")
+        verdict = ("improved EV" if improved
+                   else "no clear EV gain" if improved is False
+                   else "insufficient data")
+        lines.append(f"  Did patterns help? `{verdict}` "
+                     f"({cs.get('sample_size', 0)} resolved)")
+        lines.append("")
 
     lines.append(f"_({ANALYTICS_FOOTER})_")
     return "\n".join(lines)

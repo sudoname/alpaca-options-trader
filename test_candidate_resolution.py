@@ -13,8 +13,17 @@ No creds, no network, no broker. Covers:
   - summarize counts
   - fail-open hooks present in the ranker and paper runner
   - no execution path touched (static guards)
+
+Phase 11A additions:
+  - stamp_candidate / stamp_candidates append + Triple-Gap stamping
+  - load_jsonl_records folds last-write-wins, tolerates missing/malformed/partial
+  - resolve_jsonl_candidates statuses (expiry / partial / missing / unresolved)
+    over BOTH selected and rejected candidates; actual_move + hold-to-expiry sign
+  - record_candidates also stamps the JSONL layer (fail-open)
+  - SPREAD_PROPOSAL / ADVISORY_CHECK stamp hooks + the two analytics commands
 """
 
+import json
 import os
 import tempfile
 import unittest
@@ -56,8 +65,17 @@ class StoreCase(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.cfg = CandidateResolutionConfig(
             enabled=True, file=os.path.join(self.tmp.name, "cand.json"))
+        # Isolate the additive JSONL layer (record_candidates stamps it via the
+        # env-resolved default path) so tests never pollute the repo.
+        self.jsonl = os.path.join(self.tmp.name, "cand.jsonl")
+        self._prev_jsonl_env = os.environ.get("CANDIDATE_RESOLUTION_JSONL")
+        os.environ["CANDIDATE_RESOLUTION_JSONL"] = self.jsonl
 
     def tearDown(self):
+        if self._prev_jsonl_env is None:
+            os.environ.pop("CANDIDATE_RESOLUTION_JSONL", None)
+        else:
+            os.environ["CANDIDATE_RESOLUTION_JSONL"] = self._prev_jsonl_env
         self.tmp.cleanup()
 
     def rows(self):
@@ -306,6 +324,264 @@ class TestOutcomeAndSummary(StoreCase):
 
 
 # --------------------------------------------------------------------------- #
+# Phase 11A — append-only JSONL stamp layer
+# --------------------------------------------------------------------------- #
+def gap_fields(symbol="SPY", strategy=BULLISH_PUT_CREDIT_SPREAD, **kw):
+    """Candidate fields carrying the Triple-Gap signal inputs."""
+    f = {"symbol": symbol, "strategy": strategy,
+         "market_iv": 0.25, "forecast_vol": 0.20,
+         "market_expected_move": 12.0, "oracle_expected_move": 10.0,
+         "expected_value": 25.0, "probability_of_profit": 0.7,
+         "oracle_score": 6.5, "volatility_edge": 0.12,
+         "ev_per_dollar_risk": 0.06, "max_profit": 60.0, "max_loss": 440.0,
+         "strikes": [95.0, 100.0], "expiry": "2026-06-05", "days": 4,
+         "underlying_price_at_entry": 100.0, "recommendation": "TRADE"}
+    f.update(kw)
+    return f
+
+
+class TestJsonlStamp(StoreCase):
+    def lines(self):
+        with open(self.jsonl, "r", encoding="utf-8") as fh:
+            return [json.loads(ln) for ln in fh if ln.strip()]
+
+    def test_stamp_candidate_appends_with_triple_gap(self):
+        cid = cr.stamp_candidate(gap_fields(), jsonl_path=self.jsonl, now=NOW)
+        self.assertTrue(cid)
+        lines = self.lines()
+        self.assertEqual(len(lines), 1)
+        rec = lines[0]
+        self.assertEqual(rec["record_type"], cr.RECORD_TYPE_CANDIDATE)
+        self.assertEqual(rec["candidate_id"], cid)
+        self.assertEqual(rec["symbol"], "SPY")
+        # vol 50, move 20, ev 50 -> (.3*50+.3*20+.4*50)/1.0 = 41.0
+        self.assertAlmostEqual(rec["vol_gap"], 0.05)
+        self.assertAlmostEqual(rec["move_gap"], 2.0)
+        self.assertAlmostEqual(rec["ev_gap"], 25.0)
+        self.assertEqual(rec["triple_gap_score"], 41.0)
+        self.assertEqual(rec["ev_gap_source"], "zero_baseline")
+
+    def test_stamp_candidate_requires_symbol_and_strategy(self):
+        self.assertIsNone(cr.stamp_candidate({"symbol": "SPY"},
+                                             jsonl_path=self.jsonl))
+        self.assertIsNone(cr.stamp_candidate(
+            {"strategy": BULLISH_PUT_CREDIT_SPREAD}, jsonl_path=self.jsonl))
+        self.assertFalse(os.path.exists(self.jsonl))
+
+    def test_model_baseline_tag_when_market_neutral_present(self):
+        cr.stamp_candidate(gap_fields(market_neutral_expected_value=5.0),
+                           jsonl_path=self.jsonl, now=NOW)
+        rec = self.lines()[0]
+        self.assertEqual(rec["ev_gap"], 20.0)
+        self.assertEqual(rec["ev_gap_source"], "model_baseline")
+
+    def test_stamp_candidates_maps_and_flags_selected(self):
+        key = cr.candidate_key("SPY", BULLISH_PUT_CREDIT_SPREAD, DAY)
+        n = cr.stamp_candidates(
+            [_Result(symbol="SPY"), _Result(symbol="QQQ")],
+            source_command="BEST_EV_TRADES", selected_keys=[key],
+            jsonl_path=self.jsonl, now=NOW)
+        self.assertEqual(n, 2)
+        recs = {r["symbol"]: r for r in self.lines()}
+        self.assertTrue(recs["SPY"]["selected_for_paper_trade"])
+        self.assertFalse(recs["QQQ"]["selected_for_paper_trade"])
+        self.assertEqual(recs["SPY"]["source_command"], "BEST_EV_TRADES")
+
+    def test_stamp_candidates_merges_extras(self):
+        key = cr.candidate_key("SPY", BULLISH_PUT_CREDIT_SPREAD, DAY)
+        cr.stamp_candidates(
+            [_Result(symbol="SPY")], source_command="BEST_EV_PAPER_RUN",
+            extras={key: {"strikes": [95.0, 100.0],
+                          "underlying_price_at_entry": 101.0}},
+            jsonl_path=self.jsonl, now=NOW)
+        rec = self.lines()[0]
+        self.assertEqual(rec["strikes"], [95.0, 100.0])
+        self.assertEqual(rec["underlying_price_at_entry"], 101.0)
+
+    def test_record_candidates_also_stamps_jsonl_fail_open(self):
+        cr.record_candidates([cand("SPY"), cand("QQQ")],
+                             source="best_ev_ranker", config=self.cfg, now=NOW)
+        recs = cr.load_jsonl_records(self.jsonl)
+        self.assertEqual({r["symbol"] for r in recs}, {"SPY", "QQQ"})
+
+
+class TestJsonlLoad(StoreCase):
+    def test_missing_file_returns_empty(self):
+        self.assertEqual(cr.load_jsonl_records(self.jsonl), [])
+
+    def test_malformed_and_partial_lines_tolerated(self):
+        with open(self.jsonl, "w", encoding="utf-8") as fh:
+            fh.write("not json\n")
+            fh.write("[1,2,3]\n")                     # not a dict
+            fh.write(json.dumps({"no": "id"}) + "\n")  # no candidate_id
+            fh.write("\n")
+            fh.write(json.dumps({"candidate_id": "abc",
+                                 "symbol": "SPY"}) + "\n")
+        recs = cr.load_jsonl_records(self.jsonl)
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["candidate_id"], "abc")
+
+    def test_fold_last_write_wins_non_null(self):
+        cid = cr.stamp_candidate(gap_fields(), jsonl_path=self.jsonl, now=NOW)
+        # A later snapshot overrides with non-null, keeps frozen stamp fields.
+        cr._append_jsonl({"candidate_id": cid,
+                          "record_type": cr.RECORD_TYPE_RESOLUTION,
+                          "underlying_price_at_resolution": 105.0,
+                          "triple_gap_score": None}, self.jsonl)
+        recs = cr.load_jsonl_records(self.jsonl)
+        self.assertEqual(len(recs), 1)
+        rec = recs[0]
+        self.assertEqual(rec["record_type"], cr.RECORD_TYPE_RESOLUTION)
+        self.assertEqual(rec["underlying_price_at_resolution"], 105.0)
+        self.assertEqual(rec["triple_gap_score"], 41.0)  # null did not clobber
+
+
+class TestJsonlResolve(StoreCase):
+    def seed_two(self):
+        """One selected (SPY) and one rejected (QQQ) candidate."""
+        sid = cr.stamp_candidate(gap_fields("SPY",
+                                            selected_for_paper_trade=True),
+                                 jsonl_path=self.jsonl, now=NOW)
+        qid = cr.stamp_candidate(gap_fields("QQQ"),
+                                 jsonl_path=self.jsonl, now=NOW)
+        return sid, qid
+
+    def folded(self):
+        return {r["candidate_id"]: r
+                for r in cr.load_jsonl_records(self.jsonl)}
+
+    def test_resolved_expiry_tracks_selected_and_rejected(self):
+        sid, qid = self.seed_two()
+        n = cr.resolve_jsonl_candidates(lambda s: 105.0,
+                                        today=date(2026, 6, 5),
+                                        jsonl_path=self.jsonl, now=NOW)
+        self.assertEqual(n, 2)
+        f = self.folded()
+        for cid in (sid, qid):
+            self.assertEqual(f[cid]["resolution_status"],
+                             cr.RESOLUTION_EXPIRY)
+            self.assertEqual(f[cid]["underlying_price_at_resolution"], 105.0)
+            self.assertAlmostEqual(f[cid]["actual_move"], 0.05)
+            self.assertEqual(f[cid]["hypothetical_hold_to_expiry_pnl"], 60.0)
+        self.assertTrue(f[sid]["selected_for_paper_trade"])
+        self.assertFalse(f[qid]["selected_for_paper_trade"])
+
+    def test_partial_when_price_but_not_due(self):
+        sid, _ = self.seed_two()
+        n = cr.resolve_jsonl_candidates(lambda s: 90.0,
+                                        today=date(2026, 6, 3),
+                                        jsonl_path=self.jsonl, now=NOW)
+        self.assertEqual(n, 2)
+        f = self.folded()
+        self.assertEqual(f[sid]["resolution_status"], cr.RESOLUTION_PARTIAL)
+        # 90 below short strike 100 -> full loss for the bull put credit.
+        self.assertEqual(f[sid]["hypothetical_hold_to_expiry_pnl"], -440.0)
+        self.assertAlmostEqual(f[sid]["actual_move"], -0.10)
+
+    def test_missing_price_when_due(self):
+        sid, _ = self.seed_two()
+        n = cr.resolve_jsonl_candidates(lambda s: None,
+                                        today=date(2026, 6, 5),
+                                        jsonl_path=self.jsonl, now=NOW)
+        self.assertEqual(n, 0)
+        f = self.folded()
+        self.assertEqual(f[sid]["resolution_status"],
+                         cr.RESOLUTION_MISSING_PRICE)
+
+    def test_unresolved_leaves_no_line(self):
+        sid, _ = self.seed_two()
+        n = cr.resolve_jsonl_candidates(lambda s: None,
+                                        today=date(2026, 6, 3),
+                                        jsonl_path=self.jsonl, now=NOW)
+        self.assertEqual(n, 0)
+        f = self.folded()
+        self.assertEqual(f[sid]["record_type"], cr.RECORD_TYPE_CANDIDATE)
+        self.assertIsNone(f[sid].get("resolution_status"))
+
+    def test_resolved_expiry_not_re_resolved(self):
+        self.seed_two()
+        cr.resolve_jsonl_candidates(lambda s: 105.0, today=date(2026, 6, 5),
+                                    jsonl_path=self.jsonl, now=NOW)
+        again = cr.resolve_jsonl_candidates(lambda s: 1.0,
+                                            today=date(2026, 6, 9),
+                                            jsonl_path=self.jsonl, now=NOW)
+        self.assertEqual(again, 0)
+
+
+# --------------------------------------------------------------------------- #
+# Phase 11B — candlestick fields frozen on the candidate stamp (additive)
+# --------------------------------------------------------------------------- #
+def _candle(o, h, l, c, v=100):
+    return {"o": o, "h": h, "l": l, "c": c, "v": v}
+
+
+def _hammer_candles():
+    """Four down-trend candles + a hammer (lower shadow >> small body)."""
+    prior = [_candle(p + 0.3, p + 0.6, p - 0.6, p)
+             for p in (110, 108, 106, 104)]
+    return prior + [_candle(100, 100.7, 98.5, 100.6)]
+
+
+class TestJsonlCandlestick(StoreCase):
+    def lines(self):
+        with open(self.jsonl, "r", encoding="utf-8") as fh:
+            return [json.loads(ln) for ln in fh if ln.strip()]
+
+    def test_injected_candles_freeze_six_fields(self):
+        cr.stamp_candidate(gap_fields(candles=_hammer_candles()),
+                           jsonl_path=self.jsonl, now=NOW)
+        rec = self.lines()[0]
+        self.assertEqual(rec["candlestick_pattern"], "hammer")
+        self.assertEqual(rec["candlestick_bias"], "bullish")
+        self.assertEqual(rec["candlestick_strength"], "medium")
+        self.assertIsInstance(rec["candlestick_confidence"], float)
+        self.assertTrue(rec["candlestick_reason"])
+        self.assertTrue(rec["candlestick_requires_confirmation"])
+        # The raw candle list is NOT persisted to the record.
+        self.assertNotIn("candles", rec)
+
+    def test_precomputed_fields_pass_through(self):
+        cr.stamp_candidate(
+            gap_fields(candlestick_pattern="evening_star",
+                       candlestick_bias="bearish",
+                       candlestick_strength="strong",
+                       candlestick_confidence=0.78,
+                       candlestick_reason="precomputed upstream",
+                       candlestick_requires_confirmation=False),
+            jsonl_path=self.jsonl, now=NOW)
+        rec = self.lines()[0]
+        self.assertEqual(rec["candlestick_pattern"], "evening_star")
+        self.assertEqual(rec["candlestick_bias"], "bearish")
+        self.assertEqual(rec["candlestick_strength"], "strong")
+        self.assertEqual(rec["candlestick_confidence"], 0.78)
+        self.assertEqual(rec["candlestick_reason"], "precomputed upstream")
+        self.assertFalse(rec["candlestick_requires_confirmation"])
+
+    def test_absent_candles_leaves_fields_none(self):
+        cr.stamp_candidate(gap_fields(), jsonl_path=self.jsonl, now=NOW)
+        rec = self.lines()[0]
+        for k in ("candlestick_pattern", "candlestick_bias",
+                  "candlestick_strength", "candlestick_confidence",
+                  "candlestick_reason", "candlestick_requires_confirmation"):
+            self.assertIsNone(rec[k])
+
+    def test_fold_carries_candlestick_to_resolution(self):
+        cr.stamp_candidate(
+            gap_fields("SPY", selected_for_paper_trade=True,
+                       candles=_hammer_candles()),
+            jsonl_path=self.jsonl, now=NOW)
+        cr.resolve_jsonl_candidates(lambda s: 105.0, today=date(2026, 6, 5),
+                                    jsonl_path=self.jsonl, now=NOW)
+        folded = {r["candidate_id"]: r
+                  for r in cr.load_jsonl_records(self.jsonl)}
+        rec = next(iter(folded.values()))
+        self.assertEqual(rec["record_type"], cr.RECORD_TYPE_RESOLUTION)
+        # Frozen candlestick stamp survives the resolution fold.
+        self.assertEqual(rec["candlestick_pattern"], "hammer")
+        self.assertEqual(rec["candlestick_bias"], "bullish")
+
+
+# --------------------------------------------------------------------------- #
 # Hooks + no execution path touched
 # --------------------------------------------------------------------------- #
 class TestHooksPresent(unittest.TestCase):
@@ -323,6 +599,25 @@ class TestHooksPresent(unittest.TestCase):
         self.assertIn("import candidate_resolution", src)
         self.assertIn("selection_context", src)
         self.assertIn("record_candidates", src)
+
+    def test_record_candidates_stamps_jsonl_layer(self):
+        with open(os.path.join(HERE, "candidate_resolution.py"), "r",
+                  encoding="utf-8") as fh:
+            src = fh.read()
+        # record_candidates must also feed the additive JSONL stamp layer.
+        body = src.split("def record_candidates", 1)[1]
+        body = body.split("\ndef ", 1)[0]
+        self.assertIn("stamp_candidates", body)
+
+    def test_telegram_stamp_hooks_and_commands_present(self):
+        with open(os.path.join(HERE, "telegram_bot.py"), "r",
+                  encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn("stamp_candidates", src)
+        self.assertIn("SPREAD_PROPOSAL", src)
+        self.assertIn("ADVISORY_CHECK", src)
+        self.assertIn("TRIPLE_GAP_REPORT", src)
+        self.assertIn("SIGNAL_SEPARATION", src)
 
 
 class TestNoExecutionPathTouched(unittest.TestCase):
