@@ -144,26 +144,53 @@ class TelegramTradingBot:
             print(f"Error saving tickers: {e}")
             return False
 
-    def send_message(self, text, chat_id=None):
-        """Send message to Telegram"""
-        if not chat_id:
-            chat_id = self.chat_id
+    # Telegram hard-limits a single sendMessage to 4096 characters; stay under
+    # it with margin so multibyte text never trips the boundary.
+    TELEGRAM_MAX_CHARS = 4000
 
+    @staticmethod
+    def _split_message(text, limit=TELEGRAM_MAX_CHARS):
+        """Split text into <=limit-char chunks, preferring line boundaries.
+
+        Long reports otherwise trip Telegram's 4096-char cap ("message is too
+        long"). Whole lines are kept together where possible; a single line
+        longer than the limit is hard-split. Never raises; always returns at
+        least one chunk."""
+        text = "" if text is None else str(text)
+        if len(text) <= limit:
+            return [text]
+        chunks, current = [], ""
+        for line in text.split("\n"):
+            # A single over-long line is hard-split into limit-sized pieces.
+            while len(line) > limit:
+                if current:
+                    chunks.append(current)
+                    current = ""
+                chunks.append(line[:limit])
+                line = line[limit:]
+            piece = line if not current else current + "\n" + line
+            if len(piece) > limit:
+                chunks.append(current)
+                current = line
+            else:
+                current = piece
+        if current:
+            chunks.append(current)
+        return chunks or [""]
+
+    def _post_message(self, chat_id, text):
+        """POST one (already length-safe) chunk; fail-open to plain text.
+
+        Telegram rejects unbalanced Markdown entities (e.g. a bare underscore
+        in INSUFFICIENT_DATA, or an entity split across a chunk boundary) with
+        a 400. Never drop a reply silently: log the API error and retry once
+        without parse_mode so the user always sees *something*."""
         url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
-        data = {
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "Markdown"
-        }
-
+        data = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
         try:
             response = requests.post(url, data=data)
             if response.status_code == 200:
                 return True
-            # Telegram rejects unbalanced Markdown entities (e.g. a bare
-            # underscore in INSUFFICIENT_DATA) and over-long texts with 400.
-            # Never drop a reply silently: log the API error and retry once
-            # as plain text so the user always sees *something*.
             print(f"Send message HTTP {response.status_code}: "
                   f"{response.text[:200]}")
             data.pop("parse_mode", None)
@@ -172,6 +199,16 @@ class TelegramTradingBot:
         except Exception as e:
             print(f"Send message error: {e}")
             return False
+
+    def send_message(self, text, chat_id=None):
+        """Send message to Telegram, chunking over-long text. Fail-open."""
+        if not chat_id:
+            chat_id = self.chat_id
+        ok = True
+        for chunk in self._split_message(text):
+            if not self._post_message(chat_id, chunk):
+                ok = False
+        return ok
 
     def get_updates(self):
         """Get new messages from Telegram"""
