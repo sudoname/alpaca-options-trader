@@ -329,6 +329,17 @@ class TelegramTradingBot:
         elif text == 'CANDLESTICK_REPORT' or text == '/CANDLESTICK_REPORT':
             return self.candlestick_report(chat_id)
 
+        elif text == 'EV_MODEL_ERROR' or text == '/EV_MODEL_ERROR':
+            return self.ev_model_error(chat_id)
+
+        elif text == 'RL_VETO_REPORT' or text == '/RL_VETO_REPORT':
+            return self.rl_veto_report(chat_id)
+
+        elif text.startswith('STRATEGY_EV_MATRIX') or text.startswith('/STRATEGY_EV_MATRIX'):
+            parts = text.replace('/STRATEGY_EV_MATRIX', '').replace('STRATEGY_EV_MATRIX', '', 1).split()
+            symbol = parts[0].strip().upper() if parts else ''
+            return self.strategy_ev_matrix(symbol, chat_id)
+
         elif text.startswith('ADVISORY_CHECK') or text.startswith('/ADVISORY_CHECK'):
             parts = text.replace('/ADVISORY_CHECK', '').replace('ADVISORY_CHECK', '', 1).split()
             symbol = parts[0].strip().upper() if parts else ''
@@ -1927,6 +1938,46 @@ Total symbols: `{len(self.supported_tickers)}`"""
         except Exception as e:
             return f"❌ Could not build candlestick report: {e}"
 
+    def strategy_ev_matrix(self, symbol, chat_id=None):
+        """Phase 12: EV-FIRST strategy matrix. Builds every candidate structure
+        (long call/put, debit/credit spreads, iron condor, SKIP), EV-scores each
+        independently, and ranks by EV/Risk then EV — choosing the best structure
+        or SKIP when all EV is non-positive. Requires an injected chain provider;
+        without one it returns a usage note. ANALYTICS ONLY — nothing is traded,
+        sized or blocked.
+        """
+        symbol = (symbol or '').strip().upper()
+        if symbol and not re.fullmatch(r'[A-Z]{1,5}', symbol):
+            return "❌ Invalid symbol. Usage: `STRATEGY_EV_MATRIX SPY`"
+        try:
+            from strategy_ev_matrix import generate_strategy_ev_matrix_text
+            return generate_strategy_ev_matrix_text(symbol or 'SPY')
+        except Exception as e:
+            return f"❌ Could not build strategy EV matrix: {e}"
+
+    def ev_model_error(self, chat_id=None):
+        """Phase 12: EV model error — predicted EV vs realized PnL over closed
+        trades. Reports overall bias (under/over-prediction) plus breakdowns by
+        strategy, CALL vs PUT, exit reason and EV bucket. ANALYTICS ONLY.
+        """
+        try:
+            from ev_model_error import generate_ev_model_error_text
+            return generate_ev_model_error_text()
+        except Exception as e:
+            return f"❌ Could not build EV model error report: {e}"
+
+    def rl_veto_report(self, chat_id=None):
+        """Phase 12: shadow-RL veto analysis. Flags CALL states with negative Q,
+        PUT states with positive Q, and states where the RL best action disagrees
+        with the rule action at sufficient visits, with advisory veto thresholds.
+        Shadow RL never blocks or places trades — suggestions are advisory only.
+        """
+        try:
+            from rl_veto_report import generate_rl_veto_report_text
+            return generate_rl_veto_report_text()
+        except Exception as e:
+            return f"❌ Could not build RL veto report: {e}"
+
     def vol_edge(self, symbol, vix_arg=None, chat_id=None):
         """Phase 7A/8A: ADVISORY volatility edge + shadow recommendation.
 
@@ -2530,6 +2581,9 @@ Total symbols: `{len(self.supported_tickers)}`"""
 • `TRIPLE_GAP_REPORT` - Does model-vs-market disagreement predict profit? Per-bucket WR/PF over all candidates (analytics)
 • `SIGNAL_SEPARATION` - Which entry signal best separates winners from losers? PF separation per signal (analytics)
 • `CANDLESTICK_REPORT` - Per-candlestick-pattern win rate / profit factor / EV impact over resolved candidates (analytics)
+• `STRATEGY_EV_MATRIX TICKER` - EV-first: build every structure, EV-score each, rank by EV/risk or SKIP (analytics)
+• `EV_MODEL_ERROR` - Predicted EV vs realized PnL; error by strategy / CALL-PUT / exit reason / EV bucket (analytics)
+• `RL_VETO_REPORT` - Shadow-RL disagreements with rule action + advisory veto thresholds (advisory)
 • `VOL_EDGE TICKER [VIX]` - Volatility edge + shadow rec (advisory)
 • `ORACLE_DATASET_STATS` - Training dataset summary (advisory)
 • `ORACLE_STATS` - Oracle performance summary (analytics)
