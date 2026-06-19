@@ -423,7 +423,9 @@ def _trend_subscore(strategy_name: str, trend: Optional[str]) -> float:
 
 def compute_oracle_score(proposal: "SpreadProposal", config: SpreadConfig,
                          vol_state: Optional[str] = None,
-                         trend: Optional[str] = None) -> float:
+                         trend: Optional[str] = None,
+                         version: str = "v1",
+                         learned_edge_score: Optional[float] = None) -> float:
     """Blend five sub-scores into a 0-100 proposal confidence (Requirement 2).
 
     Considers: volatility edge, liquidity, width/max_loss (risk-reward), spread
@@ -431,6 +433,13 @@ def compute_oracle_score(proposal: "SpreadProposal", config: SpreadConfig,
     execution (there is no spread execution). A no_trade / empty proposal scores
     0.0. ``vol_state`` / ``trend`` are the *measured* market context; when
     omitted the score assumes the structure is selection-aligned but unconfirmed.
+
+    P13B (additive, default-off): when ``version == "v2"`` AND a
+    ``learned_edge_score`` is supplied, the five sub-scores are re-weighted and
+    blended with the learned edge via ``oracle_score_v2.blend_v2``. The default
+    ``version="v1"`` path below is UNCHANGED, so every existing caller (which
+    passes neither argument) gets byte-identical scores. Any v2 error falls open
+    to v1. v2 is exercised only by offline tooling, reports and tests.
     """
     if not proposal.is_tradeable or not proposal.legs:
         return 0.0
@@ -439,6 +448,15 @@ def compute_oracle_score(proposal: "SpreadProposal", config: SpreadConfig,
     risk_reward = _risk_reward_subscore(proposal)
     cost = _cost_subscore(proposal.legs, config)
     trend_align = _trend_subscore(proposal.strategy_name, trend)
+    if version == "v2" and learned_edge_score is not None:
+        try:
+            import oracle_score_v2
+            return oracle_score_v2.blend_v2(
+                {"vol_edge": vol_edge, "liquidity": liquidity,
+                 "risk_reward": risk_reward, "cost": cost,
+                 "trend_align": trend_align}, learned_edge_score)
+        except Exception:
+            pass  # fail open to the v1 path below
     blended = (0.25 * vol_edge + 0.20 * liquidity + 0.25 * risk_reward +
                0.15 * cost + 0.15 * trend_align)
     return round(_clamp01(blended) * 100.0, 1)

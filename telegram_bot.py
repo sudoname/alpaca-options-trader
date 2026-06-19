@@ -335,6 +335,15 @@ class TelegramTradingBot:
         elif text == 'RL_VETO_REPORT' or text == '/RL_VETO_REPORT':
             return self.rl_veto_report(chat_id)
 
+        elif text == 'LEARNED_EDGE_REPORT' or text == '/LEARNED_EDGE_REPORT':
+            return self.learned_edge_report(chat_id)
+
+        elif text == 'ORACLE_SCORE_COMPARISON' or text == '/ORACLE_SCORE_COMPARISON':
+            return self.oracle_score_comparison(chat_id)
+
+        elif text == 'LEARNED_EDGE_LEADERBOARD' or text == '/LEARNED_EDGE_LEADERBOARD':
+            return self.learned_edge_leaderboard(chat_id)
+
         elif text.startswith('STRATEGY_EV_MATRIX') or text.startswith('/STRATEGY_EV_MATRIX'):
             parts = text.replace('/STRATEGY_EV_MATRIX', '').replace('STRATEGY_EV_MATRIX', '', 1).split()
             symbol = parts[0].strip().upper() if parts else ''
@@ -1978,6 +1987,40 @@ Total symbols: `{len(self.supported_tickers)}`"""
         except Exception as e:
             return f"❌ Could not build RL veto report: {e}"
 
+    def learned_edge_report(self, chat_id=None):
+        """Phase 13: learned-edge report — the global prior plus the strongest
+        and weakest historical setups by Bayesian-smoothed edge, with confidence.
+        SHADOW / ANALYTICS ONLY — nothing is traded, sized, blocked or altered.
+        """
+        try:
+            from learned_edge_reports import generate_learned_edge_report_text
+            return generate_learned_edge_report_text()
+        except Exception as e:
+            return f"❌ Could not build learned edge report: {e}"
+
+    def oracle_score_comparison(self, chat_id=None):
+        """Phase 13: replays the frozen history under the live Oracle (v1),
+        EV-first and learned rankings and tabulates win rate, avg return, profit
+        factor, max drawdown and expectancy. SHADOW / ANALYTICS ONLY — no live
+        ranking or trade is changed.
+        """
+        try:
+            from learned_edge_reports import generate_oracle_score_comparison_text
+            return generate_oracle_score_comparison_text()
+        except Exception as e:
+            return f"❌ Could not build oracle score comparison: {e}"
+
+    def learned_edge_leaderboard(self, chat_id=None):
+        """Phase 13: setups ranked by sample-size-adjusted expected profitability
+        (confidence x smoothed avg return). SHADOW / ANALYTICS ONLY — nothing is
+        traded, sized, blocked or altered.
+        """
+        try:
+            from learned_edge_reports import generate_learned_edge_leaderboard_text
+            return generate_learned_edge_leaderboard_text()
+        except Exception as e:
+            return f"❌ Could not build learned edge leaderboard: {e}"
+
     def vol_edge(self, symbol, vix_arg=None, chat_id=None):
         """Phase 7A/8A: ADVISORY volatility edge + shadow recommendation.
 
@@ -2584,6 +2627,9 @@ Total symbols: `{len(self.supported_tickers)}`"""
 • `STRATEGY_EV_MATRIX TICKER` - EV-first: build every structure, EV-score each, rank by EV/risk or SKIP (analytics)
 • `EV_MODEL_ERROR` - Predicted EV vs realized PnL; error by strategy / CALL-PUT / exit reason / EV bucket (analytics)
 • `RL_VETO_REPORT` - Shadow-RL disagreements with rule action + advisory veto thresholds (advisory)
+• `LEARNED_EDGE_REPORT` - Global prior + strongest/weakest setups by Bayesian-smoothed edge (shadow)
+• `ORACLE_SCORE_COMPARISON` - Replay history: Oracle v1 vs EV-first vs learned ranking (shadow)
+• `LEARNED_EDGE_LEADERBOARD` - Setups by sample-size-adjusted expected profitability (shadow)
 • `VOL_EDGE TICKER [VIX]` - Volatility edge + shadow rec (advisory)
 • `ORACLE_DATASET_STATS` - Training dataset summary (advisory)
 • `ORACLE_STATS` - Oracle performance summary (analytics)
