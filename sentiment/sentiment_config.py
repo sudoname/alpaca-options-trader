@@ -102,6 +102,17 @@ class SentimentConfig:
     # Momentum lookback (trading days) for SPY vs moving average.
     momentum_window: int = 125
 
+    # Realized-volatility window (trading days) for the volatility component.
+    # The component scores SPY's trailing return volatility (stationary,
+    # mean-reverting) instead of a VIX-level proxy whose secular drift would
+    # bias the percentile.
+    volatility_window: int = 20
+
+    # Trailing-return window (trading days) for the safe-haven component, which
+    # scores the SPY-minus-bond return spread (CNN's method) rather than an
+    # absolute price-ratio level.
+    return_spread_window: int = 20
+
     cache_file: str = "sentiment_cache.json"
 
     @classmethod
@@ -121,5 +132,7 @@ class SentimentConfig:
             cnn_timeout=_get_int("SENTIMENT_CNN_TIMEOUT", 10),
             history_days=_get_int("SENTIMENT_HISTORY_DAYS", 400),
             momentum_window=_get_int("SENTIMENT_MOMENTUM_WINDOW", 125),
+            volatility_window=_get_int("SENTIMENT_VOLATILITY_WINDOW", 20),
+            return_spread_window=_get_int("SENTIMENT_RETURN_SPREAD_WINDOW", 20),
             cache_file=os.getenv("SENTIMENT_CACHE_FILE", "sentiment_cache.json"),
         )

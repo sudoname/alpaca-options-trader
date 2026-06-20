@@ -7,12 +7,20 @@ for this bot: it keeps working even when the CNN endpoint is unavailable.
 
 Seven components (CNN-style):
     1. Market momentum      — SPY vs its 125-day moving average (above = greed)
-    2. Market volatility    — VIX percentile (high VIX = fear, inverse)
+    2. Market volatility    — SPY realized-volatility percentile (high vol = fear, inverse)
     3. Put/call ratio       — high ratio = fear (inverse)            [provider-supplied]
     4. Junk bond demand     — HYG vs LQD relative strength (strong HYG = greed)
-    5. Safe-haven demand    — SPY vs bonds (TLT/IEF); bonds winning = fear
+    5. Safe-haven demand    — SPY-minus-bond trailing return spread (stocks winning = greed)
     6. Market breadth       — advancers vs decliners                [provider-supplied]
     7. New highs / new lows — 52-week highs vs lows                 [provider-supplied]
+
+Components 2 and 5 score *stationary* inputs (trailing return volatility and a
+trailing return spread) rather than absolute price levels. A percentile of a
+trending level mostly captures the secular trend, not current sentiment: VIXY
+(the only VIX proxy on a stock feed) drifts to new lows via contango decay, and
+an SPY/bond price ratio inherits the long bull/bond-bear trend — both would pin
+the score near "extreme greed" regardless of risk. Returns are mean-reverting,
+which matches CNN's own methodology.
 
 Each component is scored 0-100 via rolling percentile. Components whose data is
 unavailable are EXCLUDED from the average and reported in
@@ -21,6 +29,7 @@ average of the available component scores.
 """
 
 import logging
+import math
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Sequence
 
@@ -75,6 +84,46 @@ def _relative_strength_series(numer: Sequence[float],
         if x is None or y is None or y == 0:
             continue
         out.append(float(x) / float(y))
+    return out
+
+
+def _daily_returns(series: Sequence[float]) -> List[float]:
+    """Simple day-over-day returns from a close series (oldest -> newest)."""
+    clean = [float(v) for v in series if v is not None]
+    out = []
+    for i in range(1, len(clean)):
+        prev = clean[i - 1]
+        if prev:
+            out.append(clean[i] / prev - 1.0)
+    return out
+
+
+def _rolling_volatility(returns: Sequence[float], window: int) -> List[float]:
+    """Rolling sample standard deviation of ``returns`` (one value per window end).
+
+    Not annualized: the percentile is scale-invariant, so annualizing would not
+    change the score. Returns an empty list when there is too little history.
+    """
+    clean = [float(r) for r in returns if r is not None]
+    out: List[float] = []
+    if window < 2 or len(clean) < window:
+        return out
+    for i in range(window, len(clean) + 1):
+        w = clean[i - window:i]
+        mean = sum(w) / len(w)
+        var = sum((r - mean) ** 2 for r in w) / (len(w) - 1)
+        out.append(math.sqrt(var))
+    return out
+
+
+def _rolling_return(series: Sequence[float], window: int) -> List[float]:
+    """Rolling window-over-window return: ``series[i] / series[i-window] - 1``."""
+    clean = [float(v) for v in series if v is not None]
+    out: List[float] = []
+    for i in range(window, len(clean)):
+        prev = clean[i - window]
+        if prev:
+            out.append(clean[i] / prev - 1.0)
     return out
 
 
@@ -191,14 +240,21 @@ def compute_custom_fear_greed(provider: MarketDataProvider,
         logger.warning("momentum component failed: %s", exc)
         components.append(_component("market_momentum", None, f"error: {exc}"))
 
-    # --- 2. Market volatility: VIX percentile (inverse: high VIX = fear) ---
+    # --- 2. Market volatility: SPY realized-vol percentile (inverse: high = fear) ---
+    # Scores SPY's trailing return volatility, not a VIX-level proxy. The only
+    # index proxy on a stock feed is VIXY, whose contango decay drives its price
+    # to new lows continuously -- a level-percentile of that pins the score near
+    # "extreme greed" regardless of real risk. Realized vol is mean-reverting.
     try:
-        vix = provider.get_close_series(config.vix_symbol, days)
-        if vix:
-            score = percentile_score(vix[:-1] or vix, vix[-1], inverse=True)
-            detail = f"VIX {vix[-1]:.2f} (inverse percentile)"
+        spy_vol = provider.get_close_series(config.spy_symbol, days)
+        vols = _rolling_volatility(_daily_returns(spy_vol), config.volatility_window)
+        if len(vols) >= 2:
+            score = percentile_score(vols[:-1], vols[-1], inverse=True)
+            ann = vols[-1] * math.sqrt(252) * 100.0
+            detail = (f"SPY {config.volatility_window}d realized vol "
+                      f"{ann:.1f}% ann. (inverse percentile)")
         else:
-            score, detail = None, "no VIX history"
+            score, detail = None, "insufficient SPY history for realized vol"
         components.append(_component("market_volatility", score, detail))
     except Exception as exc:
         logger.warning("volatility component failed: %s", exc)
@@ -233,17 +289,26 @@ def compute_custom_fear_greed(provider: MarketDataProvider,
         logger.warning("junk bond component failed: %s", exc)
         components.append(_component("junk_bond_demand", None, f"error: {exc}"))
 
-    # --- 5. Safe-haven demand: SPY vs bonds (TLT/IEF). Bonds winning = fear ---
+    # --- 5. Safe-haven demand: SPY-minus-bond trailing return spread ---
+    # Stocks outperforming bonds recently = greed. Scores the difference in
+    # trailing returns (CNN's method), not the absolute SPY/bond price-ratio
+    # level: a level-percentile over a long window mostly captures the secular
+    # bull/bond-bear trend rather than current risk appetite.
     try:
         spy = provider.get_close_series(config.spy_symbol, days)
         tlt = provider.get_close_series(config.long_treasury_symbol, days)
         ief = provider.get_close_series(config.mid_treasury_symbol, days)
         bond = tlt if tlt else ief
-        rs = _relative_strength_series(spy, bond)  # SPY/bond, high = greed
-        if len(rs) >= 2:
-            score = percentile_score(rs[:-1], rs[-1])
+        win = config.return_spread_window
+        spy_ret = _rolling_return(spy, win)
+        bond_ret = _rolling_return(bond, win)
+        n = min(len(spy_ret), len(bond_ret))
+        if n >= 2:
+            spread = [a - b for a, b in zip(spy_ret[-n:], bond_ret[-n:])]
+            score = percentile_score(spread[:-1], spread[-1])
             label = "TLT" if tlt else ("IEF" if ief else "bond")
-            detail = f"SPY/{label} strength ratio {rs[-1]:.4f}"
+            detail = (f"SPY-{label} {win}d return spread "
+                      f"{spread[-1] * 100:+.2f}pp")
         else:
             score, detail = None, "insufficient SPY/bond history"
         components.append(_component("safe_haven_demand", score, detail))

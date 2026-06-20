@@ -22,6 +22,9 @@ from sentiment.custom_fear_greed import (
     MarketDataProvider,
     compute_custom_fear_greed,
     percentile_score,
+    _daily_returns,
+    _rolling_volatility,
+    _rolling_return,
 )
 from sentiment.sentiment_cache import SentimentCache
 from sentiment.sentiment_service import SentimentService
@@ -57,35 +60,70 @@ class FakeSession:
         return self._response
 
 
+def _zigzag(start, pct, n, drift=0.0):
+    """High-volatility series: alternating +/-``pct`` daily moves plus ``drift``.
+
+    A net-flat zigzag (drift 0) has large day-over-day return variance; a
+    negative drift makes it trend down while staying volatile.
+    """
+    out, price = [], float(start)
+    for i in range(n):
+        step = (pct if i % 2 == 0 else -pct) + drift
+        price *= (1.0 + step)
+        out.append(price)
+    return out
+
+
+def _smooth(start, daily, n):
+    """Low-volatility series: constant daily compounding at rate ``daily``."""
+    out, price = [], float(start)
+    for _ in range(n):
+        price *= (1.0 + daily)
+        out.append(price)
+    return out
+
+
 class GreedyProvider(MarketDataProvider):
     """Provider whose series imply a strongly bullish (greed) market.
 
-    SPY rises steadily (price well above its MA), VIX trends down, HYG strong vs
-    LQD, SPY strong vs bonds. Optional feeds remain unavailable (default None).
+    Built for the corrected, return-based components: SPY is volatile/flat early
+    then a calm strong rally (low *recent* realized vol => greed; high recent
+    20d return vs flat bonds => safe-haven greed; price well above its 125d MA
+    => momentum greed). HYG strong vs flat LQD => junk-bond greed. Optional
+    feeds remain unavailable (default None).
     """
 
     def get_close_series(self, symbol, days):
-        n = 200
         if symbol == "$VIX.X":
-            # Falling VIX, current near the low end.
-            return [30.0 - (i * 0.1) for i in range(n)]
+            return _smooth(40.0, -0.003, 200)  # falling proxy (now unused)
         if symbol in ("LQD", "IEF", "TLT"):
-            # Flat-ish bonds.
-            return [100.0 + (i * 0.001) for i in range(n)]
-        # SPY / HYG strongly rising.
-        return [100.0 + i for i in range(n)]
+            return _smooth(100.0, 0.0001, 200)  # ~flat bonds
+        if symbol == "HYG":
+            return _smooth(80.0, 0.002, 200)  # junk bonds rising vs flat IG
+        # SPY: volatile/flat early, then a calm strong rally.
+        early = _zigzag(100.0, 0.03, 100)
+        return early + _smooth(early[-1], 0.005, 100)
 
 
 class FearfulProvider(MarketDataProvider):
+    """Provider whose series imply a fearful market (mirror of GreedyProvider).
+
+    SPY is a calm climb early then a volatile decline (high *recent* realized
+    vol => fear; negative recent 20d return while bonds rise => safe-haven fear;
+    price below its MA => momentum fear). HYG falls vs rising LQD => junk-bond
+    fear.
+    """
+
     def get_close_series(self, symbol, days):
-        n = 200
         if symbol == "$VIX.X":
-            # Rising VIX, current near the high end => fear.
-            return [10.0 + (i * 0.1) for i in range(n)]
+            return _smooth(15.0, 0.003, 200)  # rising proxy (now unused)
         if symbol in ("LQD", "IEF", "TLT"):
-            return [100.0 + i for i in range(n)]  # bonds outperforming
-        # SPY / HYG falling.
-        return [300.0 - i for i in range(n)]
+            return _smooth(100.0, 0.002, 200)  # bonds outperforming
+        if symbol == "HYG":
+            return _smooth(90.0, -0.002, 200)  # junk bonds falling
+        # SPY: calm climb early, then a volatile decline.
+        early = _smooth(100.0, 0.004, 100)
+        return early + _zigzag(early[-1], 0.04, 100, drift=-0.01)
 
 
 class EmptyProvider(MarketDataProvider):
@@ -238,6 +276,138 @@ class TestCustomScore(unittest.TestCase):
         result = compute_custom_fear_greed(WithExtras(), self.config)
         self.assertEqual(result["status"], "available")
         self.assertEqual(result["unavailable_components"], [])
+
+
+# --------------------------------------------------------------------------- #
+# Return / volatility helpers (the stationary inputs behind components 2 & 5)
+# --------------------------------------------------------------------------- #
+class TestReturnHelpers(unittest.TestCase):
+    def test_daily_returns(self):
+        r = _daily_returns([100.0, 110.0, 99.0])
+        self.assertEqual(len(r), 2)
+        self.assertAlmostEqual(r[0], 0.10)
+        self.assertAlmostEqual(r[1], 99.0 / 110.0 - 1.0)
+
+    def test_daily_returns_skips_zero_prev(self):
+        # A zero previous price is skipped rather than dividing by zero.
+        self.assertEqual(_daily_returns([0.0, 5.0, 10.0]), [1.0])
+
+    def test_rolling_return_window(self):
+        # series[i]/series[i-window]-1 for each valid i.
+        r = _rolling_return([100.0, 110.0, 121.0], 1)
+        self.assertEqual(len(r), 2)
+        self.assertAlmostEqual(r[0], 0.10)
+        self.assertAlmostEqual(r[1], 0.10)
+
+    def test_rolling_return_insufficient_history(self):
+        self.assertEqual(_rolling_return([100.0, 101.0], 5), [])
+
+    def test_rolling_volatility_constant_returns_zero(self):
+        # Constant returns => zero dispersion in every window.
+        vols = _rolling_volatility([0.01] * 30, 20)
+        self.assertTrue(all(abs(v) < 1e-12 for v in vols))
+        self.assertEqual(len(vols), 11)  # 30 - 20 + 1
+
+    def test_rolling_volatility_detects_dispersion(self):
+        calm = _rolling_volatility([0.001] * 25, 20)[-1]
+        choppy = _rolling_volatility([0.05, -0.05] * 13, 20)[-1]
+        self.assertGreater(choppy, calm)
+
+    def test_rolling_volatility_too_short(self):
+        self.assertEqual(_rolling_volatility([0.01, 0.02], 20), [])
+
+
+# --------------------------------------------------------------------------- #
+# Reworked components: volatility (realized vol) & safe-haven (return spread)
+# --------------------------------------------------------------------------- #
+class TestVolatilityComponent(unittest.TestCase):
+    """market_volatility scores SPY realized vol, inverse (low vol => greed)."""
+
+    def _vol_score(self, spy_series):
+        class P(MarketDataProvider):
+            def get_close_series(_self, symbol, days):
+                return spy_series if symbol == "SPY" else []
+        comps = {c["name"]: c for c in
+                 compute_custom_fear_greed(P(), SentimentConfig())["components"]}
+        return comps["market_volatility"]
+
+    def test_calm_recent_market_is_greedy(self):
+        # Volatile past, calm recent => low current realized vol => high score.
+        spy = _zigzag(100.0, 0.03, 100) + _smooth(100.0, 0.002, 60)
+        c = self._vol_score(spy)
+        self.assertTrue(c["available"])
+        self.assertGreater(c["score"], 60)
+
+    def test_turbulent_recent_market_is_fearful(self):
+        # Calm past, turbulent recent => high current realized vol => low score.
+        spy = _smooth(100.0, 0.002, 100) + _zigzag(100.0, 0.04, 60)
+        c = self._vol_score(spy)
+        self.assertTrue(c["available"])
+        self.assertLess(c["score"], 40)
+
+    def test_detail_reports_realized_vol_not_vix_level(self):
+        c = self._vol_score(_smooth(100.0, 0.001, 60))
+        self.assertIn("realized vol", c["detail"])
+
+    def test_does_not_read_vix_symbol(self):
+        # The component must source SPY only; a VIXY series must not feed it.
+        seen = []
+
+        class P(MarketDataProvider):
+            def get_close_series(_self, symbol, days):
+                seen.append(symbol)
+                return _smooth(100.0, 0.001, 60) if symbol == "SPY" else []
+
+        compute_custom_fear_greed(P(), SentimentConfig())
+        self.assertNotIn("$VIX.X", seen)
+
+
+class TestSafeHavenComponent(unittest.TestCase):
+    """safe_haven_demand scores the SPY-minus-bond trailing return spread."""
+
+    def _score(self, spy_series, bond_series):
+        class P(MarketDataProvider):
+            def get_close_series(_self, symbol, days):
+                if symbol == "SPY":
+                    return spy_series
+                if symbol in ("TLT", "IEF"):
+                    return bond_series
+                return []
+        comps = {c["name"]: c for c in
+                 compute_custom_fear_greed(P(), SentimentConfig())["components"]}
+        return comps["safe_haven_demand"]
+
+    def test_stocks_beating_bonds_recently_is_greed(self):
+        # Flat-then-rallying SPY vs flat bonds => high recent spread => greed.
+        spy = _smooth(100.0, 0.0, 100) + _smooth(100.0, 0.006, 60)
+        bond = _smooth(100.0, 0.0001, 160)
+        c = self._score(spy, bond)
+        self.assertTrue(c["available"])
+        self.assertGreater(c["score"], 60)
+
+    def test_bonds_beating_stocks_recently_is_fear(self):
+        # Flat-then-falling SPY while bonds rally => negative spread => fear.
+        spy = _smooth(100.0, 0.0, 100) + _smooth(100.0, -0.006, 60)
+        bond = _smooth(100.0, 0.002, 160)
+        c = self._score(spy, bond)
+        self.assertTrue(c["available"])
+        self.assertLess(c["score"], 40)
+
+    def test_detail_reports_return_spread(self):
+        spy = _smooth(100.0, 0.001, 60)
+        bond = _smooth(100.0, 0.0001, 60)
+        self.assertIn("return spread", self._score(spy, bond)["detail"])
+
+    def test_secular_uptrend_alone_is_not_extreme_greed(self):
+        # A steady SPY uptrend vs steadily-declining bonds (the real-world case
+        # that produced safe_haven=94 under level-percentile scoring). With
+        # *constant* returns the trailing spread is flat, so the percentile of
+        # the current spread is mid/low -- NOT pinned at the top.
+        spy = _smooth(100.0, 0.001, 200)
+        bond = _smooth(100.0, -0.0005, 200)
+        c = self._score(spy, bond)
+        self.assertTrue(c["available"])
+        self.assertLess(c["score"], 80)
 
 
 # --------------------------------------------------------------------------- #
