@@ -178,21 +178,51 @@ class TelegramTradingBot:
             chunks.append(current)
         return chunks or [""]
 
+    @staticmethod
+    def _markdown_balanced(text):
+        """Conservative check that legacy-Markdown entities are well-formed.
+
+        Telegram's ``parse_mode="Markdown"`` parser 400s ("can't parse
+        entities") not only when ``*``/``_``/`` ` `` are unbalanced, but also
+        when they *interleave* — e.g. ``*NO_TRADE*`` (a ``_`` opening inside a
+        ``*`` bold) or a reason like ``flat_signal``. Legacy Markdown entities
+        do not nest, so a single-marker stack must close in strict LIFO order
+        and end empty. Any interleave or leftover marker means "not safe": the
+        caller then posts the chunk as plain text up-front instead of eating a
+        400. Conservative by design — when in doubt, send plain."""
+        if not text:
+            return True
+        stack = []
+        for ch in text:
+            if ch not in ("*", "_", "`"):
+                continue
+            if stack and stack[-1] == ch:
+                stack.pop()          # close the open entity
+            elif stack:
+                return False         # a different marker opened mid-entity
+            else:
+                stack.append(ch)     # open a new entity
+        return not stack
+
     def _post_message(self, chat_id, text):
         """POST one (already length-safe) chunk; fail-open to plain text.
 
-        Telegram rejects unbalanced Markdown entities (e.g. a bare underscore
-        in INSUFFICIENT_DATA, or an entity split across a chunk boundary) with
-        a 400. Never drop a reply silently: log the API error and retry once
-        without parse_mode so the user always sees *something*."""
+        Unbalanced Markdown is detected up-front and sent as plain text so the
+        common case never triggers a 400. Should a balanced chunk still be
+        rejected (e.g. a malformed link), retry once without parse_mode so the
+        user always sees *something*."""
         url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
-        data = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+        data = {"chat_id": chat_id, "text": text}
+        if self._markdown_balanced(text):
+            data["parse_mode"] = "Markdown"
         try:
             response = requests.post(url, data=data)
             if response.status_code == 200:
                 return True
             print(f"Send message HTTP {response.status_code}: "
                   f"{response.text[:200]}")
+            if "parse_mode" not in data:
+                return False
             data.pop("parse_mode", None)
             response = requests.post(url, data=data)
             return response.status_code == 200
