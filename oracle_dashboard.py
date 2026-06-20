@@ -3,9 +3,10 @@ Oracle Web Dashboard — read-only analytics API (Phase 1 skeleton).
 
 A SEPARATE Flask process from ``alps-bot``/``alps-scheduler``. It imports only
 pure ``compute_*``/``build_*`` report functions and read-only loaders, exposes
-only ``GET`` endpoints, and binds to ``127.0.0.1`` behind a Caddy reverse proxy
-(TLS + basic auth). It CANNOT open, size, price, gate, or close any real or
-paper position — there is no execution path in this module by construction.
+only ``GET`` endpoints, and binds to ``127.0.0.1`` behind an nginx reverse proxy
+(TLS via certbot + basic auth; see deploy/nginx-oracle-dashboard.conf). It
+CANNOT open, size, price, gate, or close any real or paper position — there is
+no execution path in this module by construction.
 
 Project idioms mirrored here:
   * ``DashboardConfig.from_env(path=".env", loader=None)`` — shell > .env > default.
@@ -57,7 +58,7 @@ class DashboardConfig:
     def auth_enabled(self) -> bool:
         """App-level basic auth is enforced only when BOTH creds are set.
 
-        Off for local dev; in production Caddy enforces auth regardless, so this
+        Off for local dev; in production nginx enforces auth regardless, so this
         is defense-in-depth, not the primary gate.
         """
         return bool(self.basic_auth_user) and bool(self.basic_auth_pass)

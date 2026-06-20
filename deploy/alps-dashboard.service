@@ -23,7 +23,8 @@ WorkingDirectory=/var/www/alps
 ExecStart=/var/www/alps/venv/bin/python oracle_dashboard.py
 Restart=always
 RestartSec=5
-# Binds 127.0.0.1:8787 (set in .env); Caddy is the sole public face.
+# Binds 127.0.0.1:8787 (set in .env); nginx + certbot is the sole public face
+# (see deploy/nginx-oracle-dashboard.conf).
 StandardOutput=append:/var/log/alps-dashboard.log
 StandardError=append:/var/log/alps-dashboard.log
 
