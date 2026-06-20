@@ -104,6 +104,7 @@ echo "==> Running self-test gate"
 "$PYTHON" run_alpaca_intraday.py --selftest
 "$PYTHON" oracle_dashboard.py --selftest
 "$PYTHON" single_leg_reports.py --selftest
+"$PYTHON" explain_context.py --selftest
 echo "==> All self-tests passed."
 
 # --- 4. optional restart (you own the supervisor) -------------------------

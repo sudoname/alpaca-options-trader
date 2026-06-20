@@ -135,6 +135,18 @@ def create_app(config: "DashboardConfig" = None) -> Flask:
     cache = _TTLCache(cfg.cache_ttl)
     app.config["DASHBOARD_CACHE"] = cache
 
+    # Read-only evidence-context builder for /api/explain. Injectable so the
+    # self-test / unit tests stay offline (they override it with a stub that
+    # returns {}); the default assembles live market context (and itself fails
+    # open to {} on missing creds / no network).
+    def _default_explain_ctx(symbol):
+        try:
+            import explain_context
+            return explain_context.build_explain_context(symbol)
+        except Exception:
+            return {}
+    app.config.setdefault("EXPLAIN_CTX_BUILDER", _default_explain_ctx)
+
     # -- basic-auth (defense-in-depth) ----------------------------------- #
     def _check_auth(auth) -> bool:
         if auth is None:
@@ -272,7 +284,9 @@ def create_app(config: "DashboardConfig" = None) -> Flask:
 
         def provider():
             import oracle_intelligence_reports as oir
-            return oir.compute_oracle_explain(clean)
+            ctx_builder = app.config.get("EXPLAIN_CTX_BUILDER")
+            ctx = ctx_builder(clean) if ctx_builder else None
+            return oir.compute_oracle_explain(clean, ctx=ctx)
         return _cached_json(f"explain:{clean}", provider)
 
     @app.route("/api/positions")
@@ -337,6 +351,9 @@ def _self_test() -> int:
     # 1. Health is 200 + JSON, open even when auth is configured.
     app = create_app(DashboardConfig(host="127.0.0.1", port=0, cache_ttl=0,
                                      basic_auth_user="", basic_auth_pass=""))
+    # Keep explain offline+deterministic: stub the context builder (the live
+    # builder would otherwise issue read-only Alpaca GETs during the gate).
+    app.config["EXPLAIN_CTX_BUILDER"] = lambda s: {}
     client = app.test_client()
     r = client.get("/api/health")
     if r.status_code != 200 or r.get_json().get("status") != "ok":
@@ -366,6 +383,16 @@ def _self_test() -> int:
     for junk in ("spy;rm", "TOOLONGTICKER", "1", "a%20b"):
         if client.get(f"/api/explain/{junk}").status_code != 400:
             print(f"FAIL: junk ticker {junk!r} should 400"); ok = False
+
+    # 2c. With a populated evidence context, explain leaves INSUFFICIENT_DATA.
+    app_ctx = create_app(DashboardConfig(host="127.0.0.1", port=0, cache_ttl=0,
+                                         basic_auth_user="", basic_auth_pass=""))
+    app_ctx.config["EXPLAIN_CTX_BUILDER"] = lambda s: {
+        "trend": "up", "momentum": 0.05, "realized_vol": 0.2}
+    rc = app_ctx.test_client().get("/api/explain/SPY")
+    jb = rc.get_json()
+    if rc.status_code != 200 or jb.get("verdict") == VERDICT_INSUFFICIENT:
+        print("FAIL: explain with ctx should not be INSUFFICIENT_DATA:", jb); ok = False
 
     # 3. A raising provider degrades to verdict=ERROR, still 200.
     err = _safe_provider(lambda: (_ for _ in ()).throw(RuntimeError("boom")))

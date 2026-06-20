@@ -29,9 +29,20 @@ def _cfg(user="", password="", ttl=0):
                            basic_auth_user=user, basic_auth_pass=password)
 
 
+def _app(user="", password="", ttl=0, explain_ctx=None):
+    """Build an app with the explain context builder stubbed offline.
+
+    The live builder issues read-only Alpaca GETs; tests must never touch the
+    network, so default it to a no-evidence stub (yields INSUFFICIENT_DATA).
+    """
+    app = create_app(_cfg(user, password, ttl))
+    app.config["EXPLAIN_CTX_BUILDER"] = explain_ctx or (lambda s: {})
+    return app
+
+
 class TestHealthAndFailOpen(unittest.TestCase):
     def setUp(self):
-        self.client = create_app(_cfg()).test_client()
+        self.client = _app().test_client()
 
     def test_health_ok(self):
         r = self.client.get("/api/health")
@@ -68,7 +79,7 @@ class TestHealthAndFailOpen(unittest.TestCase):
 
 class TestExplainSanitization(unittest.TestCase):
     def setUp(self):
-        self.client = create_app(_cfg()).test_client()
+        self.client = _app().test_client()
 
     def test_valid_tickers_pass(self):
         for t in ("SPY", "AAPL", "BRK.B"):
@@ -84,6 +95,41 @@ class TestExplainSanitization(unittest.TestCase):
             r = self.client.get(f"/api/explain/{junk}")
             self.assertEqual(r.status_code, 400, msg=junk)
             self.assertEqual(r.get_json().get("verdict"), "ERROR", msg=junk)
+
+
+class TestExplainContext(unittest.TestCase):
+    """The route feeds the injectable builder's ctx into compute_oracle_explain."""
+
+    def test_populated_ctx_is_not_insufficient(self):
+        ctx = {"trend": "up", "momentum": 0.05, "realized_vol": 0.2}
+        client = _app(explain_ctx=lambda s: ctx).test_client()
+        body = client.get("/api/explain/SPY").get_json()
+        self.assertEqual(body.get("verdict"), "OK")
+
+    def test_empty_ctx_stays_insufficient(self):
+        client = _app(explain_ctx=lambda s: {}).test_client()
+        body = client.get("/api/explain/SPY").get_json()
+        self.assertEqual(body.get("verdict"), "INSUFFICIENT_DATA")
+
+    def test_builder_receives_sanitized_symbol(self):
+        seen = {}
+
+        def builder(sym):
+            seen["sym"] = sym
+            return {}
+
+        client = _app(explain_ctx=builder).test_client()
+        client.get("/api/explain/spy")
+        self.assertEqual(seen.get("sym"), "SPY")
+
+    def test_raising_builder_fails_open(self):
+        def boom(s):
+            raise RuntimeError("network down")
+
+        client = _app(explain_ctx=boom).test_client()
+        r = client.get("/api/explain/SPY")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json().get("verdict"), "ERROR")
 
 
 class TestBasicAuth(unittest.TestCase):
