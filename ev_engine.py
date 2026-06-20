@@ -272,13 +272,22 @@ def estimate_structure_costs(legs, days: int = 0,
 def evaluate_proposal(proposal, spot, sigma, days=None, mu: float = 0.0,
                       volatility_edge=None, oracle_score=None,
                       config: Optional[EVConfig] = None,
-                      cost_model: Optional[CostModel] = None) -> EVResult:
+                      cost_model: Optional[CostModel] = None,
+                      prob_override: Optional[float] = None) -> EVResult:
     """Estimate PoP / EV / EV-per-risk for one SpreadProposal. Never raises.
 
     ``spot``  — current underlying price.
     ``sigma`` — annualized volatility (decimal, e.g. 0.20).
     ``days``  — horizon to expiry (defaults to ``config.default_days``).
     ``mu``    — annualized drift (0.0 = neutral terminal distribution).
+
+    ``prob_override`` (Oracle 3.0, Phase 5) — an OPTIONAL blended directional
+    win-probability from the Intelligence Layer. **Defaults to None, in which
+    case this function is byte-identical to before** (the driftless log-normal
+    PoP is used). When a valid probability in [0, 1] is supplied (only ever the
+    case when ``ORACLE_INTELLIGENCE_ENABLED`` is on at the call site), EV is
+    recomputed using it in place of the modeled PoP. EV still arbitrates the
+    trade and risk still gates it — this only changes the probability input.
     """
     cfg = config or EVConfig()
     symbol = _get(proposal, "symbol", "") if proposal is not None else ""
@@ -351,6 +360,24 @@ def evaluate_proposal(proposal, spot, sigma, days=None, mu: float = 0.0,
         tail_prob = 1.0 - range_prob
         pop = range_prob
         ev = iron_condor_ev(range_prob, tail_prob, max_profit, max_loss, costs)
+
+    # ---- Oracle 3.0 (Phase 5): optional probability override -------------- #
+    # DEFAULT None -> this block is a strict no-op and the EVResult is
+    # byte-identical to the pre-Oracle path. When the Intelligence Layer supplies
+    # a valid blended PoP, EV is recomputed with it in place of the log-normal
+    # PoP, preserving each strategy's modeled win-region shape.
+    if ev is not None and _valid_prob(pop) and _valid_prob(prob_override):
+        pop = float(prob_override)
+        if strategy in _CREDIT_SPREADS:
+            ev = credit_spread_ev(pop, max_profit, max_loss, costs)
+        elif strategy in _DEBIT_SPREADS:
+            win_region = p_max + p_partial
+            frac = (p_max / win_region) if win_region > 0 else 1.0
+            ev = debit_spread_ev(pop * frac, pop * (1.0 - frac), 1.0 - pop,
+                                 max_profit, max_profit / 2.0, max_loss, costs)
+        else:  # IRON_CONDOR
+            ev = iron_condor_ev(pop, max(0.0, 1.0 - pop), max_profit, max_loss,
+                                costs)
 
     if ev is None or not _valid_prob(pop):
         return _insufficient(symbol, strategy, "invalid probability inputs",

@@ -97,10 +97,21 @@ class EpisodeStore:
         as_of: Optional[str] = None,
         risk: Optional[Dict] = None,
         decision_id: Optional[str] = None,
+        oracle: Optional[Dict] = None,
     ) -> str:
-        """Insert a decision row and return its decision_id (uuid4)."""
+        """Insert a decision row and return its decision_id (uuid4).
+
+        ``oracle`` (Oracle 3.0, Phase 3) is an optional shadow payload — regime
+        label, model probabilities, agent votes / contributions. When supplied
+        it is folded into the free-form ``features_json`` under an ``"oracle"``
+        namespace (no schema migration). When omitted (the default live path)
+        the stored row is byte-identical to before.
+        """
         did = decision_id or str(uuid.uuid4())
         quote = quote or {}
+        if oracle:
+            # Copy so the caller's features dict is never mutated; namespaced.
+            features = {**features, "oracle": oracle}
         self.conn.execute(
             """
             INSERT INTO episodes (

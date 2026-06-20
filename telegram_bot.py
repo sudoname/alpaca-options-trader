@@ -381,6 +381,32 @@ class TelegramTradingBot:
         elif text == 'LEARNED_EDGE_LEADERBOARD' or text == '/LEARNED_EDGE_LEADERBOARD':
             return self.learned_edge_leaderboard(chat_id)
 
+        elif text == 'ORACLE_REGIME' or text == '/ORACLE_REGIME':
+            return self.oracle_regime(chat_id)
+
+        elif text == 'ORACLE_AGENT_REPORT' or text == '/ORACLE_AGENT_REPORT':
+            return self.oracle_agent_report(chat_id)
+
+        elif text == 'ORACLE_PROBABILITY_REPORT' or text == '/ORACLE_PROBABILITY_REPORT':
+            return self.oracle_probability_report(chat_id)
+
+        elif text == 'ORACLE_FEATURE_IMPORTANCE' or text == '/ORACLE_FEATURE_IMPORTANCE':
+            return self.oracle_feature_importance(chat_id)
+
+        elif text == 'ORACLE_WEIGHT_CHANGES' or text == '/ORACLE_WEIGHT_CHANGES':
+            return self.oracle_weight_changes(chat_id)
+
+        elif text == 'ORACLE_HYPOTHESIS_REPORT' or text == '/ORACLE_HYPOTHESIS_REPORT':
+            return self.oracle_hypothesis_report(chat_id)
+
+        elif text == 'ORACLE_REGIME_PERFORMANCE' or text == '/ORACLE_REGIME_PERFORMANCE':
+            return self.oracle_regime_performance(chat_id)
+
+        elif text.startswith('ORACLE_EXPLAIN') or text.startswith('/ORACLE_EXPLAIN'):
+            parts = text.replace('/ORACLE_EXPLAIN', '').replace('ORACLE_EXPLAIN', '', 1).split()
+            symbol = parts[0].strip().upper() if parts else ''
+            return self.oracle_explain(symbol, chat_id)
+
         elif text.startswith('STRATEGY_EV_MATRIX') or text.startswith('/STRATEGY_EV_MATRIX'):
             parts = text.replace('/STRATEGY_EV_MATRIX', '').replace('STRATEGY_EV_MATRIX', '', 1).split()
             symbol = parts[0].strip().upper() if parts else ''
@@ -2058,6 +2084,91 @@ Total symbols: `{len(self.supported_tickers)}`"""
         except Exception as e:
             return f"❌ Could not build learned edge leaderboard: {e}"
 
+    def oracle_regime(self, chat_id=None):
+        """Oracle 3.0: the current 8-label market regime + confidence + reasons.
+        SHADOW / ANALYTICS ONLY — labels the market, never trades or sizes.
+        Without a live market context it returns INSUFFICIENT_DATA.
+        """
+        try:
+            from oracle_intelligence_reports import generate_oracle_regime_report_text
+            return generate_oracle_regime_report_text()
+        except Exception as e:
+            return f"❌ Could not build oracle regime report: {e}"
+
+    def oracle_explain(self, symbol, chat_id=None):
+        """Oracle 3.0: per-ticker evidence -> agent votes -> probability ->
+        attribution. SHADOW / ANALYTICS ONLY. Without a live evidence context it
+        returns INSUFFICIENT_DATA.
+        """
+        symbol = (symbol or '').strip().upper()
+        if symbol and not re.fullmatch(r'[A-Z]{1,5}', symbol):
+            return "❌ Invalid symbol. Usage: `ORACLE_EXPLAIN SPY`"
+        try:
+            from oracle_intelligence_reports import generate_oracle_explain_text
+            return generate_oracle_explain_text(symbol or 'SPY')
+        except Exception as e:
+            return f"❌ Could not build oracle explain report: {e}"
+
+    def oracle_agent_report(self, chat_id=None):
+        """Oracle 3.0: per-agent hit-rate (win rate of trades where the agent had
+        conviction) vs the global base rate. SHADOW / ANALYTICS ONLY.
+        """
+        try:
+            from oracle_intelligence_reports import generate_oracle_agent_report_text
+            return generate_oracle_agent_report_text()
+        except Exception as e:
+            return f"❌ Could not build oracle agent report: {e}"
+
+    def oracle_probability_report(self, chat_id=None):
+        """Oracle 3.0: calibration (Brier score) of the model's P(call) against
+        realized wins, vs a 0.5 baseline. SHADOW / ANALYTICS ONLY.
+        """
+        try:
+            from oracle_intelligence_reports import generate_oracle_probability_report_text
+            return generate_oracle_probability_report_text()
+        except Exception as e:
+            return f"❌ Could not build oracle probability report: {e}"
+
+    def oracle_feature_importance(self, chat_id=None):
+        """Oracle 3.0: mean agent contribution share across closed trades.
+        SHADOW / ANALYTICS ONLY — nothing is traded, sized, blocked or altered.
+        """
+        try:
+            from oracle_intelligence_reports import generate_oracle_feature_importance_text
+            return generate_oracle_feature_importance_text()
+        except Exception as e:
+            return f"❌ Could not build oracle feature importance: {e}"
+
+    def oracle_weight_changes(self, chat_id=None):
+        """Oracle 3.0: adaptive voting-weight history + drift. SHADOW / ANALYTICS
+        ONLY — weights only feed shadow voting, never live sizing or gating.
+        """
+        try:
+            from oracle_intelligence_reports import generate_oracle_weight_changes_text
+            return generate_oracle_weight_changes_text()
+        except Exception as e:
+            return f"❌ Could not build oracle weight changes: {e}"
+
+    def oracle_hypothesis_report(self, chat_id=None):
+        """Oracle 3.0: catalogued hypotheses tested over the closed book
+        (delegates to the hypothesis engine). SHADOW / ADVISORY ONLY.
+        """
+        try:
+            from oracle_intelligence_reports import generate_oracle_hypothesis_report_text
+            return generate_oracle_hypothesis_report_text()
+        except Exception as e:
+            return f"❌ Could not build oracle hypothesis report: {e}"
+
+    def oracle_regime_performance(self, chat_id=None):
+        """Oracle 3.0: realized WR / avg P/L / PF / total by market regime over
+        regime-stamped closed trades. SHADOW / ANALYTICS ONLY.
+        """
+        try:
+            from oracle_intelligence_reports import generate_oracle_regime_performance_text
+            return generate_oracle_regime_performance_text()
+        except Exception as e:
+            return f"❌ Could not build oracle regime performance: {e}"
+
     def vol_edge(self, symbol, vix_arg=None, chat_id=None):
         """Phase 7A/8A: ADVISORY volatility edge + shadow recommendation.
 
@@ -2667,6 +2778,14 @@ Total symbols: `{len(self.supported_tickers)}`"""
 • `LEARNED_EDGE_REPORT` - Global prior + strongest/weakest setups by Bayesian-smoothed edge (shadow)
 • `ORACLE_SCORE_COMPARISON` - Replay history: Oracle v1 vs EV-first vs learned ranking (shadow)
 • `LEARNED_EDGE_LEADERBOARD` - Setups by sample-size-adjusted expected profitability (shadow)
+• `ORACLE_REGIME` - Current 8-label market regime + confidence + reasons (shadow)
+• `ORACLE_EXPLAIN TICKER` - Agent votes -> probability -> attribution for one ticker (shadow)
+• `ORACLE_AGENT_REPORT` - Per-agent hit-rate (WR where the agent had conviction) vs base rate (shadow)
+• `ORACLE_PROBABILITY_REPORT` - Calibration (Brier) of model P(call) vs realized wins (shadow)
+• `ORACLE_FEATURE_IMPORTANCE` - Mean agent contribution share across closed trades (shadow)
+• `ORACLE_WEIGHT_CHANGES` - Adaptive voting-weight history + drift (shadow)
+• `ORACLE_HYPOTHESIS_REPORT` - Catalogued hypotheses tested over the closed book (advisory)
+• `ORACLE_REGIME_PERFORMANCE` - Realized WR/avg/PF/total by market regime (shadow)
 • `VOL_EDGE TICKER [VIX]` - Volatility edge + shadow rec (advisory)
 • `ORACLE_DATASET_STATS` - Training dataset summary (advisory)
 • `ORACLE_STATS` - Oracle performance summary (analytics)

@@ -71,6 +71,12 @@ OPEN_FIELDS = (
     # Phase 10C: EV belief at entry (never recomputed after close).
     "expected_value", "ev_per_dollar_risk", "probability_of_profit",
     "ev_recommendation",
+    # Oracle 3.0 (Phase 3): Intelligence-layer belief at entry. Additive and
+    # shadow-only — populated only when the opener carries them; legacy rows and
+    # the default live path leave these None (behavior byte-identical).
+    "regime_label", "regime_confidence",
+    "model_p_call", "model_p_put",
+    "agent_contributions", "agent_votes",
 )
 
 # Fields appended at CLOSE time (the realized outcome only).
@@ -158,6 +164,16 @@ def build_open_snapshot(trade: dict, *,
     probability_of_profit = oa._to_float(trade.get("probability_of_profit"))
     ev_recommendation = trade.get("ev_recommendation")
 
+    # Oracle 3.0 (Phase 3): Intelligence-layer belief at entry, read straight
+    # from the trade record when present. None when the opener didn't carry the
+    # Intelligence Layer (default live path) — additive, fail-open, unchanged.
+    regime_label = trade.get("regime_label")
+    regime_confidence = oa._to_float(trade.get("regime_confidence"))
+    model_p_call = oa._to_float(trade.get("model_p_call"))
+    model_p_put = oa._to_float(trade.get("model_p_put"))
+    agent_contributions = trade.get("agent_contributions")
+    agent_votes = trade.get("agent_votes")
+
     result = ag.evaluate_setup(
         oracle_score=oracle_score, volatility_edge=volatility_edge,
         dte=dte, iv_rank=iv_rank, strategy=strategy,
@@ -187,6 +203,14 @@ def build_open_snapshot(trade: dict, *,
         "ev_per_dollar_risk": ev_per_dollar_risk,
         "probability_of_profit": probability_of_profit,
         "ev_recommendation": ev_recommendation,
+        # Oracle 3.0 (Phase 3): Intelligence-layer snapshot frozen at open
+        # (record_close never touches these). None on the default live path.
+        "regime_label": regime_label,
+        "regime_confidence": regime_confidence,
+        "model_p_call": model_p_call,
+        "model_p_put": model_p_put,
+        "agent_contributions": agent_contributions,
+        "agent_votes": agent_votes,
         # Close-time fields are filled in later by record_close (None until then).
         "date_closed": None,
         "pnl": None,
