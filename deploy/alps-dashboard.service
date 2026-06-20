@@ -1,0 +1,31 @@
+# Oracle Web Dashboard — read-only analytics UI.
+#
+# A SEPARATE process from alps-bot / alps-scheduler. It imports only read-only
+# analytics functions and exposes GET-only report endpoints, bound to localhost.
+# It cannot open, size, price, gate, or close any real or paper position.
+#
+# Install:
+#   sudo cp deploy/alps-dashboard.service /etc/systemd/system/alps-dashboard.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now alps-dashboard
+#   systemctl status alps-dashboard
+
+[Unit]
+Description=Oracle read-only analytics dashboard (Flask + waitress)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Reports + config_loader resolve .env and data files via paths RELATIVE to cwd,
+# so the working directory MUST be the deploy root.
+WorkingDirectory=/var/www/alps
+ExecStart=/var/www/alps/venv/bin/python oracle_dashboard.py
+Restart=always
+RestartSec=5
+# Binds 127.0.0.1:8787 (set in .env); Caddy is the sole public face.
+StandardOutput=append:/var/log/alps-dashboard.log
+StandardError=append:/var/log/alps-dashboard.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Oracle Dashboard</title>
+  <link rel="stylesheet" href="styles.css" />
+  <!-- Plotly via CDN — buildless, no bundler. -->
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">◎</span>
+      <h1>Oracle <span class="muted">analytics</span></h1>
+    </div>
+    <div class="controls">
+      <span id="status" class="status">loading…</span>
+      <span id="updated" class="updated"></span>
+      <label class="auto">
+        <input type="checkbox" id="autorefresh" checked /> auto
+      </label>
+      <button id="refresh" class="btn">Refresh</button>
+    </div>
+  </header>
+
+  <!-- KPI row -->
+  <section class="kpis" id="kpis">
+    <div class="kpi"><div class="kpi-label">Total P/L</div><div class="kpi-val" id="kpi-pnl">—</div></div>
+    <div class="kpi"><div class="kpi-label">Win rate</div><div class="kpi-val" id="kpi-winrate">—</div></div>
+    <div class="kpi"><div class="kpi-label">Open positions</div><div class="kpi-val" id="kpi-open">—</div></div>
+    <div class="kpi"><div class="kpi-label">Brier skill</div><div class="kpi-val" id="kpi-skill">—</div></div>
+  </section>
+
+  <main class="grid">
+    <section class="card" id="card-regime">
+      <h2>Market Regime</h2>
+      <div class="card-body"><div id="regime-gauge" class="plot"></div><div id="regime-reasons" class="reasons"></div></div>
+    </section>
+
+    <section class="card" id="card-probability">
+      <h2>Probability Calibration</h2>
+      <div class="card-body"><div id="prob-curve" class="plot"></div><div id="prob-stats" class="stats"></div></div>
+    </section>
+
+    <section class="card" id="card-agents">
+      <h2>Agent Hit-Rate &amp; Lift</h2>
+      <div class="card-body"><div id="agents-bars" class="plot"></div></div>
+    </section>
+
+    <section class="card" id="card-features">
+      <h2>Feature Importance</h2>
+      <div class="card-body"><div id="features-bars" class="plot"></div></div>
+    </section>
+
+    <section class="card" id="card-weights">
+      <h2>Adaptive Weights</h2>
+      <div class="card-body"><div id="weights-bars" class="plot"></div><div id="weights-drift" class="stats"></div></div>
+    </section>
+
+    <section class="card" id="card-ev">
+      <h2>EV Attribution</h2>
+      <div class="card-body"><div id="ev-bars" class="plot"></div></div>
+    </section>
+
+    <section class="card wide" id="card-regperf">
+      <h2>Regime Performance</h2>
+      <div class="card-body"><div id="regperf-table" class="tablewrap"></div></div>
+    </section>
+
+    <section class="card wide" id="card-hypotheses">
+      <h2>Hypotheses</h2>
+      <div class="card-body"><div id="hyp-table" class="tablewrap"></div></div>
+    </section>
+
+    <section class="card wide" id="card-positions">
+      <h2>Open Positions</h2>
+      <div class="card-body"><div id="pos-table" class="tablewrap"></div></div>
+    </section>
+
+    <section class="card" id="card-explain">
+      <h2>Explain a Ticker</h2>
+      <div class="card-body">
+        <form id="explain-form" class="explain-form">
+          <input id="explain-input" type="text" placeholder="e.g. SPY" maxlength="8" />
+          <button class="btn" type="submit">Explain</button>
+        </form>
+        <div id="explain-out" class="explain-out"></div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <span class="muted">Read-only analytics. This page cannot place, size, gate, or close any trade.</span>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
