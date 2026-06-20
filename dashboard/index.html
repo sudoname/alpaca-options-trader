@@ -26,10 +26,11 @@
 
   <!-- KPI row -->
   <section class="kpis" id="kpis">
-    <div class="kpi"><div class="kpi-label">Total P/L</div><div class="kpi-val" id="kpi-pnl">—</div></div>
+    <div class="kpi"><div class="kpi-label">Realized P/L</div><div class="kpi-val" id="kpi-pnl">—</div></div>
+    <div class="kpi"><div class="kpi-label">Today's P/L</div><div class="kpi-val" id="kpi-today">—</div></div>
     <div class="kpi"><div class="kpi-label">Win rate</div><div class="kpi-val" id="kpi-winrate">—</div></div>
     <div class="kpi"><div class="kpi-label">Open positions</div><div class="kpi-val" id="kpi-open">—</div></div>
-    <div class="kpi"><div class="kpi-label">Brier skill</div><div class="kpi-val" id="kpi-skill">—</div></div>
+    <div class="kpi"><div class="kpi-label">Closed trades</div><div class="kpi-val" id="kpi-closed">—</div></div>
   </section>
 
   <main class="grid">
@@ -71,6 +72,11 @@
     <section class="card wide" id="card-hypotheses">
       <h2>Hypotheses</h2>
       <div class="card-body"><div id="hyp-table" class="tablewrap"></div></div>
+    </section>
+
+    <section class="card" id="card-episodes">
+      <h2>RL Episodes</h2>
+      <div class="card-body"><div id="episodes-bars" class="plot"></div><div id="episodes-stats" class="stats"></div></div>
     </section>
 
     <section class="card wide" id="card-positions">

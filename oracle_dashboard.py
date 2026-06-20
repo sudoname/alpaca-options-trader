@@ -286,6 +286,32 @@ def create_app(config: "DashboardConfig" = None) -> Flask:
                     "account": account}
         return _cached_json("positions", provider)
 
+    # -- single-leg deployment views ------------------------------------- #
+    # This box runs the single-leg intraday bot; the Oracle/spread-paper
+    # analytics above are dormant here. These endpoints read the single-leg
+    # stores (active_trades.json / trading_history.json / realized_pnl_log.json
+    # / episodes.db) so the dashboard reflects the activity that exists.
+    @app.route("/api/single-leg/kpis")
+    def single_leg_kpis():
+        def provider():
+            import single_leg_reports as slr
+            return slr.compute_single_leg_kpis()
+        return _cached_json("single-leg-kpis", provider)
+
+    @app.route("/api/single-leg/positions")
+    def single_leg_positions():
+        def provider():
+            import single_leg_reports as slr
+            return slr.compute_single_leg_positions()
+        return _cached_json("single-leg-positions", provider)
+
+    @app.route("/api/single-leg/episodes")
+    def single_leg_episodes():
+        def provider():
+            import single_leg_reports as slr
+            return slr.compute_single_leg_episodes()
+        return _cached_json("single-leg-episodes", provider)
+
     # -- static frontend ------------------------------------------------- #
     @app.route("/")
     def index():
@@ -323,6 +349,8 @@ def _self_test() -> int:
         "/api/regime-performance", "/api/hypotheses", "/api/calibration/pop",
         "/api/calibration/ev", "/api/calibration/triple-gap",
         "/api/explain/SPY", "/api/positions",
+        "/api/single-leg/kpis", "/api/single-leg/positions",
+        "/api/single-leg/episodes",
     )
     for path in endpoints:
         r = client.get(path)

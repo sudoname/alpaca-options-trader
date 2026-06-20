@@ -60,16 +60,41 @@ function setSigned(elId, value, text) {
 }
 
 // ---- KPI row --------------------------------------------------------------
+// Sourced from the single-leg stores (realized_pnl_log / trading_history /
+// active_trades) — the data this deployment actually produces.
 async function loadKpis() {
-  const [daily, prob] = await Promise.all([api("daily"), api("probability")]);
-  const acct = (daily && daily.account) || {};
-  setSigned("kpi-pnl", acct.total_pnl, fmtMoney(acct.total_pnl));
+  const k = await api("single-leg/kpis");
+  const usable = isUsable(k);
+  setSigned("kpi-pnl", usable ? k.realized_total : null,
+    usable ? fmtMoney(k.realized_total) : "—");
+  setSigned("kpi-today", usable ? k.today_realized : null,
+    usable ? fmtMoney(k.today_realized) : "—");
   document.getElementById("kpi-winrate").textContent =
-    acct.win_rate != null ? fmtPct(acct.win_rate) : "—";
+    (usable && k.win_rate != null) ? fmtPct(k.win_rate) : "—";
   document.getElementById("kpi-open").textContent =
-    acct.open_positions != null ? acct.open_positions : "—";
-  document.getElementById("kpi-skill").textContent =
-    (prob && prob.skill != null) ? fmtNum(prob.skill, 3) : "—";
+    (usable && k.open_positions != null) ? k.open_positions : "—";
+  document.getElementById("kpi-closed").textContent =
+    (usable && k.closed_trades != null) ? k.closed_trades : "—";
+}
+
+// ---- RL Episodes ----------------------------------------------------------
+async function loadEpisodes() {
+  const d = await api("single-leg/episodes");
+  const statsEl = document.getElementById("episodes-stats");
+  const counts = (d && d.chosen_action_counts) || {};
+  const labels = Object.keys(counts);
+  if (!isUsable(d) || !labels.length) {
+    placeholder("episodes-bars", d);
+    if (statsEl) statsEl.innerHTML = isUsable(d) ? "" : badge(d);
+    return;
+  }
+  Plotly.react("episodes-bars", [
+    { x: labels, y: labels.map(k => counts[k]), type: "bar", marker: { color: C.accent } },
+  ], { ...PLOT_LAYOUT, height: 220, yaxis: { ...PLOT_LAYOUT.yaxis, title: "episodes" } }, PLOT_CFG);
+  const s = d.stats || {};
+  statsEl.innerHTML =
+    `total <b>${s.total ?? 0}</b> · completed <b>${s.completed ?? 0}</b> · ` +
+    `win rate <b>${fmtPct(s.win_rate)}</b> · mean net <b>${fmtNum(s.mean_net_pnl_pct, 2)}%</b>`;
 }
 
 // ---- Regime ---------------------------------------------------------------
@@ -210,14 +235,16 @@ async function loadHypotheses() {
 }
 
 async function loadPositions() {
-  const d = await api("positions");
+  const d = await api("single-leg/positions");
   const rows = (d && Array.isArray(d.positions)) ? d.positions : null;
   renderTable("pos-table", [
-    { label: "Symbol", get: r => escapeHtml(String(r.symbol ?? r.ticker ?? "—")) },
-    { label: "Strategy", get: r => escapeHtml(String(r.strategy_name ?? r.strategy ?? "—")) },
-    { label: "Opened", get: r => escapeHtml(String(r.opened_at ?? r.entry_date ?? r.date ?? "—")) },
-    { label: "Credit/Debit", num: true, get: r => fmtNum(r.net_credit_or_debit ?? r.net, 2) },
-    { label: "Unrealized", num: true, get: r => signedCell(r.unrealized_pnl ?? r.open_pnl) },
+    { label: "Symbol", get: r => escapeHtml(String(r.symbol ?? "—")) },
+    { label: "Underlying", get: r => escapeHtml(String(r.underlying ?? "—")) },
+    { label: "Qty", num: true, get: r => r.quantity ?? "—" },
+    { label: "Entry", num: true, get: r => fmtNum(r.entry_price, 2) },
+    { label: "Opened", get: r => escapeHtml(String(r.entry_time ?? "—")) },
+    { label: "EV", num: true, get: r => fmtNum(r.expected_value, 2) },
+    { label: "PoP", num: true, get: r => r.probability_of_profit != null ? fmtPct(r.probability_of_profit, 0) : "—" },
   ], rows && rows.length ? rows : null, d);
 }
 
@@ -268,7 +295,7 @@ async function refreshAll() {
     await Promise.all([
       loadKpis(), loadRegime(), loadProbability(), loadAgents(),
       loadFeatures(), loadWeights(), loadEv(), loadRegimePerf(),
-      loadHypotheses(), loadPositions(),
+      loadHypotheses(), loadEpisodes(), loadPositions(),
     ]);
     status.textContent = "live"; status.className = "status ok";
   } catch (e) {

@@ -44,6 +44,8 @@ class TestHealthAndFailOpen(unittest.TestCase):
         "/api/regime-performance", "/api/hypotheses", "/api/calibration/pop",
         "/api/calibration/ev", "/api/calibration/triple-gap",
         "/api/explain/SPY", "/api/positions",
+        "/api/single-leg/kpis", "/api/single-leg/positions",
+        "/api/single-leg/episodes",
     )
 
     def test_every_endpoint_200_with_verdict(self):
