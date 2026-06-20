@@ -200,16 +200,55 @@ async function loadEv() {
 }
 
 // ---- Tables ---------------------------------------------------------------
-function renderTable(elId, columns, rows, d) {
+const sortState = {}; // elId -> { idx, dir }  (dir: 1 asc, -1 desc)
+
+function cmpVals(a, b) {
+  const an = (a === "" || a === undefined) ? null : a;
+  const bn = (b === "" || b === undefined) ? null : b;
+  if (an == null && bn == null) return 0;
+  if (an == null) return 1;   // blanks sort last
+  if (bn == null) return -1;
+  if (typeof an === "number" && typeof bn === "number") return an - bn;
+  return String(an).localeCompare(String(bn));
+}
+
+// columns: [{ label, num, get:r=>html, sort?:r=>rawValue }]
+// opts.sortable -> clickable headers toggle asc/desc; sort key is `sort` (or `get`).
+function renderTable(elId, columns, rows, d, opts = {}) {
   const el = document.getElementById(elId);
   if (!rows || !rows.length) { el.innerHTML = `<div style="padding:20px 0">${badge(d)}</div>`; return; }
-  const head = "<tr>" + columns.map(c => `<th>${escapeHtml(c.label)}</th>`).join("") + "</tr>";
-  const body = rows.map(r => "<tr>" + columns.map(c => {
+  const sortable = !!opts.sortable;
+  let display = rows;
+  const st = sortState[elId];
+  if (sortable && st && columns[st.idx]) {
+    const col = columns[st.idx];
+    const acc = col.sort || col.get;
+    display = rows.slice().sort((a, b) => cmpVals(acc(a), acc(b)) * st.dir);
+  }
+  const head = "<tr>" + columns.map((c, i) => {
+    const active = sortable && st && st.idx === i;
+    const arrow = active ? (st.dir > 0 ? " ▲" : " ▼") : "";
+    const cls = sortable ? ' class="sortable"' : "";
+    const attr = sortable ? ` data-col="${i}"` : "";
+    return `<th${cls}${attr}>${escapeHtml(c.label)}${arrow}</th>`;
+  }).join("") + "</tr>";
+  const body = display.map(r => "<tr>" + columns.map(c => {
     const v = c.get(r);
     const cls = c.num ? "num" : "";
     return `<td class="${cls}">${v}</td>`;
   }).join("") + "</tr>").join("");
   el.innerHTML = `<table><thead>${head}</thead><tbody>${body}</tbody></table>`;
+  if (sortable) {
+    el.querySelectorAll("th[data-col]").forEach(th => {
+      th.addEventListener("click", () => {
+        const idx = Number(th.getAttribute("data-col"));
+        const prev = sortState[elId];
+        sortState[elId] = (prev && prev.idx === idx)
+          ? { idx, dir: -prev.dir } : { idx, dir: 1 };
+        renderTable(elId, columns, rows, d, opts);
+      });
+    });
+  }
 }
 
 async function loadRegimePerf() {
@@ -237,15 +276,19 @@ async function loadHypotheses() {
 async function loadPositions() {
   const d = await api("single-leg/positions");
   const rows = (d && Array.isArray(d.positions)) ? d.positions : null;
+  const num = v => (v == null || isNaN(v)) ? null : Number(v);
   renderTable("pos-table", [
-    { label: "Symbol", get: r => escapeHtml(String(r.symbol ?? "—")) },
-    { label: "Underlying", get: r => escapeHtml(String(r.underlying ?? "—")) },
-    { label: "Qty", num: true, get: r => r.quantity ?? "—" },
-    { label: "Entry", num: true, get: r => fmtNum(r.entry_price, 2) },
-    { label: "Opened", get: r => escapeHtml(String(r.entry_time ?? "—")) },
-    { label: "EV", num: true, get: r => fmtNum(r.expected_value, 2) },
-    { label: "PoP", num: true, get: r => r.probability_of_profit != null ? fmtPct(r.probability_of_profit, 0) : "—" },
-  ], rows && rows.length ? rows : null, d);
+    { label: "Symbol", get: r => escapeHtml(String(r.symbol ?? "—")), sort: r => r.symbol },
+    { label: "Underlying", get: r => escapeHtml(String(r.underlying ?? "—")), sort: r => r.underlying },
+    { label: "Qty", num: true, get: r => r.quantity ?? "—", sort: r => num(r.quantity) },
+    { label: "Entry", num: true, get: r => fmtNum(r.entry_price, 2), sort: r => num(r.entry_price) },
+    { label: "Current", num: true, get: r => fmtNum(r.current_price, 2), sort: r => num(r.current_price) },
+    { label: "P/L $", num: true, get: r => signedCell(r.unrealized_pl), sort: r => num(r.unrealized_pl) },
+    { label: "P/L %", num: true, get: r => signedPctCell(r.unrealized_plpc), sort: r => num(r.unrealized_plpc) },
+    { label: "Opened", get: r => escapeHtml(String(r.entry_time ?? "—")), sort: r => r.entry_time },
+    { label: "EV", num: true, get: r => fmtNum(r.expected_value, 2), sort: r => num(r.expected_value) },
+    { label: "PoP", num: true, get: r => r.probability_of_profit != null ? fmtPct(r.probability_of_profit, 0) : "—", sort: r => num(r.probability_of_profit) },
+  ], rows && rows.length ? rows : null, d, { sortable: true });
 }
 
 // ---- Explain --------------------------------------------------------------
@@ -275,6 +318,11 @@ function signedCell(v) {
   if (v == null || isNaN(v)) return "—";
   const cls = v > 0 ? "pos" : (v < 0 ? "neg" : "");
   return `<span class="${cls}">${fmtMoney(v)}</span>`;
+}
+function signedPctCell(v) {
+  if (v == null || isNaN(v)) return "—";
+  const cls = v > 0 ? "pos" : (v < 0 ? "neg" : "");
+  return `<span class="${cls}">${fmtPct(v, 1)}</span>`;
 }
 function conclusionBadge(c) {
   const s = String(c || "").toUpperCase();

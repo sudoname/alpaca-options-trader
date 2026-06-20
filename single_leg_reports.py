@@ -24,7 +24,7 @@ missing/corrupt source yields a verdict-carrying dict, never an exception.
 import json
 import os
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 VERDICT_OK = "OK"
 VERDICT_INSUFFICIENT = "INSUFFICIENT_DATA"
@@ -76,6 +76,59 @@ def _coerce_float(v):
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+# --------------------------------------------------------------------------- #
+# Live broker marks (READ-ONLY GET /v2/positions)
+# --------------------------------------------------------------------------- #
+def _fetch_broker_marks() -> Dict[str, Dict]:
+    """Read-only snapshot of current marks + unrealized P/L, keyed by OCC symbol.
+
+    Issues a single ``GET /v2/positions`` to Alpaca (paper or live, per
+    ``ALPACA_PAPER``) and maps each broker position to
+    ``{current_price, unrealized_pl, unrealized_plpc, market_value}``. This is
+    the SAME endpoint the bot reads to monitor positions; it returns state and
+    cannot mutate anything. Fails open to ``{}`` on any error (no creds, no
+    network, non-200, malformed body) so the positions widget still renders.
+    """
+    try:
+        from config_loader import ConfigLoader
+        import requests
+
+        env = ConfigLoader()
+        key = env.get("ALPACA_API_KEY", "")
+        secret = env.get("ALPACA_SECRET_KEY", "")
+        if not key or not secret:
+            return {}
+        paper = str(env.get("ALPACA_PAPER", "true")).lower() == "true"
+        base = ("https://paper-api.alpaca.markets" if paper
+                else "https://api.alpaca.markets")
+        resp = requests.get(
+            base + "/v2/positions",
+            headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret},
+            timeout=8,
+        )
+        if resp.status_code != 200:
+            return {}
+        rows = resp.json()
+        if not isinstance(rows, list):
+            return {}
+        marks: Dict[str, Dict] = {}
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            sym = r.get("symbol")
+            if not sym:
+                continue
+            marks[sym] = {
+                "current_price": _coerce_float(r.get("current_price")),
+                "unrealized_pl": _coerce_float(r.get("unrealized_pl")),
+                "unrealized_plpc": _coerce_float(r.get("unrealized_plpc")),
+                "market_value": _coerce_float(r.get("market_value")),
+            }
+        return marks
+    except Exception:
+        return {}
 
 
 # --------------------------------------------------------------------------- #
@@ -134,19 +187,41 @@ def compute_single_leg_kpis(
 # --------------------------------------------------------------------------- #
 # Open positions
 # --------------------------------------------------------------------------- #
-def compute_single_leg_positions(*, active_path: str = ACTIVE_TRADES_FILE) -> Dict:
-    """The bot's currently-open single-leg option positions (display shape)."""
+def compute_single_leg_positions(
+    *,
+    active_path: str = ACTIVE_TRADES_FILE,
+    fetch_marks: Optional[Callable[[], Dict[str, Dict]]] = None,
+) -> Dict:
+    """The bot's currently-open single-leg option positions (display shape).
+
+    Each row is enriched with live ``current_price`` / ``unrealized_pl`` ($) /
+    ``unrealized_plpc`` (fraction) from a read-only ``GET /v2/positions`` snapshot,
+    joined to the on-disk position by OCC ``symbol``. ``fetch_marks`` is injectable
+    so the self-test / unit tests stay offline; it defaults to the live broker
+    fetch, which itself fails open to ``{}`` (positions then show "—" for marks).
+    """
     active = _load_active_trades(active_path)
     if not active:
-        return {"verdict": VERDICT_INSUFFICIENT, "positions": [], "count": 0}
+        return {"verdict": VERDICT_INSUFFICIENT, "positions": [], "count": 0,
+                "marks_available": False}
+
+    if fetch_marks is None:
+        fetch_marks = _fetch_broker_marks
+    try:
+        marks = fetch_marks() or {}
+    except Exception:
+        marks = {}
 
     positions = []
     for t in active:
         if not isinstance(t, dict):
             continue
         metrics = t.get("metrics") if isinstance(t.get("metrics"), dict) else {}
+        sym = t.get("symbol")
+        m = marks.get(sym) if isinstance(marks, dict) else None
+        m = m if isinstance(m, dict) else {}
         positions.append({
-            "symbol": t.get("symbol"),
+            "symbol": sym,
             "underlying": t.get("underlying_symbol"),
             "quantity": t.get("quantity"),
             "entry_price": t.get("entry_price"),
@@ -157,8 +232,12 @@ def compute_single_leg_positions(*, active_path: str = ACTIVE_TRADES_FILE) -> Di
             "source": t.get("source"),
             "expected_value": metrics.get("expected_value"),
             "probability_of_profit": metrics.get("probability_of_profit"),
+            "current_price": m.get("current_price"),
+            "unrealized_pl": m.get("unrealized_pl"),
+            "unrealized_plpc": m.get("unrealized_plpc"),
         })
-    return {"verdict": VERDICT_OK, "positions": positions, "count": len(positions)}
+    return {"verdict": VERDICT_OK, "positions": positions, "count": len(positions),
+            "marks_available": bool(marks)}
 
 
 # --------------------------------------------------------------------------- #
@@ -227,7 +306,8 @@ def _self_test() -> int:
     if k.get("verdict") != VERDICT_INSUFFICIENT or k.get("open_positions") != 0:
         print("FAIL: empty kpis should be INSUFFICIENT_DATA:", k); ok = False
     if compute_single_leg_positions(
-            active_path=os.path.join(d, "none.json")).get("verdict") \
+            active_path=os.path.join(d, "none.json"),
+            fetch_marks=lambda: {}).get("verdict") \
             != VERDICT_INSUFFICIENT:
         print("FAIL: empty positions should be INSUFFICIENT_DATA"); ok = False
     if compute_single_leg_episodes(
@@ -276,11 +356,29 @@ def _self_test() -> int:
     if abs(k.get("win_rate") - (2.0 / 3.0)) > 1e-6:
         print("FAIL: win_rate:", k); ok = False
 
-    p = compute_single_leg_positions(active_path=active_p)
+    stub_marks = {
+        "SPY260101C00500000": {"current_price": 1.80, "unrealized_pl": 60.0,
+                               "unrealized_plpc": 0.20, "market_value": 360.0},
+    }
+    p = compute_single_leg_positions(active_path=active_p,
+                                     fetch_marks=lambda: stub_marks)
     if p.get("verdict") != VERDICT_OK or p.get("count") != 2:
         print("FAIL: positions:", p); ok = False
     if p["positions"][0].get("underlying") != "SPY":
         print("FAIL: position underlying mapping:", p["positions"][0]); ok = False
+    if not p.get("marks_available"):
+        print("FAIL: marks_available should be True with a stub:", p); ok = False
+    if abs((p["positions"][0].get("unrealized_pl") or 0) - 60.0) > 1e-6:
+        print("FAIL: P/L join by symbol:", p["positions"][0]); ok = False
+    # Unmatched symbol -> mark fields stay None (fail-open display "—").
+    if p["positions"][1].get("current_price") is not None:
+        print("FAIL: unmatched mark should be None:", p["positions"][1]); ok = False
+    # A raising fetcher must not break the widget.
+    def _boom():
+        raise RuntimeError("broker down")
+    p2 = compute_single_leg_positions(active_path=active_p, fetch_marks=_boom)
+    if p2.get("verdict") != VERDICT_OK or p2.get("marks_available"):
+        print("FAIL: positions should fail open when fetch raises:", p2); ok = False
 
     # 3. Episodes against a real in-temp SQLite store with one closed episode.
     db_p = os.path.join(d, "episodes.db")

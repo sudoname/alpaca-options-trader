@@ -74,6 +74,8 @@ body {
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
 th { color: var(--muted); font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: .03em; }
+th.sortable { cursor: pointer; user-select: none; }
+th.sortable:hover { color: var(--text); }
 td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .pos { color: var(--green); } .neg { color: var(--red); }
 

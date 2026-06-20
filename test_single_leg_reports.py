@@ -73,28 +73,71 @@ class TestPositions(unittest.TestCase):
     def setUp(self):
         self.d = tempfile.mkdtemp()
 
+    def _write_two(self):
+        p = os.path.join(self.d, "a.json")
+        with open(p, "w") as f:
+            json.dump([
+                {"symbol": "SPY260101C00500000",
+                 "underlying_symbol": "SPY", "quantity": 2,
+                 "entry_price": 1.5, "entry_time": "2026-01-01T10:00:00",
+                 "metrics": {"expected_value": 0.2,
+                             "probability_of_profit": 0.55}},
+                {"symbol": "QQQ260101P00400000",
+                 "underlying_symbol": "QQQ", "quantity": 1, "entry_price": 2.0},
+            ], f)
+        return p
+
     def test_empty(self):
+        # fetch_marks stub keeps the test offline (defends against a real broker call).
         out = slr.compute_single_leg_positions(
-            active_path=os.path.join(self.d, "none.json"))
+            active_path=os.path.join(self.d, "none.json"),
+            fetch_marks=lambda: {})
         self.assertEqual(out["verdict"], "INSUFFICIENT_DATA")
         self.assertEqual(out["positions"], [])
 
     def test_shape(self):
-        p = os.path.join(self.d, "a.json")
-        with open(p, "w") as f:
-            json.dump([{"symbol": "SPY260101C00500000",
-                        "underlying_symbol": "SPY", "quantity": 2,
-                        "entry_price": 1.5, "entry_time": "2026-01-01T10:00:00",
-                        "metrics": {"expected_value": 0.2,
-                                    "probability_of_profit": 0.55}}], f)
-        out = slr.compute_single_leg_positions(active_path=p)
+        p = self._write_two()
+        out = slr.compute_single_leg_positions(active_path=p,
+                                               fetch_marks=lambda: {})
         self.assertEqual(out["verdict"], "OK")
-        self.assertEqual(out["count"], 1)
+        self.assertEqual(out["count"], 2)
+        self.assertFalse(out["marks_available"])
         row = out["positions"][0]
         self.assertEqual(row["underlying"], "SPY")
         self.assertEqual(row["quantity"], 2)
         self.assertAlmostEqual(row["expected_value"], 0.2)
         self.assertAlmostEqual(row["probability_of_profit"], 0.55)
+        # No marks -> P/L fields present but None (render as "—").
+        self.assertIsNone(row["current_price"])
+        self.assertIsNone(row["unrealized_pl"])
+
+    def test_marks_join_by_symbol(self):
+        p = self._write_two()
+        marks = {"SPY260101C00500000": {
+            "current_price": 1.8, "unrealized_pl": 60.0,
+            "unrealized_plpc": 0.2, "market_value": 360.0}}
+        out = slr.compute_single_leg_positions(active_path=p,
+                                               fetch_marks=lambda: marks)
+        self.assertTrue(out["marks_available"])
+        spy = out["positions"][0]
+        self.assertAlmostEqual(spy["current_price"], 1.8)
+        self.assertAlmostEqual(spy["unrealized_pl"], 60.0)
+        self.assertAlmostEqual(spy["unrealized_plpc"], 0.2)
+        # Unmatched symbol keeps None marks.
+        qqq = out["positions"][1]
+        self.assertIsNone(qqq["current_price"])
+        self.assertIsNone(qqq["unrealized_pl"])
+
+    def test_fetch_raises_fails_open(self):
+        p = self._write_two()
+
+        def boom():
+            raise RuntimeError("broker down")
+
+        out = slr.compute_single_leg_positions(active_path=p, fetch_marks=boom)
+        self.assertEqual(out["verdict"], "OK")
+        self.assertFalse(out["marks_available"])
+        self.assertIsNone(out["positions"][0]["current_price"])
 
 
 class TestEpisodes(unittest.TestCase):
@@ -147,6 +190,32 @@ class TestReadOnlyProviders(unittest.TestCase):
             for tok in forbidden:
                 self.assertNotIn(tok, src,
                                  msg=f"{fn.__name__} contains write token {tok!r}")
+
+    def test_broker_fetch_is_get_only(self):
+        # The live marks fetch must only ever issue a read-only HTTP GET — never
+        # a mutating verb against the broker.
+        import inspect
+        src = inspect.getsource(slr._fetch_broker_marks)
+        self.assertIn("requests.get(", src)
+        for verb in ("requests.post(", "requests.put(", "requests.delete(",
+                     "requests.patch("):
+            self.assertNotIn(verb, src,
+                             msg=f"_fetch_broker_marks must not call {verb}")
+
+    def test_broker_fetch_no_creds_returns_empty(self):
+        # With creds blanked it must fail open to {} without any network call.
+        import config_loader
+        orig = config_loader.ConfigLoader
+
+        class _NoCreds:
+            def get(self, name, default=""):
+                return "" if name in ("ALPACA_API_KEY", "ALPACA_SECRET_KEY") else default
+
+        config_loader.ConfigLoader = _NoCreds
+        try:
+            self.assertEqual(slr._fetch_broker_marks(), {})
+        finally:
+            config_loader.ConfigLoader = orig
 
 
 class TestSelfTest(unittest.TestCase):
