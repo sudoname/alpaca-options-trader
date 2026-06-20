@@ -236,8 +236,24 @@ def compute_single_leg_positions(
             "unrealized_pl": m.get("unrealized_pl"),
             "unrealized_plpc": m.get("unrealized_plpc"),
         })
-    return {"verdict": VERDICT_OK, "positions": positions, "count": len(positions),
-            "marks_available": bool(marks)}
+
+    # Green/red split of marked positions by unrealized P/L (breakeven = neither).
+    green = sum(1 for p in positions
+                if p["unrealized_pl"] is not None and p["unrealized_pl"] > 0)
+    red = sum(1 for p in positions
+              if p["unrealized_pl"] is not None and p["unrealized_pl"] < 0)
+    marked = green + red
+    return {
+        "verdict": VERDICT_OK,
+        "positions": positions,
+        "count": len(positions),
+        "marks_available": bool(marks),
+        "green_count": green,
+        "red_count": red,
+        "marked_count": marked,
+        "green_pct": (green / marked) if marked else None,
+        "red_pct": (red / marked) if marked else None,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -370,6 +386,10 @@ def _self_test() -> int:
         print("FAIL: marks_available should be True with a stub:", p); ok = False
     if abs((p["positions"][0].get("unrealized_pl") or 0) - 60.0) > 1e-6:
         print("FAIL: P/L join by symbol:", p["positions"][0]); ok = False
+    # One marked position, green -> green_count 1 / red 0 / green_pct 1.0.
+    if p.get("green_count") != 1 or p.get("red_count") != 0 \
+            or abs((p.get("green_pct") or 0) - 1.0) > 1e-6:
+        print("FAIL: green/red split:", p); ok = False
     # Unmatched symbol -> mark fields stay None (fail-open display "—").
     if p["positions"][1].get("current_price") is not None:
         print("FAIL: unmatched mark should be None:", p["positions"][1]); ok = False

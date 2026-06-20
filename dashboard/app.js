@@ -276,6 +276,7 @@ async function loadHypotheses() {
 async function loadPositions() {
   const d = await api("single-leg/positions");
   const rows = (d && Array.isArray(d.positions)) ? d.positions : null;
+  renderGreenRed(d);
   const num = v => (v == null || isNaN(v)) ? null : Number(v);
   renderTable("pos-table", [
     { label: "Symbol", get: r => escapeHtml(String(r.symbol ?? "—")), sort: r => r.symbol },
@@ -311,6 +312,27 @@ async function explainTicker(t) {
     `<div class="prob-row">${pill("P(call)", p.call ?? p.p_call)}${pill("P(put)", p.put ?? p.p_put)}${pill("P(no-trade)", p.no_trade ?? p.p_no_trade)}</div>` +
     (voteRows ? `<div class="tablewrap"><table><thead><tr><th>Agent</th><th>Bull</th><th>Bear</th><th>Conf</th></tr></thead><tbody>${voteRows}</tbody></table></div>` : "") +
     (d.explanation ? `<p class="muted">${escapeHtml(String(d.explanation))}</p>` : "");
+}
+
+// ---- Green vs Red tile ----------------------------------------------------
+// Share of currently-open positions in profit (green) vs loss (red), by live
+// unrealized P/L. Needs broker marks; degrades to "—" without them.
+function renderGreenRed(d) {
+  const val = document.getElementById("kpi-greenred");
+  const sub = document.getElementById("kpi-greenred-sub");
+  if (!val) return;
+  const ok = isUsable(d) && d.marked_count > 0 && d.green_pct != null;
+  if (!ok) {
+    val.textContent = "—"; val.classList.remove("pos", "neg");
+    if (sub) sub.innerHTML = d && d.marks_available === false ? "no live marks" : "";
+    return;
+  }
+  val.innerHTML = `<span class="pos">${fmtPct(d.green_pct, 0)}</span>` +
+    ` <span class="muted">/</span> <span class="neg">${fmtPct(d.red_pct, 0)}</span>`;
+  val.classList.remove("pos", "neg");
+  if (sub) sub.innerHTML =
+    `<span class="pos">${d.green_count} green</span> · ` +
+    `<span class="neg">${d.red_count} red</span> of ${d.marked_count}`;
 }
 
 // ---- misc render helpers --------------------------------------------------

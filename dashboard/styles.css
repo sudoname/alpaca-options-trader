@@ -52,6 +52,8 @@ body {
 .kpi-val { font-size: 28px; font-weight: 700; margin-top: 6px; }
 .kpi-val.pos { color: var(--green); }
 .kpi-val.neg { color: var(--red); }
+.kpi-sub { font-size: 12px; margin-top: 4px; color: var(--muted); }
+.kpi-sub .pos { color: var(--green); } .kpi-sub .neg { color: var(--red); }
 
 .grid {
   display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px;
