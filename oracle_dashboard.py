@@ -147,6 +147,18 @@ def create_app(config: "DashboardConfig" = None) -> Flask:
             return {}
     app.config.setdefault("EXPLAIN_CTX_BUILDER", _default_explain_ctx)
 
+    # Read-only Fear & Greed report for /api/sentiment. Injectable so the
+    # self-test / unit tests stay offline (override with a stub); the default
+    # blends CNN's index with a self-computed score over read-only market data
+    # and itself fails open to INSUFFICIENT_DATA on missing creds / no network.
+    def _default_sentiment():
+        try:
+            import sentiment_report
+            return sentiment_report.compute_sentiment_report()
+        except Exception:
+            return {"verdict": VERDICT_INSUFFICIENT}
+    app.config.setdefault("SENTIMENT_REPORT", _default_sentiment)
+
     # -- basic-auth (defense-in-depth) ----------------------------------- #
     def _check_auth(auth) -> bool:
         if auth is None:
@@ -197,6 +209,13 @@ def create_app(config: "DashboardConfig" = None) -> Flask:
             import oracle_intelligence_reports as oir
             return oir.compute_oracle_regime_report()
         return _cached_json("regime", provider)
+
+    @app.route("/api/sentiment")
+    def sentiment():
+        def provider():
+            fn = app.config.get("SENTIMENT_REPORT")
+            return fn() if fn else {"verdict": VERDICT_INSUFFICIENT}
+        return _cached_json("sentiment", provider)
 
     @app.route("/api/agents")
     def agents():
@@ -354,6 +373,9 @@ def _self_test() -> int:
     # Keep explain offline+deterministic: stub the context builder (the live
     # builder would otherwise issue read-only Alpaca GETs during the gate).
     app.config["EXPLAIN_CTX_BUILDER"] = lambda s: {}
+    # Keep sentiment offline+deterministic: the live report would otherwise scrape
+    # CNN and issue read-only Alpaca GETs during the gate.
+    app.config["SENTIMENT_REPORT"] = lambda: {"verdict": VERDICT_INSUFFICIENT}
     client = app.test_client()
     r = client.get("/api/health")
     if r.status_code != 200 or r.get_json().get("status") != "ok":
@@ -362,7 +384,8 @@ def _self_test() -> int:
     # 2. Each analytics endpoint returns 200 + JSON carrying a verdict, even
     #    with empty data sources (fail-open, never a 500).
     endpoints = (
-        "/api/daily", "/api/regime", "/api/agents", "/api/probability",
+        "/api/daily", "/api/regime", "/api/sentiment", "/api/agents",
+        "/api/probability",
         "/api/weights", "/api/feature-importance", "/api/ev-attribution",
         "/api/regime-performance", "/api/hypotheses", "/api/calibration/pop",
         "/api/calibration/ev", "/api/calibration/triple-gap",

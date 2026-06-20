@@ -32,12 +32,18 @@
     <div class="kpi"><div class="kpi-label">Open positions</div><div class="kpi-val" id="kpi-open">—</div></div>
     <div class="kpi"><div class="kpi-label">Closed trades</div><div class="kpi-val" id="kpi-closed">—</div></div>
     <div class="kpi"><div class="kpi-label">Green vs Red</div><div class="kpi-val" id="kpi-greenred">—</div><div class="kpi-sub" id="kpi-greenred-sub"></div></div>
+    <div class="kpi"><div class="kpi-label">Fear &amp; Greed</div><div class="kpi-val" id="kpi-sentiment">—</div><div class="kpi-sub" id="kpi-sentiment-sub"></div></div>
   </section>
 
   <main class="grid">
     <section class="card" id="card-regime">
       <h2>Market Regime</h2>
       <div class="card-body"><div id="regime-gauge" class="plot"></div><div id="regime-reasons" class="reasons"></div></div>
+    </section>
+
+    <section class="card" id="card-sentiment">
+      <h2>Market Sentiment <span class="muted">Fear &amp; Greed</span></h2>
+      <div class="card-body"><div id="sentiment-gauge" class="plot"></div><div id="sentiment-components" class="reasons"></div></div>
     </section>
 
     <section class="card" id="card-probability">

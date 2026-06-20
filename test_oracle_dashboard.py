@@ -37,6 +37,8 @@ def _app(user="", password="", ttl=0, explain_ctx=None):
     """
     app = create_app(_cfg(user, password, ttl))
     app.config["EXPLAIN_CTX_BUILDER"] = explain_ctx or (lambda s: {})
+    # Keep sentiment offline: the live report scrapes CNN + GETs Alpaca bars.
+    app.config["SENTIMENT_REPORT"] = lambda: {"verdict": "INSUFFICIENT_DATA"}
     return app
 
 
@@ -50,7 +52,8 @@ class TestHealthAndFailOpen(unittest.TestCase):
         self.assertEqual(r.get_json().get("status"), "ok")
 
     ALL_ENDPOINTS = (
-        "/api/daily", "/api/regime", "/api/agents", "/api/probability",
+        "/api/daily", "/api/regime", "/api/sentiment", "/api/agents",
+        "/api/probability",
         "/api/weights", "/api/feature-importance", "/api/ev-attribution",
         "/api/regime-performance", "/api/hypotheses", "/api/calibration/pop",
         "/api/calibration/ev", "/api/calibration/triple-gap",
@@ -128,6 +131,37 @@ class TestExplainContext(unittest.TestCase):
 
         client = _app(explain_ctx=boom).test_client()
         r = client.get("/api/explain/SPY")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json().get("verdict"), "ERROR")
+
+
+class TestSentiment(unittest.TestCase):
+    """The /api/sentiment route surfaces the injectable SENTIMENT_REPORT."""
+
+    def _client(self, report):
+        app = create_app(_cfg())
+        app.config["SENTIMENT_REPORT"] = lambda: report
+        return app.test_client()
+
+    def test_available_report_passes_through(self):
+        report = {"verdict": "OK", "score": 55.0, "classification": "Neutral",
+                  "source": "blend"}
+        body = self._client(report).get("/api/sentiment").get_json()
+        self.assertEqual(body.get("verdict"), "OK")
+        self.assertEqual(body.get("score"), 55.0)
+        self.assertEqual(body.get("classification"), "Neutral")
+
+    def test_insufficient_report_is_not_500(self):
+        r = self._client({"verdict": "INSUFFICIENT_DATA"}).get("/api/sentiment")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json().get("verdict"), "INSUFFICIENT_DATA")
+
+    def test_raising_report_fails_open_to_error(self):
+        def boom():
+            raise RuntimeError("cnn down")
+        app = create_app(_cfg())
+        app.config["SENTIMENT_REPORT"] = boom
+        r = app.test_client().get("/api/sentiment")
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.get_json().get("verdict"), "ERROR")
 

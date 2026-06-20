@@ -120,6 +120,70 @@ async function loadRegime() {
     : "";
 }
 
+// ---- Market sentiment (Fear & Greed) --------------------------------------
+// 0-100 gauge with CNN-style fear->greed color bands, classification label,
+// blended source, and the per-component breakdown. Read-only; degrades to a
+// badge on INSUFFICIENT_DATA / ERROR.
+const FG_BANDS = [
+  { lo: 0, hi: 25, color: "#f85149" },   // Extreme Fear
+  { lo: 25, hi: 45, color: "#d29922" },  // Fear
+  { lo: 45, hi: 55, color: "#8b949e" },  // Neutral
+  { lo: 55, hi: 75, color: "#56b870" },  // Greed
+  { lo: 75, hi: 100, color: "#3fb950" }, // Extreme Greed
+];
+function fgColor(score) {
+  for (const b of FG_BANDS) if (score >= b.lo && score <= b.hi) return b.color;
+  return C.accent;
+}
+function renderSentimentKpi(d) {
+  const val = document.getElementById("kpi-sentiment");
+  const sub = document.getElementById("kpi-sentiment-sub");
+  if (!val) return;
+  if (!isUsable(d) || d.score == null) {
+    val.textContent = "—"; val.style.color = "";
+    if (sub) sub.textContent = "";
+    return;
+  }
+  val.textContent = Math.round(d.score);
+  val.style.color = fgColor(d.score);
+  if (sub) sub.textContent = d.classification || "";
+}
+async function loadSentiment() {
+  const d = await api("sentiment");
+  renderSentimentKpi(d);
+  const compEl = document.getElementById("sentiment-components");
+  if (!isUsable(d) || d.score == null) {
+    placeholder("sentiment-gauge", d);
+    if (compEl) compEl.innerHTML = "";
+    return;
+  }
+  const score = Number(d.score);
+  Plotly.react("sentiment-gauge", [{
+    type: "indicator", mode: "gauge+number",
+    value: +score.toFixed(0),
+    number: { font: { color: "#e6edf3" } },
+    title: { text: d.classification || "—", font: { color: fgColor(score), size: 18 } },
+    gauge: {
+      axis: { range: [0, 100], tickcolor: "#8b949e", tickvals: [0, 25, 45, 55, 75, 100] },
+      bar: { color: fgColor(score) },
+      bgcolor: "#1c2330", borderwidth: 0,
+      steps: FG_BANDS.map(b => ({ range: [b.lo, b.hi], color: b.color + "33" })),
+    },
+  }], { ...PLOT_LAYOUT, height: 220 }, PLOT_CFG);
+
+  const src = d.source ? `<span class="muted">source: ${escapeHtml(String(d.source))}` +
+    (d.cnn_score != null ? ` · CNN ${Math.round(d.cnn_score)}` : "") +
+    (d.custom_score != null ? ` · custom ${Math.round(d.custom_score)}` : "") +
+    (d.from_cache ? " · cached" : "") + "</span>" : "";
+  const comps = Array.isArray(d.components) ? d.components.filter(c => c && c.available && c.score != null) : [];
+  const list = comps.length
+    ? "<ul>" + comps.map(c =>
+        `<li>${escapeHtml(String(c.name).replace(/_/g, " "))}: ` +
+        `<b style="color:${fgColor(Number(c.score))}">${Math.round(c.score)}</b></li>`).join("") + "</ul>"
+    : "";
+  if (compEl) compEl.innerHTML = src + list;
+}
+
 // ---- Probability calibration (reliability curve from /calibration/pop) ----
 async function loadProbability() {
   const [prob, pop] = await Promise.all([api("probability"), api("calibration/pop")]);
@@ -363,7 +427,7 @@ async function refreshAll() {
   status.textContent = "refreshing…"; status.className = "status";
   try {
     await Promise.all([
-      loadKpis(), loadRegime(), loadProbability(), loadAgents(),
+      loadKpis(), loadRegime(), loadSentiment(), loadProbability(), loadAgents(),
       loadFeatures(), loadWeights(), loadEv(), loadRegimePerf(),
       loadHypotheses(), loadEpisodes(), loadPositions(),
     ]);
