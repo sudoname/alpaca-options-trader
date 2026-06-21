@@ -29,14 +29,15 @@ def _cfg(user="", password="", ttl=0):
                            basic_auth_user=user, basic_auth_pass=password)
 
 
-def _app(user="", password="", ttl=0, explain_ctx=None):
-    """Build an app with the explain context builder stubbed offline.
+def _app(user="", password="", ttl=0, explain_ctx=None, regime_ctx=None):
+    """Build an app with the context builders stubbed offline.
 
-    The live builder issues read-only Alpaca GETs; tests must never touch the
-    network, so default it to a no-evidence stub (yields INSUFFICIENT_DATA).
+    The live builders issue read-only Alpaca GETs; tests must never touch the
+    network, so default them to no-evidence stubs (yield INSUFFICIENT_DATA).
     """
     app = create_app(_cfg(user, password, ttl))
     app.config["EXPLAIN_CTX_BUILDER"] = explain_ctx or (lambda s: {})
+    app.config["REGIME_CTX_BUILDER"] = regime_ctx or (lambda: {})
     # Keep sentiment offline: the live report scrapes CNN + GETs Alpaca bars.
     app.config["SENTIMENT_REPORT"] = lambda: {"verdict": "INSUFFICIENT_DATA"}
     return app
@@ -135,6 +136,31 @@ class TestExplainContext(unittest.TestCase):
         self.assertEqual(r.get_json().get("verdict"), "ERROR")
 
 
+class TestRegimeContext(unittest.TestCase):
+    """The route feeds the injectable builder's ctx into the regime report."""
+
+    def test_populated_ctx_is_ok_with_label(self):
+        ctx = {"trend": "up", "momentum": 0.05, "realized_vol": 0.012}
+        client = _app(regime_ctx=lambda: ctx).test_client()
+        body = client.get("/api/regime").get_json()
+        self.assertEqual(body.get("verdict"), "OK")
+        self.assertTrue(body.get("label"))
+
+    def test_empty_ctx_stays_insufficient(self):
+        client = _app(regime_ctx=lambda: {}).test_client()
+        body = client.get("/api/regime").get_json()
+        self.assertEqual(body.get("verdict"), "INSUFFICIENT_DATA")
+
+    def test_raising_builder_fails_open(self):
+        def boom():
+            raise RuntimeError("network down")
+
+        client = _app(regime_ctx=boom).test_client()
+        r = client.get("/api/regime")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json().get("verdict"), "ERROR")
+
+
 class TestSentiment(unittest.TestCase):
     """The /api/sentiment route surfaces the injectable SENTIMENT_REPORT."""
 
@@ -201,11 +227,12 @@ class TestTTLCache(unittest.TestCase):
     def test_second_hit_served_from_cache(self):
         calls = {"n": 0}
 
-        def provider():
+        def provider(*args, **kwargs):
             calls["n"] += 1
             return {"verdict": "OK", "n": calls["n"]}
 
         app = create_app(_cfg(ttl=60))
+        app.config["REGIME_CTX_BUILDER"] = lambda: {}
         # Patch the provider by overriding the module function the route imports.
         import oracle_intelligence_reports as oir
         orig = oir.compute_oracle_regime_report

@@ -147,6 +147,18 @@ def create_app(config: "DashboardConfig" = None) -> Flask:
             return {}
     app.config.setdefault("EXPLAIN_CTX_BUILDER", _default_explain_ctx)
 
+    # Read-only market context for /api/regime. Injectable so the self-test /
+    # unit tests stay offline (override with a stub returning {}); the default
+    # assembles live SPY context and itself fails open to {} on missing creds /
+    # no network. Without a context the regime report stays INSUFFICIENT_DATA.
+    def _default_regime_ctx():
+        try:
+            import explain_context
+            return explain_context.build_explain_context("SPY")
+        except Exception:
+            return {}
+    app.config.setdefault("REGIME_CTX_BUILDER", _default_regime_ctx)
+
     # Read-only Fear & Greed report for /api/sentiment. Injectable so the
     # self-test / unit tests stay offline (override with a stub); the default
     # blends CNN's index with a self-computed score over read-only market data
@@ -207,7 +219,8 @@ def create_app(config: "DashboardConfig" = None) -> Flask:
     def regime():
         def provider():
             import oracle_intelligence_reports as oir
-            return oir.compute_oracle_regime_report()
+            ctx = app.config["REGIME_CTX_BUILDER"]() or None
+            return oir.compute_oracle_regime_report(regime_raw=ctx, symbol="SPY")
         return _cached_json("regime", provider)
 
     @app.route("/api/sentiment")
@@ -373,6 +386,9 @@ def _self_test() -> int:
     # Keep explain offline+deterministic: stub the context builder (the live
     # builder would otherwise issue read-only Alpaca GETs during the gate).
     app.config["EXPLAIN_CTX_BUILDER"] = lambda s: {}
+    # Keep regime offline+deterministic: an empty ctx keeps the regime report
+    # at INSUFFICIENT_DATA without issuing read-only Alpaca GETs during the gate.
+    app.config["REGIME_CTX_BUILDER"] = lambda: {}
     # Keep sentiment offline+deterministic: the live report would otherwise scrape
     # CNN and issue read-only Alpaca GETs during the gate.
     app.config["SENTIMENT_REPORT"] = lambda: {"verdict": VERDICT_INSUFFICIENT}
@@ -416,6 +432,25 @@ def _self_test() -> int:
     jb = rc.get_json()
     if rc.status_code != 200 or jb.get("verdict") == VERDICT_INSUFFICIENT:
         print("FAIL: explain with ctx should not be INSUFFICIENT_DATA:", jb); ok = False
+
+    # 2d. /api/regime: empty ctx stays INSUFFICIENT_DATA; a populated ctx flips
+    #     to OK with a regime label (read-only context wiring).
+    app_reg = create_app(DashboardConfig(host="127.0.0.1", port=0, cache_ttl=0,
+                                         basic_auth_user="", basic_auth_pass=""))
+    app_reg.config["REGIME_CTX_BUILDER"] = lambda: {}
+    rr0 = app_reg.test_client().get("/api/regime")
+    if rr0.status_code != 200 or rr0.get_json().get("verdict") != VERDICT_INSUFFICIENT:
+        print("FAIL: regime empty ctx should be INSUFFICIENT_DATA:",
+              rr0.get_json()); ok = False
+    app_reg2 = create_app(DashboardConfig(host="127.0.0.1", port=0, cache_ttl=0,
+                                          basic_auth_user="", basic_auth_pass=""))
+    app_reg2.config["REGIME_CTX_BUILDER"] = lambda: {
+        "trend": "up", "momentum": 0.05, "realized_vol": 0.012}
+    rr1 = app_reg2.test_client().get("/api/regime")
+    jr = rr1.get_json()
+    if rr1.status_code != 200 or jr.get("verdict") == VERDICT_INSUFFICIENT \
+            or not jr.get("label"):
+        print("FAIL: regime with ctx should be OK with a label:", jr); ok = False
 
     # 3. A raising provider degrades to verdict=ERROR, still 200.
     err = _safe_provider(lambda: (_ for _ in ()).throw(RuntimeError("boom")))

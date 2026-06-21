@@ -2074,6 +2074,21 @@ class SmartOptionsTrader:
             except Exception as e:
                 print(f"[EV STAMP] skipped: {e}")
 
+            # Shadow-Oracle stamp: freeze an advisory Oracle opinion (regime,
+            # model probabilities, agent votes/contributions) for the dashboard
+            # Intelligence-Layer tiles. Recorded, never used — it cannot change
+            # direction, sizing, gating, pricing or execution, and a failure
+            # leaves the just-placed order untouched.
+            try:
+                import oracle_shadow
+                shadow = oracle_shadow.compute_oracle_shadow(underlying_symbol)
+                if shadow:
+                    trade_info['oracle'] = shadow
+                    print(f"[ORACLE SHADOW] regime {shadow.get('regime_label')} "
+                          f"P(call) {shadow.get('model_p_call')}")
+            except Exception as e:
+                print(f"[ORACLE SHADOW] skipped: {e}")
+
             action = (option.get('type') or 'call').upper()  # CALL/PUT
             analysis_ctx = {
                 'direction': action,
@@ -2619,6 +2634,21 @@ class SmartOptionsTrader:
                 })
         except Exception as e:
             print(f"[EV STAMP] close flatten skipped: {e}")
+
+        # Flatten the frozen shadow-Oracle opinion onto the top-level record so
+        # the Intelligence-Layer reports (which read model_p_call / agent_votes /
+        # agent_contributions / regime_label) can score this trade. Analytics
+        # only — never read back into any trading decision.
+        try:
+            oracle = trade.get('oracle') or {}
+            if isinstance(oracle, dict):
+                for k in ('model_p_call', 'model_p_put', 'agent_votes',
+                          'agent_contributions', 'regime_label',
+                          'regime_confidence'):
+                    if oracle.get(k) is not None:
+                        trade_record[k] = oracle[k]
+        except Exception as e:
+            print(f"[ORACLE SHADOW] close flatten skipped: {e}")
 
         self.trading_history['trades'].append(trade_record)
 
