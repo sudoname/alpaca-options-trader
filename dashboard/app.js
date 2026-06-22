@@ -1,22 +1,39 @@
 "use strict";
 
 // Oracle Dashboard — buildless frontend. Fetches the read-only JSON API and
-// renders KPIs + Plotly widgets. Every widget degrades gracefully when its
+// renders KPIs + AntV G2 v5 widgets. Every widget degrades gracefully when its
 // source returns verdict INSUFFICIENT_DATA / ERROR. No mutation, GET-only.
 
 const REFRESH_MS = 60000;
-const PLOT_LAYOUT = {
-  paper_bgcolor: "rgba(0,0,0,0)",
-  plot_bgcolor: "rgba(0,0,0,0)",
-  font: { color: "#8b949e", size: 12 },
-  margin: { l: 50, r: 16, t: 16, b: 40 },
-  xaxis: { gridcolor: "#2a3441", zerolinecolor: "#2a3441" },
-  yaxis: { gridcolor: "#2a3441", zerolinecolor: "#2a3441" },
-};
-const PLOT_CFG = { displayModeBar: false, responsive: true };
 const C = { accent: "#58a6ff", green: "#3fb950", red: "#f85149", amber: "#d29922" };
+// Dark theme that matches the panel background (#0d1117 / #161b22).
+const G2_THEME = { type: "classicDark", view: { viewFill: "transparent", plotFill: "transparent" } };
 
 let refreshTimer = null;
+
+// ---- G2 chart registry ----------------------------------------------------
+// One Chart instance per container, reused across refreshes. We clear() and
+// re-options() rather than recreate so the canvas isn't thrashed. When a tile
+// degrades to a badge (placeholder), the cached chart is destroyed so the next
+// data-bearing render rebuilds cleanly into the restored container.
+const _charts = {};
+function g2render(id, options, height) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  let c = _charts[id];
+  if (!c) {
+    el.innerHTML = "";
+    c = new G2.Chart({ container: el, autoFit: true, height: height || 260, theme: G2_THEME });
+    _charts[id] = c;
+  }
+  c.clear();
+  c.options(options);
+  c.render();
+}
+function g2destroy(id) {
+  const c = _charts[id];
+  if (c) { try { c.destroy(); } catch (e) { /* fail-open */ } delete _charts[id]; }
+}
 
 // ---- helpers --------------------------------------------------------------
 async function api(path) {
@@ -38,6 +55,7 @@ function badge(d) {
 }
 
 function placeholder(elId, d) {
+  g2destroy(elId);
   const el = document.getElementById(elId);
   if (el) el.innerHTML = `<div style="padding:30px 0;text-align:center">${badge(d)}</div>`;
 }
@@ -90,9 +108,14 @@ async function loadEpisodes() {
     if (statsEl) statsEl.innerHTML = isUsable(d) ? "" : badge(d);
     return;
   }
-  Plotly.react("episodes-bars", [
-    { x: labels, y: labels.map(k => counts[k]), type: "bar", marker: { color: C.accent } },
-  ], { ...PLOT_LAYOUT, height: 220, yaxis: { ...PLOT_LAYOUT.yaxis, title: "episodes" } }, PLOT_CFG);
+  g2render("episodes-bars", {
+    type: "interval",
+    autoFit: true,
+    data: labels.map(k => ({ action: k, count: Number(counts[k]) })),
+    encode: { x: "action", y: "count" },
+    axis: { y: { title: "episodes" }, x: { title: null } },
+    style: { fill: C.accent },
+  }, 260);
   const s = d.stats || {};
   statsEl.innerHTML =
     `total <b>${s.total ?? 0}</b> · completed <b>${s.completed ?? 0}</b> · ` +
@@ -105,17 +128,19 @@ async function loadRegime() {
   const reasonsEl = document.getElementById("regime-reasons");
   if (!isUsable(d)) { placeholder("regime-gauge", d); reasonsEl.innerHTML = ""; return; }
   const conf = Number(d.confidence || 0);
-  Plotly.react("regime-gauge", [{
-    type: "indicator", mode: "gauge+number",
-    value: +(conf * 100).toFixed(0),
-    number: { suffix: "%", font: { color: "#e6edf3" } },
-    title: { text: d.label || "—", font: { color: "#e6edf3", size: 16 } },
-    gauge: {
-      axis: { range: [0, 100], tickcolor: "#8b949e" },
-      bar: { color: C.accent },
-      bgcolor: "#1c2330", borderwidth: 0,
+  const label = d.label || "—";
+  g2render("regime-gauge", {
+    type: "gauge",
+    autoFit: true,
+    data: { value: { target: +(conf * 100).toFixed(0), total: 100 } },
+    legend: false,
+    scale: { color: { range: [C.accent, "#1c2330"] } },
+    style: {
+      textContent: (target) => `${label} · ${target}%`,
+      pointerStroke: C.accent,
+      pinStroke: C.accent,
     },
-  }], { ...PLOT_LAYOUT, height: 220 }, PLOT_CFG);
+  }, 260);
   const reasons = Array.isArray(d.reasons) ? d.reasons : [];
   reasonsEl.innerHTML = reasons.length
     ? "<ul>" + reasons.map(r => `<li>${escapeHtml(String(r))}</li>`).join("") + "</ul>"
@@ -160,18 +185,25 @@ async function loadSentiment() {
     return;
   }
   const score = Number(d.score);
-  Plotly.react("sentiment-gauge", [{
-    type: "indicator", mode: "gauge+number",
-    value: +score.toFixed(0),
-    number: { font: { color: "#e6edf3" } },
-    title: { text: d.classification || "—", font: { color: fgColor(score), size: 18 } },
-    gauge: {
-      axis: { range: [0, 100], tickcolor: "#8b949e", tickvals: [0, 25, 45, 55, 75, 100] },
-      bar: { color: fgColor(score) },
-      bgcolor: "#1c2330", borderwidth: 0,
-      steps: FG_BANDS.map(b => ({ range: [b.lo, b.hi], color: b.color + "33" })),
+  const cls = d.classification || "—";
+  g2render("sentiment-gauge", {
+    type: "gauge",
+    autoFit: true,
+    data: {
+      value: {
+        target: +score.toFixed(0),
+        total: 100,
+        thresholds: FG_BANDS.map(b => b.hi),  // [25,45,55,75,100]
+      },
     },
-  }], { ...PLOT_LAYOUT, height: 220 }, PLOT_CFG);
+    legend: false,
+    scale: { color: { range: FG_BANDS.map(b => b.color) } },
+    style: {
+      textContent: (target) => `${cls} · ${target}`,
+      pointerStroke: "#e6edf3",
+      pinStroke: "#e6edf3",
+    },
+  }, 260);
 
   const src = d.source ? `<span class="muted">source: ${escapeHtml(String(d.source))}` +
     (d.cnn_score != null ? ` · CNN ${Math.round(d.cnn_score)}` : "") +
@@ -191,12 +223,21 @@ async function loadProbability() {
   const [prob, pop] = await Promise.all([api("probability"), api("calibration/pop")]);
   const statsEl = document.getElementById("prob-stats");
   if (isUsable(pop) && Array.isArray(pop.buckets) && pop.buckets.length) {
-    const xs = pop.buckets.map(b => b.predicted ?? b.mid ?? b.p ?? b.bucket);
-    const ys = pop.buckets.map(b => b.realized ?? b.actual ?? b.win_rate);
-    Plotly.react("prob-curve", [
-      { x: [0, 1], y: [0, 1], mode: "lines", line: { dash: "dot", color: "#8b949e" }, name: "ideal" },
-      { x: xs, y: ys, mode: "lines+markers", line: { color: C.accent }, name: "observed" },
-    ], { ...PLOT_LAYOUT, height: 240, xaxis: { ...PLOT_LAYOUT.xaxis, title: "predicted", range: [0, 1] }, yaxis: { ...PLOT_LAYOUT.yaxis, title: "realized", range: [0, 1] }, showlegend: false }, PLOT_CFG);
+    const obs = pop.buckets.map(b => ({
+      x: Number(b.predicted ?? b.mid ?? b.p ?? b.bucket),
+      y: Number(b.realized ?? b.actual ?? b.win_rate),
+    }));
+    g2render("prob-curve", {
+      type: "view",
+      autoFit: true,
+      scale: { x: { domain: [0, 1] }, y: { domain: [0, 1] } },
+      axis: { x: { title: "predicted" }, y: { title: "realized" } },
+      children: [
+        { type: "line", data: [{ x: 0, y: 0 }, { x: 1, y: 1 }], encode: { x: "x", y: "y" }, style: { stroke: "#8b949e", lineDash: [4, 4] }, tooltip: false },
+        { type: "line", data: obs, encode: { x: "x", y: "y" }, style: { stroke: C.accent, lineWidth: 2 } },
+        { type: "point", data: obs, encode: { x: "x", y: "y" }, style: { fill: C.accent } },
+      ],
+    }, 260);
   } else {
     placeholder("prob-curve", pop);
   }
@@ -211,26 +252,41 @@ async function loadProbability() {
 async function loadAgents() {
   const d = await api("agents");
   if (!isUsable(d) || !Array.isArray(d.agents) || !d.agents.length) { placeholder("agents-bars", d); return; }
-  const names = d.agents.map(a => a.agent);
-  Plotly.react("agents-bars", [
-    { x: d.agents.map(a => a.hit_rate), y: names, type: "bar", orientation: "h", marker: { color: C.accent }, name: "hit rate" },
-  ], {
-    ...PLOT_LAYOUT, height: Math.max(220, names.length * 34),
-    xaxis: { ...PLOT_LAYOUT.xaxis, title: "hit rate", range: [0, 1] },
-    shapes: d.base_win_rate != null ? [{
-      type: "line", x0: d.base_win_rate, x1: d.base_win_rate, y0: -0.5, y1: names.length - 0.5,
-      line: { color: C.amber, dash: "dash", width: 1 },
-    }] : [],
-  }, PLOT_CFG);
+  const rows = d.agents.map(a => ({ agent: String(a.agent), hit_rate: Number(a.hit_rate) }));
+  const children = [
+    { type: "interval", encode: { x: "agent", y: "hit_rate" }, style: { fill: C.accent } },
+  ];
+  if (d.base_win_rate != null) {
+    children.push({
+      type: "lineY", data: [Number(d.base_win_rate)],
+      style: { stroke: C.amber, lineDash: [4, 4] },
+    });
+  }
+  g2render("agents-bars", {
+    type: "view",
+    autoFit: true,
+    data: rows,
+    coordinate: { transform: [{ type: "transpose" }] },
+    scale: { y: { domain: [0, 1] } },
+    axis: { y: { title: "hit rate" }, x: { title: null } },
+    children,
+  }, Math.max(260, rows.length * 34));
 }
 
 // ---- Feature importance ---------------------------------------------------
 async function loadFeatures() {
   const d = await api("feature-importance");
   if (!isUsable(d) || !Array.isArray(d.features) || !d.features.length) { placeholder("features-bars", d); return; }
-  Plotly.react("features-bars", [
-    { x: d.features.map(f => f.importance), y: d.features.map(f => f.agent), type: "bar", orientation: "h", marker: { color: C.green } },
-  ], { ...PLOT_LAYOUT, height: Math.max(220, d.features.length * 34), xaxis: { ...PLOT_LAYOUT.xaxis, title: "mean contribution" } }, PLOT_CFG);
+  const rows = d.features.map(f => ({ agent: String(f.agent), importance: Number(f.importance) }));
+  g2render("features-bars", {
+    type: "interval",
+    autoFit: true,
+    data: rows,
+    encode: { x: "agent", y: "importance" },
+    coordinate: { transform: [{ type: "transpose" }] },
+    axis: { y: { title: "mean contribution" }, x: { title: null } },
+    style: { fill: C.green },
+  }, Math.max(260, rows.length * 34));
 }
 
 // ---- Weights --------------------------------------------------------------
@@ -240,9 +296,15 @@ async function loadWeights() {
   const cur = (d && d.current) || {};
   const keys = Object.keys(cur);
   if (!isUsable(d) || !keys.length) { placeholder("weights-bars", d); driftEl.innerHTML = ""; return; }
-  Plotly.react("weights-bars", [
-    { x: keys, y: keys.map(k => cur[k]), type: "bar", marker: { color: C.accent } },
-  ], { ...PLOT_LAYOUT, height: 240, yaxis: { ...PLOT_LAYOUT.yaxis, title: "weight" } }, PLOT_CFG);
+  const rows = keys.map(k => ({ agent: k, weight: Number(cur[k]) }));
+  g2render("weights-bars", {
+    type: "interval",
+    autoFit: true,
+    data: rows,
+    encode: { x: "agent", y: "weight" },
+    axis: { y: { title: "weight" }, x: { title: null } },
+    style: { fill: C.accent },
+  }, 260);
   driftEl.innerHTML = `snapshots <b>${d.snapshots ?? 0}</b> · drift <b>${fmtNum(d.drift, 3)}</b>`;
 }
 
@@ -255,18 +317,36 @@ async function loadEv() {
     buckets = Object.entries(buckets).map(([label, b]) => ({ label, ...b }));
   }
   if (!d || d.verdict === "ERROR" || !Array.isArray(buckets) || !buckets.length) { placeholder("ev-bars", d); return; }
-  const labels = buckets.map(b => b.label ?? b.bucket ?? b.range ?? "");
-  const wr = buckets.map(b => b.win_rate ?? b.winrate);
-  const pf = buckets.map(b => b.profit_factor ?? b.pf);
-  Plotly.react("ev-bars", [
-    { x: labels, y: wr, type: "bar", name: "win rate", marker: { color: C.accent } },
-    { x: labels, y: pf, type: "bar", name: "profit factor", marker: { color: C.green }, yaxis: "y2" },
-  ], {
-    ...PLOT_LAYOUT, height: 260, barmode: "group",
-    yaxis: { ...PLOT_LAYOUT.yaxis, title: "win rate" },
-    yaxis2: { overlaying: "y", side: "right", gridcolor: "transparent", title: "PF" },
-    legend: { orientation: "h", y: 1.15 },
-  }, PLOT_CFG);
+  // Dual axis: win rate as bars (left), profit factor as a line (right).
+  const rows = buckets.map(b => ({
+    label: String(b.label ?? b.bucket ?? b.range ?? ""),
+    win_rate: Number(b.win_rate ?? b.winrate),
+    profit_factor: Number(b.profit_factor ?? b.pf),
+  }));
+  g2render("ev-bars", {
+    type: "view",
+    autoFit: true,
+    data: rows,
+    children: [
+      {
+        type: "interval", encode: { x: "label", y: "win_rate" },
+        scale: { y: { domain: [0, 1] } },
+        axis: { y: { title: "win rate" } },
+        style: { fill: C.accent },
+      },
+      {
+        type: "line", encode: { x: "label", y: "profit_factor" },
+        scale: { y: { independent: true } },
+        axis: { y: { position: "right", title: "PF" } },
+        style: { stroke: C.green, lineWidth: 2 },
+      },
+      {
+        type: "point", encode: { x: "label", y: "profit_factor" },
+        scale: { y: { independent: true } },
+        style: { fill: C.green },
+      },
+    ],
+  }, 280);
 }
 
 // ---- Tables ---------------------------------------------------------------
@@ -379,10 +459,15 @@ async function explainTicker(t) {
     `<td class="num">${fmtNum(v.bullish_score ?? v.bull, 2)}</td>` +
     `<td class="num">${fmtNum(v.bearish_score ?? v.bear, 2)}</td>` +
     `<td class="num">${fmtNum(v.confidence, 2)}</td></tr>`).join("");
+  // `explanation` is an object {summary_str, top_reasons, ...}, not a string.
+  const ex = (d.explanation && typeof d.explanation === "object") ? d.explanation : {};
+  const summary = ex.summary_str || d.summary_str || "";
+  const reasons = Array.isArray(ex.top_reasons) ? ex.top_reasons : [];
   out.innerHTML =
     `<div class="prob-row">${pill("P(call)", p.call ?? p.p_call)}${pill("P(put)", p.put ?? p.p_put)}${pill("P(no-trade)", p.no_trade ?? p.p_no_trade)}</div>` +
     (voteRows ? `<div class="tablewrap"><table><thead><tr><th>Agent</th><th>Bull</th><th>Bear</th><th>Conf</th></tr></thead><tbody>${voteRows}</tbody></table></div>` : "") +
-    (d.explanation ? `<p class="muted">${escapeHtml(String(d.explanation))}</p>` : "");
+    (summary ? `<p class="muted">${escapeHtml(String(summary))}</p>` : "") +
+    (reasons.length ? `<ul class="muted">${reasons.map(r => `<li>${escapeHtml(String(r))}</li>`).join("")}</ul>` : "");
 }
 
 // ---- Green vs Red tile ----------------------------------------------------
