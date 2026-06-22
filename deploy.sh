@@ -107,6 +107,7 @@ echo "==> Running self-test gate"
 "$PYTHON" explain_context.py --selftest
 "$PYTHON" sentiment_report.py --selftest
 "$PYTHON" oracle_shadow.py --selftest
+"$PYTHON" oracle_weights_snapshot.py --selftest
 echo "==> All self-tests passed."
 
 # --- 4. optional restart (you own the supervisor) -------------------------
