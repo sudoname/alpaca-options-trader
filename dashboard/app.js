@@ -382,10 +382,12 @@ async function explainTicker(t) {
 }
 
 // ---- Green vs Red tile ----------------------------------------------------
-// Dollar sums of profit (green) vs loss (red), shown on two rows: OPEN by live
-// unrealized P/L (from /single-leg/positions) and CLOSED by realized P/L (from
-// /single-leg/kpis). The two sources refresh independently, so each loader
-// caches its slice and re-renders from both.
+// Dollar sums of profit (green) vs loss (red), split across two KPI tiles:
+// OPEN by live unrealized P/L (from /single-leg/positions) and CLOSED by
+// realized P/L (from /single-leg/kpis). Each tile shows the dollar pair on the
+// value row and each side's share of the combined magnitude on the sub row.
+// The two sources refresh independently, so each loader caches its slice and
+// re-renders both tiles.
 let _grOpen = null;    // last /single-leg/positions payload
 let _grClosed = null;  // last /single-leg/kpis payload
 
@@ -395,28 +397,51 @@ function grPair(green, red) {
     `<span class="neg">${fmtMoney(red)}</span>`;
 }
 
-function renderGreenRed() {
-  const val = document.getElementById("kpi-greenred");
-  const sub = document.getElementById("kpi-greenred-sub");
+// Green/red share of the combined |$| magnitude; null when there's nothing.
+function grShare(green, red) {
+  const g = Math.abs(green || 0), r = Math.abs(red || 0);
+  const tot = g + r;
+  if (tot <= 0) return null;
+  return { g: g / tot, r: r / tot };
+}
+
+function grPct(green, red) {
+  const sh = grShare(green, red);
+  if (!sh) return `<span class="muted">—</span>`;
+  return `<span class="pos">${(sh.g * 100).toFixed(0)}%</span>` +
+    ` <span class="muted">/</span> ` +
+    `<span class="neg">${(sh.r * 100).toFixed(0)}%</span>`;
+}
+
+function renderGrTile(valId, subId, green, red, ready, fallback) {
+  const val = document.getElementById(valId);
   if (!val) return;
   val.classList.remove("pos", "neg");
-
-  // Row 1 (main value): OPEN positions, live unrealized P/L.
-  const o = _grOpen;
-  if (isUsable(o) && o.marks_available && o.green_sum != null && o.red_sum != null) {
-    val.innerHTML = `<span class="muted">Open</span> ${grPair(o.green_sum, o.red_sum)}`;
+  const sub = document.getElementById(subId);
+  if (ready && green != null && red != null) {
+    val.innerHTML = grPair(green, red);
+    if (sub) sub.innerHTML = grPct(green, red);
   } else {
-    val.innerHTML = `<span class="muted">Open</span> ` +
-      (o && o.marks_available === false ? `<span class="muted">no live marks</span>` : "—");
+    val.innerHTML = fallback;
+    if (sub) sub.innerHTML = "";
   }
+}
 
-  // Row 2 (sub): CLOSED trades, realized P/L.
-  if (sub) {
-    const c = _grClosed;
-    sub.innerHTML = (isUsable(c) && c.closed_green_sum != null && c.closed_red_sum != null)
-      ? `<span class="muted">Closed</span> ${grPair(c.closed_green_sum, c.closed_red_sum)}`
-      : `<span class="muted">Closed —</span>`;
-  }
+function renderGreenRed() {
+  // OPEN: live unrealized P/L. No broker marks -> say so explicitly.
+  const o = _grOpen;
+  renderGrTile(
+    "kpi-greenred-open", "kpi-greenred-open-sub",
+    o ? o.green_sum : null, o ? o.red_sum : null,
+    isUsable(o) && o.marks_available,
+    (o && o.marks_available === false) ? `<span class="muted">no live marks</span>` : "—");
+
+  // CLOSED: realized P/L.
+  const c = _grClosed;
+  renderGrTile(
+    "kpi-greenred-closed", "kpi-greenred-closed-sub",
+    c ? c.closed_green_sum : null, c ? c.closed_red_sum : null,
+    isUsable(c), "—");
 }
 
 // ---- misc render helpers --------------------------------------------------

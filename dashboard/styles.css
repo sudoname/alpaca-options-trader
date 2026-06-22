@@ -54,11 +54,12 @@ body {
 .kpi-val.neg { color: var(--red); }
 .kpi-sub { font-size: 12px; margin-top: 4px; color: var(--muted); }
 .kpi-sub .pos { color: var(--green); } .kpi-sub .neg { color: var(--red); }
-/* Green vs Red holds a labeled dollar pair (Open) + a second row (Closed),
-   so it uses a smaller value font than the headline KPIs to avoid overflow. */
-#kpi-greenred { font-size: 17px; line-height: 1.4; }
-#kpi-greenred .muted { font-size: 12px; }
-#kpi-greenred-sub .pos { color: var(--green); } #kpi-greenred-sub .neg { color: var(--red); }
+/* The Open/Closed Green-vs-Red tiles each hold a labeled dollar pair, so they
+   use a smaller value font than the headline KPIs to avoid overflow. */
+#kpi-greenred-open, #kpi-greenred-closed { font-size: 17px; line-height: 1.4; }
+#kpi-greenred-open .muted, #kpi-greenred-closed .muted { font-size: 14px; }
+#kpi-greenred-open-sub .pos, #kpi-greenred-closed-sub .pos { color: var(--green); }
+#kpi-greenred-open-sub .neg, #kpi-greenred-closed-sub .neg { color: var(--red); }
 
 .grid {
   display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px;
