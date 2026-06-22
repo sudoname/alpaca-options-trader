@@ -56,6 +56,9 @@ class TestKpis(unittest.TestCase):
         self.assertEqual(k["closed_trades"], 3)
         self.assertAlmostEqual(k["realized_total"], 1089.0)
         self.assertAlmostEqual(k["today_realized"], 90.0)
+        # Closed dollar sums: profits 120+999=1119, losses -30.
+        self.assertAlmostEqual(k["closed_green_sum"], 1119.0)
+        self.assertAlmostEqual(k["closed_red_sum"], -30.0)
         self.assertEqual(k["wins"], 2)
         self.assertEqual(k["losses"], 1)
         self.assertAlmostEqual(k["win_rate"], 2.0 / 3.0)
@@ -138,6 +141,21 @@ class TestPositions(unittest.TestCase):
         self.assertEqual(out["verdict"], "OK")
         self.assertFalse(out["marks_available"])
         self.assertIsNone(out["positions"][0]["current_price"])
+
+    def test_green_red_dollar_sums(self):
+        p = self._write_two()
+        marks = {
+            "SPY260101C00500000": {"current_price": 1.8, "unrealized_pl": 60.0,
+                                   "unrealized_plpc": 0.2, "market_value": 360.0},
+            "QQQ260101P00400000": {"current_price": 1.6, "unrealized_pl": -40.0,
+                                   "unrealized_plpc": -0.2, "market_value": 160.0},
+        }
+        out = slr.compute_single_leg_positions(active_path=p,
+                                               fetch_marks=lambda: marks)
+        self.assertEqual(out["green_count"], 1)
+        self.assertEqual(out["red_count"], 1)
+        self.assertAlmostEqual(out["green_sum"], 60.0)
+        self.assertAlmostEqual(out["red_sum"], -40.0)
 
 
 class TestEpisodes(unittest.TestCase):

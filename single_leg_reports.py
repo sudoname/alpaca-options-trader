@@ -156,11 +156,17 @@ def compute_single_leg_kpis(
     today = today or datetime.now().date().isoformat()
     realized_total = 0.0
     today_realized = 0.0
+    closed_green_sum = 0.0  # sum of realized profits (closed trades)
+    closed_red_sum = 0.0    # sum of realized losses (closed trades, negative)
     for r in realized:
         amt = _coerce_float(r.get("amount"))
         if amt is None:
             continue
         realized_total += amt
+        if amt > 0:
+            closed_green_sum += amt
+        elif amt < 0:
+            closed_red_sum += amt
         if r.get("date") == today:
             today_realized += amt
 
@@ -175,6 +181,8 @@ def compute_single_leg_kpis(
         "verdict": VERDICT_OK if has_data else VERDICT_INSUFFICIENT,
         "realized_total": round(realized_total, 2),
         "today_realized": round(today_realized, 2),
+        "closed_green_sum": round(closed_green_sum, 2),
+        "closed_red_sum": round(closed_red_sum, 2),
         "open_positions": len(active),
         "closed_trades": len(history),
         "win_rate": win_rate,
@@ -243,6 +251,11 @@ def compute_single_leg_positions(
     red = sum(1 for p in positions
               if p["unrealized_pl"] is not None and p["unrealized_pl"] < 0)
     marked = green + red
+    # Dollar sums of live unrealized P/L: total green (profit) vs red (loss).
+    green_sum = sum(p["unrealized_pl"] for p in positions
+                    if p["unrealized_pl"] is not None and p["unrealized_pl"] > 0)
+    red_sum = sum(p["unrealized_pl"] for p in positions
+                  if p["unrealized_pl"] is not None and p["unrealized_pl"] < 0)
     return {
         "verdict": VERDICT_OK,
         "positions": positions,
@@ -253,6 +266,8 @@ def compute_single_leg_positions(
         "marked_count": marked,
         "green_pct": (green / marked) if marked else None,
         "red_pct": (red / marked) if marked else None,
+        "green_sum": round(green_sum, 2),
+        "red_sum": round(red_sum, 2),
     }
 
 
@@ -367,6 +382,11 @@ def _self_test() -> int:
         print("FAIL: realized_total should sum all entries:", k); ok = False
     if abs(k.get("today_realized") - 90.0) > 1e-6:
         print("FAIL: today_realized should be 90:", k); ok = False
+    # Closed green/red dollar sums: profits 120+999, losses -30.
+    if abs(k.get("closed_green_sum") - 1119.0) > 1e-6:
+        print("FAIL: closed_green_sum should be 1119:", k); ok = False
+    if abs(k.get("closed_red_sum") - (-30.0)) > 1e-6:
+        print("FAIL: closed_red_sum should be -30:", k); ok = False
     if k.get("wins") != 2 or k.get("losses") != 1:
         print("FAIL: win/loss split:", k); ok = False
     if abs(k.get("win_rate") - (2.0 / 3.0)) > 1e-6:
@@ -390,6 +410,10 @@ def _self_test() -> int:
     if p.get("green_count") != 1 or p.get("red_count") != 0 \
             or abs((p.get("green_pct") or 0) - 1.0) > 1e-6:
         print("FAIL: green/red split:", p); ok = False
+    # Dollar sums: the one green mark is +60, no red mark.
+    if abs((p.get("green_sum") or 0) - 60.0) > 1e-6 \
+            or abs(p.get("red_sum") or 0) > 1e-6:
+        print("FAIL: open green/red dollar sums:", p); ok = False
     # Unmatched symbol -> mark fields stay None (fail-open display "—").
     if p["positions"][1].get("current_price") is not None:
         print("FAIL: unmatched mark should be None:", p["positions"][1]); ok = False
