@@ -249,7 +249,11 @@ async function loadWeights() {
 // ---- EV attribution -------------------------------------------------------
 async function loadEv() {
   const d = await api("ev-attribution");
-  const buckets = d && (d.ev_buckets || d.buckets);
+  let buckets = d && (d.ev_buckets || d.buckets);
+  // The API returns ev_buckets as a dict {label: stats}; normalize to an array.
+  if (buckets && !Array.isArray(buckets) && typeof buckets === "object") {
+    buckets = Object.entries(buckets).map(([label, b]) => ({ label, ...b }));
+  }
   if (!d || d.verdict === "ERROR" || !Array.isArray(buckets) || !buckets.length) { placeholder("ev-bars", d); return; }
   const labels = buckets.map(b => b.label ?? b.bucket ?? b.range ?? "");
   const wr = buckets.map(b => b.win_rate ?? b.winrate);
@@ -323,7 +327,7 @@ async function loadRegimePerf() {
     { label: "Regime", get: r => escapeHtml(String(r.regime ?? r.label ?? "—")) },
     { label: "Trades", num: true, get: r => r.trades ?? r.n ?? "—" },
     { label: "Win rate", num: true, get: r => fmtPct(r.win_rate) },
-    { label: "Avg P/L", num: true, get: r => signedCell(r.avg_pnl) },
+    { label: "Avg P/L", num: true, get: r => signedCell(r.average_pnl ?? r.avg_pnl) },
   ], isUsable(d) ? d.regimes : null, d);
 }
 
