@@ -221,6 +221,24 @@ def held_past_max_days(entry_time, now, max_days):
         return False
 
 
+def entered_prior_session(entry_time, session_date):
+    """True when a tracked trade was entered on a session before the current one
+    (`next_close.date()`). Date-only comparison so timezone offsets can't shave a
+    day. Fail-open False on a missing/garbled stamp or no session date, so a bad
+    row is never force-closed by accident.
+
+    Drives the same-day carryover flush: a position still open from a prior
+    session should have been closed at that session's EOD but wasn't (scheduler
+    downtime during the eod_min window, a holiday gap)."""
+    if session_date is None:
+        return False
+    try:
+        entry = datetime.fromisoformat(str(entry_time)[:19])
+        return entry.date() < session_date
+    except (TypeError, ValueError):
+        return False
+
+
 def session_key(next_close):
     """Date used to detect a new session for daily counter resets."""
     return next_close.date() if next_close is not None else None
@@ -739,6 +757,24 @@ class IntradayScheduler:
             except Exception as e:
                 log(f"[WARN] time-stop sweep failed: {e}")
 
+        # 1e) carryover flush (same-day / EOD mode): force-close any scheduler
+        # position entered in a PRIOR session. It should have closed at that
+        # session's EOD but didn't (scheduler downtime during the eod_min window,
+        # a holiday gap). This catch-up runs on resume, not in the final minutes,
+        # so it survives downtime and bounds holding to at most the next open. A
+        # distinct STALE_CARRYOVER outcome makes backstop firings auditable.
+        # No-op in hold-overnight mode (carryover is intentional there, bounded
+        # by MAX_HOLD_DAYS instead).
+        if self.cfg.eod_close_enabled:
+            try:
+                sdate = session_key(parsed["next_close"])
+                self.force_close_scheduler_positions(
+                    reason="STALE_CARRYOVER",
+                    only=lambda t: entered_prior_session(
+                        t.get("entry_time"), sdate))
+            except Exception as e:
+                log(f"[WARN] carryover flush failed: {e}")
+
         # 2) EOD window — never open new trades this late; close ours only
         # when EOD_CLOSE_ENABLED (hold-overnight mode leaves them running
         # to their TP/SL/time stop, monitored again next session).
@@ -878,6 +914,21 @@ def _selftest():
           held_past_max_days("not-a-date", now, 5) is False)
     check("timestop: missing entry_time fails open",
           held_past_max_days(None, now, 5) is False)
+
+    # carryover flush: prior-session detection (next_close.date() is the session)
+    sdate = date(2026, 6, 22)
+    check("carryover: prior-session entry triggers",
+          entered_prior_session("2026-06-18T14:00:00", sdate) is True)
+    check("carryover: same-session entry kept",
+          entered_prior_session("2026-06-22T09:45:00", sdate) is False)
+    check("carryover: future-dated entry kept",
+          entered_prior_session("2026-06-23T09:45:00", sdate) is False)
+    check("carryover: no session date fails open",
+          entered_prior_session("2026-06-18T14:00:00", None) is False)
+    check("carryover: garbage entry_time fails open",
+          entered_prior_session("not-a-date", sdate) is False)
+    check("carryover: missing entry_time fails open",
+          entered_prior_session(None, sdate) is False)
 
     # session_key / underlying_of
     check("session_key is the close date",
