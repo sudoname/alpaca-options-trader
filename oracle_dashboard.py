@@ -369,7 +369,14 @@ def create_app(config: "DashboardConfig" = None) -> Flask:
 
     @app.route("/<path:filename>")
     def static_files(filename):
-        return send_from_directory(_DASHBOARD_DIR, filename)
+        # Serve the requested asset when it exists; otherwise fall back to the
+        # SPA entry point so client-side (TanStack Router) deep links resolve
+        # instead of 404ing. /api/* routes are matched earlier, so this only
+        # affects static/front-end paths.
+        full = os.path.join(_DASHBOARD_DIR, filename)
+        if os.path.isfile(full):
+            return send_from_directory(_DASHBOARD_DIR, filename)
+        return send_from_directory(_DASHBOARD_DIR, "index.html")
 
     return app
 

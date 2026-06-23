@@ -1,113 +1,84 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Oracle Dashboard</title>
-  <link rel="stylesheet" href="styles.css" />
-  <!-- AntV G2 v5 via CDN — buildless, no bundler. Exposes window.G2. -->
-  <script src="https://unpkg.com/@antv/g2@5/dist/g2.min.js" charset="utf-8"></script>
-</head>
-<body>
-  <header class="topbar">
-    <div class="brand">
-      <span class="logo">◎</span>
-      <h1>Oracle <span class="muted">analytics</span></h1>
-    </div>
-    <div class="controls">
-      <span id="status" class="status">loading…</span>
-      <span id="updated" class="updated"></span>
-      <label class="auto">
-        <input type="checkbox" id="autorefresh" checked /> auto
-      </label>
-      <button id="refresh" class="btn">Refresh</button>
-    </div>
-  </header>
+  <head>
+    <meta charset="UTF-8" />
+    <link
+      rel="icon"
+      type="image/svg+xml"
+      href="/images/favicon.svg"
+      media="(prefers-color-scheme: light)"
+    />
+    <link
+      rel="icon"
+      type="image/svg+xml"
+      href="/images/favicon_light.svg"
+      media="(prefers-color-scheme: dark)"
+    />
+    <link
+      rel="icon"
+      type="image/png"
+      href="/images/favicon.png"
+      media="(prefers-color-scheme: light)"
+    />
+    <link
+      rel="icon"
+      type="image/png"
+      href="/images/favicon_light.png"
+      media="(prefers-color-scheme: dark)"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 
-  <!-- KPI row -->
-  <section class="kpis" id="kpis">
-    <div class="kpi"><div class="kpi-label">Realized P/L</div><div class="kpi-val" id="kpi-pnl">—</div></div>
-    <div class="kpi"><div class="kpi-label">Today's P/L</div><div class="kpi-val" id="kpi-today">—</div></div>
-    <div class="kpi"><div class="kpi-label">Win rate</div><div class="kpi-val" id="kpi-winrate">—</div></div>
-    <div class="kpi"><div class="kpi-label">Open positions</div><div class="kpi-val" id="kpi-open">—</div></div>
-    <div class="kpi"><div class="kpi-label">Closed trades</div><div class="kpi-val" id="kpi-closed">—</div></div>
-    <div class="kpi"><div class="kpi-label">Open Green vs Red</div><div class="kpi-val" id="kpi-greenred-open">—</div><div class="kpi-sub" id="kpi-greenred-open-sub"></div></div>
-    <div class="kpi"><div class="kpi-label">Closed Green vs Red</div><div class="kpi-val" id="kpi-greenred-closed">—</div><div class="kpi-sub" id="kpi-greenred-closed-sub"></div></div>
-    <div class="kpi"><div class="kpi-label">Fear &amp; Greed</div><div class="kpi-val" id="kpi-sentiment">—</div><div class="kpi-sub" id="kpi-sentiment-sub"></div></div>
-  </section>
+    <!-- Primary Meta Tags -->
+    <title>Oracle — Read-only Analytics</title>
+    <meta name="title" content="Oracle — Read-only Analytics" />
+    <meta
+      name="description"
+      content="Read-only analytics for the Oracle single-leg intraday paper trader."
+    />
 
-  <main class="grid">
-    <section class="card" id="card-regime">
-      <h2>Market Regime</h2>
-      <div class="card-body"><div id="regime-caption" class="gauge-caption"></div><div id="regime-gauge" class="plot"></div><div id="regime-reasons" class="reasons"></div></div>
-    </section>
+    <!-- Open Graph / Facebook -->
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://shadcn-admin.netlify.app" />
+    <meta property="og:title" content="Shadcn Admin" />
+    <meta
+      property="og:description"
+      content="Admin Dashboard UI built with Shadcn and Vite."
+    />
+    <meta
+      property="og:image"
+      content="https://shadcn-admin.netlify.app/images/shadcn-admin.png"
+    />
 
-    <section class="card" id="card-sentiment">
-      <h2>Market Sentiment <span class="muted">Fear &amp; Greed</span></h2>
-      <div class="card-body"><div id="sentiment-caption" class="gauge-caption"></div><div id="sentiment-gauge" class="plot"></div><div id="sentiment-components" class="reasons"></div></div>
-    </section>
+    <!-- Twitter -->
+    <meta property="twitter:card" content="summary_large_image" />
+    <meta property="twitter:url" content="https://shadcn-admin.netlify.app" />
+    <meta property="twitter:title" content="Shadcn Admin" />
+    <meta
+      property="twitter:description"
+      content="Admin Dashboard UI built with Shadcn and Vite."
+    />
+    <meta
+      property="twitter:image"
+      content="https://shadcn-admin.netlify.app/images/shadcn-admin.png"
+    />
 
-    <section class="card" id="card-probability">
-      <h2>Probability Calibration</h2>
-      <div class="card-body"><div id="prob-curve" class="plot"></div><div id="prob-stats" class="stats"></div></div>
-    </section>
+    <!-- font family -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,100..900;1,14..32,100..900&family=Manrope:wght@200..800&display=swap"
+      rel="stylesheet"
+    />
 
-    <section class="card" id="card-agents">
-      <h2>Agent Hit-Rate &amp; Lift</h2>
-      <div class="card-body"><div id="agents-bars" class="plot"></div></div>
-    </section>
+    <meta name="theme-color" content="#0d1117" />
+    <script type="module" crossorigin src="/assets/index-B2VOjK-U.js"></script>
+    <link rel="modulepreload" crossorigin href="/assets/button-q8ovzfhV.js">
+    <link rel="modulepreload" crossorigin href="/assets/with-selector-DJf50u0g.js">
+    <link rel="modulepreload" crossorigin href="/assets/utils-BJkellPl.js">
+    <link rel="stylesheet" crossorigin href="/assets/index-B0FGEF7B.css">
+  </head>
 
-    <section class="card" id="card-features">
-      <h2>Feature Importance</h2>
-      <div class="card-body"><div id="features-bars" class="plot"></div></div>
-    </section>
-
-    <section class="card" id="card-weights">
-      <h2>Adaptive Weights</h2>
-      <div class="card-body"><div id="weights-bars" class="plot"></div><div id="weights-drift" class="stats"></div></div>
-    </section>
-
-    <section class="card" id="card-ev">
-      <h2>EV Attribution</h2>
-      <div class="card-body"><div id="ev-bars" class="plot"></div></div>
-    </section>
-
-    <section class="card wide" id="card-regperf">
-      <h2>Regime Performance</h2>
-      <div class="card-body"><div id="regperf-table" class="tablewrap"></div></div>
-    </section>
-
-    <section class="card wide" id="card-hypotheses">
-      <h2>Hypotheses</h2>
-      <div class="card-body"><div id="hyp-table" class="tablewrap"></div></div>
-    </section>
-
-    <section class="card" id="card-episodes">
-      <h2>RL Episodes</h2>
-      <div class="card-body"><div id="episodes-bars" class="plot"></div><div id="episodes-stats" class="stats"></div></div>
-    </section>
-
-    <section class="card wide" id="card-positions">
-      <h2>Open Positions</h2>
-      <div class="card-body"><div id="pos-table" class="tablewrap"></div></div>
-    </section>
-
-    <section class="card" id="card-explain">
-      <h2>Explain a Ticker</h2>
-      <div class="card-body">
-        <form id="explain-form" class="explain-form">
-          <input id="explain-input" type="text" placeholder="e.g. SPY" maxlength="8" />
-          <button class="btn" type="submit">Explain</button>
-        </form>
-        <div id="explain-out" class="explain-out"></div>
-      </div>
-    </section>
-  </main>
-
-  <footer class="foot">
-    <span class="muted">Read-only analytics. This page cannot place, size, gate, or close any trade.</span>
-  </footer>
-
-  <script src="app.js"></script>
-</body>
+  <body>
+    <div id="root"></div>
+  </body>
 </html>

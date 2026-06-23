@@ -74,6 +74,15 @@ env/
 .mypy_cache/
 
 # ---------------------------------------------------------------------------
+# Frontend (Vite/React source — we DO commit frontend/ source and the built
+# dashboard/ bundle, but never these generated/dependency dirs)
+# ---------------------------------------------------------------------------
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/*.local
+
+# ---------------------------------------------------------------------------
 # OS / editor cruft
 # ---------------------------------------------------------------------------
 .DS_Store
