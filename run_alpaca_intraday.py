@@ -55,6 +55,7 @@ import argparse
 from datetime import datetime, date, time as dtime
 
 from exit_manager import enforce_exit
+import json_store
 
 ACTIVE_TRADES_FILE = "active_trades.json"
 STATUS_FILE = "scheduler_status.json"
@@ -261,44 +262,52 @@ def log(msg):
 # Active-trades file helpers (stamp scheduler-owned rows for EOD targeting)
 # --------------------------------------------------------------------------- #
 def _read_active_trades():
-    if not os.path.exists(ACTIVE_TRADES_FILE):
-        return []
-    try:
-        with open(ACTIVE_TRADES_FILE, "r") as f:
-            return json.load(f)
-    except Exception:
-        return []
+    trades = json_store.read_json(ACTIVE_TRADES_FILE, [])
+    return trades if isinstance(trades, list) else []
 
 
 def _stamp_scheduler_trade(option_symbol):
     """Mark the most-recent active trade for `option_symbol` as scheduler-owned so
-    the EOD force-close only ever touches positions this scheduler opened."""
+    the EOD force-close only ever touches positions this scheduler opened.
+
+    Routed through json_store.update_items so the read-modify-write takes the
+    cross-process lock and writes atomically (re-reads current on-disk state),
+    preventing a concurrent monitor/order write from clobbering the stamp.
+    Stamps only the LAST matching row (the just-opened trade), mirroring the
+    original `reversed()` most-recent semantics.
+    """
     trades = _read_active_trades()
-    stamped = False
-    for trade in reversed(trades):
-        if trade.get("symbol") == option_symbol:
-            trade["source"] = SCHEDULER_SOURCE
-            stamped = True
+    target_idx = None
+    for i in range(len(trades) - 1, -1, -1):
+        if trades[i].get("symbol") == option_symbol:
+            target_idx = i
             break
-    if stamped:
-        try:
-            with open(ACTIVE_TRADES_FILE, "w") as f:
-                json.dump(trades, f, indent=2)
-        except Exception as e:
-            log(f"[WARN] could not stamp active trade {option_symbol}: {e}")
-    return stamped
+    if target_idx is None:
+        return False
+
+    # Stamp the Nth on-disk occurrence of this symbol (the same one we found
+    # most-recent), counted forward so update_items can identify it.
+    occ_before_target = sum(
+        1 for t in trades[:target_idx] if t.get("symbol") == option_symbol)
+    seen = {"n": 0}
+
+    def _mut(t):
+        if t.get("symbol") == option_symbol:
+            if seen["n"] == occ_before_target:
+                t["source"] = SCHEDULER_SOURCE
+            seen["n"] += 1
+        return t
+
+    json_store.update_items(ACTIVE_TRADES_FILE, "symbol", _mut)
+    return True
 
 
-def _write_active_trades(trades):
-    """Persist the active-trades list (the survivors left after closes). Pairs
-    with `_read_active_trades`; both callers (EOD close + the fill-driven
-    reconcile) prune closed rows here so a sold position can't linger as
-    'tracked open'. Fail-open: a write error is logged, never raised."""
-    try:
-        with open(ACTIVE_TRADES_FILE, "w") as f:
-            json.dump(trades, f, indent=2, default=str)
-    except Exception as e:
-        log(f"[WARN] could not write {ACTIVE_TRADES_FILE}: {e}")
+def _prune_active_trades(closed_syms):
+    """Remove the given symbols from active_trades.json via a locked merge that
+    re-reads the current on-disk list. Unlike a survivors-overwrite, a position
+    appended by the order path during this cycle is preserved."""
+    json_store.merge_list(ACTIVE_TRADES_FILE,
+                          removals=set(closed_syms), key="symbol")
 
 
 def realized_from_fills(trade, fills):
@@ -469,9 +478,7 @@ class IntradayScheduler:
                 except Exception as e:
                     log(f"[WARN] {reason} failed for {trade.get('symbol')}: {e}")
         if closed_syms:
-            survivors = [t for t in trades
-                         if t.get("symbol") not in closed_syms]
-            _write_active_trades(survivors)
+            _prune_active_trades(closed_syms)
 
     def reconcile_closed_from_fills(self):
         """Fill-driven safety net: book any scheduler-owned tracked trade that is
@@ -515,9 +522,7 @@ class IntradayScheduler:
                 except Exception as e:
                     log(f"[RECONCILE] record failed for {sym}: {e}")
             if closed_syms:
-                survivors = [t for t in trades
-                             if t.get("symbol") not in closed_syms]
-                _write_active_trades(survivors)
+                _prune_active_trades(closed_syms)
         except Exception as e:
             log(f"[WARN] reconcile_closed_from_fills failed: {e}")
 

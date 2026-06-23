@@ -11,6 +11,12 @@ import argparse
 from typing import Dict, List, Optional, Tuple
 import pickle
 import math
+import json_store
+
+# Source tag stamped on scheduler-owned trades. Mirrors
+# run_alpaca_intraday.SCHEDULER_SOURCE; duplicated here (not imported) to avoid
+# a circular import between smart_trader and the scheduler.
+SCHEDULER_SOURCE = "alpaca_scheduler"
 
 class SmartOptionsTrader:
     def __init__(self, ticker: str = None, quantity: int = 1):
@@ -347,9 +353,15 @@ class SmartOptionsTrader:
             }
 
     def save_trading_history(self):
-        """Save trading history for future learning"""
-        with open(self.history_file, 'w') as f:
-            json.dump(self.trading_history, f, indent=2, default=str)
+        """Save trading history for future learning.
+
+        Atomic + lock-serialized via json_store. self.trading_history is the
+        authoritative in-memory copy, so the on-disk state is replaced wholesale
+        (dict-shaped store) -- but the write itself is now crash-safe and won't
+        interleave with another writer.
+        """
+        json_store.replace_items(self.history_file,
+                                 lambda _cur: self.trading_history)
 
     def load_ml_model(self):
         """Load or initialize ML model for trade optimization"""
@@ -426,6 +438,62 @@ class SmartOptionsTrader:
         if len(s) > 15 and s[-15:-8] and s[-9] in ("C", "P") and s[-8:].isdigit():
             return s[:-15]
         return s
+
+    @staticmethod
+    def _build_adopted_row(pos: Dict, levels: Optional[Dict] = None) -> Optional[Dict]:
+        """Build an active_trades row for an untracked live broker position.
+
+        Pure / no network. Used by reconcile_open_trades to ADOPT an OCC-option
+        position that exists at the broker but was never persisted to tracking
+        (the lost-update race). Returns None for non-OCC symbols (e.g. equities)
+        or a missing/invalid entry price / quantity. `levels` is the result of
+        calculate_dynamic_levels(underlying); when None or incomplete it falls
+        back to the same static defaults monitor_positions uses (0.10 / 0.20 /
+        0.05). entry_time is FRESH (now) so the carryover flush treats the
+        adopted trade as belonging to the current session and manages it normally
+        rather than force-closing it on sight.
+        """
+        sym = (pos.get('symbol') or '').upper()
+        underlying = SmartOptionsTrader._occ_underlying(sym)
+        if not sym or underlying == sym:
+            return None  # not a parseable OCC option (equity / unknown)
+        try:
+            entry_price = float(pos.get('avg_entry_price') or 0)
+            quantity = int(float(pos.get('qty') or 0))
+        except (TypeError, ValueError):
+            return None
+        if entry_price <= 0 or quantity == 0:
+            return None
+
+        levels = levels or {}
+        sl = levels.get('stop_loss_percent', 0.10)
+        tp = levels.get('take_profit_percent', 0.20)
+        td = levels.get('trailing_stop_distance', 0.05)
+        return {
+            'order_id': None,
+            'symbol': sym,
+            'underlying_symbol': underlying,
+            'entry_price': entry_price,
+            'entry_bid': None,
+            'entry_ask': None,
+            'quantity': quantity,
+            'dynamic_stop_loss_percent': sl,
+            'dynamic_take_profit_percent': tp,
+            'trailing_stop_distance': td,
+            'stop_loss_trigger': entry_price * (1 - sl),
+            'take_profit_trigger': entry_price * (1 + tp),
+            'partial_close_done': False,
+            'trailing_stop_active': False,
+            'highest_price': entry_price,
+            'entry_time': datetime.now().isoformat(),
+            'market_conditions': {
+                'volatility': levels.get('volatility', 0.0),
+                'momentum': levels.get('momentum', 0.0),
+                'market_regime': levels.get('market_regime', 'ranging'),
+            },
+            'source': SCHEDULER_SOURCE,
+            'adopted': True,
+        }
 
     @staticmethod
     def _occ_parse(symbol: str):
@@ -801,12 +869,6 @@ class SmartOptionsTrader:
         active_file = 'active_trades.json'
         if not os.path.exists(active_file):
             return
-        try:
-            with open(active_file, 'r') as f:
-                active_trades = json.load(f)
-        except Exception as e:
-            print(f"[RECONCILE] Could not read {active_file}: {e}")
-            return
 
         try:
             positions = self.get_positions()
@@ -818,44 +880,71 @@ class SmartOptionsTrader:
             return
 
         pos_by_symbol = {p.get('symbol'): p for p in positions}
-        still_open = []
-        closed = 0
-        for trade in active_trades:
-            sym = trade.get('symbol')
-            if sym in pos_by_symbol:
-                still_open.append(trade)
-                continue
-            closed_pnl = 0
-            try:
-                last = self.get_option_price(sym)
-                entry_price = trade.get('entry_price')
-                if last and entry_price:
-                    exit_px = last.get('mid') or last.get('ask') or last.get('bid') or 0
-                    if exit_px and entry_price:
-                        closed_pnl = ((exit_px - entry_price) / entry_price) * 100
-            except Exception:
+
+        # Hold the lock across the whole read-modify-write so a concurrent order
+        # append can't be lost between our read and write.
+        with json_store.locked(active_file):
+            active_trades = json_store.read_json(active_file, [])
+            if not isinstance(active_trades, list):
+                active_trades = []
+
+            still_open = []
+            closed = 0
+            for trade in active_trades:
+                sym = trade.get('symbol')
+                if sym in pos_by_symbol:
+                    still_open.append(trade)
+                    continue
                 closed_pnl = 0
-            print(f"[RECONCILE] {sym} no longer held; recording close "
-                  f"(~{closed_pnl:+.1f}%).")
-            try:
-                self.record_trade_outcome(trade, 'reconciled_closed', closed_pnl)
-            except Exception as e:
-                print(f"[RECONCILE] record_trade_outcome failed for {sym}: {e}")
-            closed += 1
+                try:
+                    last = self.get_option_price(sym)
+                    entry_price = trade.get('entry_price')
+                    if last and entry_price:
+                        exit_px = last.get('mid') or last.get('ask') or last.get('bid') or 0
+                        if exit_px and entry_price:
+                            closed_pnl = ((exit_px - entry_price) / entry_price) * 100
+                except Exception:
+                    closed_pnl = 0
+                print(f"[RECONCILE] {sym} no longer held; recording close "
+                      f"(~{closed_pnl:+.1f}%).")
+                try:
+                    self.record_trade_outcome(trade, 'reconciled_closed', closed_pnl)
+                except Exception as e:
+                    print(f"[RECONCILE] record_trade_outcome failed for {sym}: {e}")
+                closed += 1
 
-        tracked = {t.get('symbol') for t in active_trades}
-        for sym, p in pos_by_symbol.items():
-            if sym not in tracked:
-                print(f"[RECONCILE] Untracked live position: {sym} "
-                      f"(qty {p.get('qty')}). Not monitored.")
+            # AUTO-ADOPT: a live broker position with no tracked trade is one the
+            # order path placed but the lost-update race dropped from tracking.
+            # Adopt OCC-option positions so the normal monitor/stop/TP/EOD path
+            # manages them; skip equities and bad rows. Recorded with a fresh
+            # entry_time and source=scheduler so they behave like a same-session
+            # trade. This recovers the current orphans and is a permanent net.
+            tracked = {t.get('symbol') for t in active_trades}
+            adopted = 0
+            for sym, p in pos_by_symbol.items():
+                if sym in tracked:
+                    continue
+                try:
+                    levels = self.calculate_dynamic_levels(self._occ_underlying(sym))
+                except Exception:
+                    levels = None
+                row = self._build_adopted_row(p, levels)
+                if row is None:
+                    print(f"[RECONCILE] Untracked live position: {sym} "
+                          f"(qty {p.get('qty')}). Not adopted (non-option/invalid).")
+                    continue
+                still_open.append(row)
+                adopted += 1
+                print(f"[RECONCILE] Adopted {sym} qty={row['quantity']} "
+                      f"@ {row['entry_price']:.2f} "
+                      f"(SL {row['dynamic_stop_loss_percent']:.0%}/"
+                      f"TP {row['dynamic_take_profit_percent']:.0%}).")
 
-        try:
-            with open(active_file, 'w') as f:
-                json.dump(still_open, f, indent=2, default=str)
-        except Exception as e:
-            print(f"[RECONCILE] Could not write {active_file}: {e}")
+            if not json_store.atomic_write_json(active_file, still_open):
+                print(f"[RECONCILE] Could not write {active_file}")
 
-        print(f"[RECONCILE] {len(still_open)} open / {closed} closed-out reconciled.")
+        print(f"[RECONCILE] {len(still_open)} open / {closed} closed-out / "
+              f"{adopted} adopted.")
 
     def get_market_status(self):
         """Check if market is open"""
@@ -2147,19 +2236,14 @@ class SmartOptionsTrader:
         return None
 
     def save_active_trade(self, trade_info: Dict):
-        """Save active trade for monitoring"""
-        active_file = 'active_trades.json'
+        """Save active trade for monitoring.
 
-        if os.path.exists(active_file):
-            with open(active_file, 'r') as f:
-                active_trades = json.load(f)
-        else:
-            active_trades = []
-
-        active_trades.append(trade_info)
-
-        with open(active_file, 'w') as f:
-            json.dump(active_trades, f, indent=2, default=str)
+        Routed through json_store.append_item so the append takes the
+        cross-process lock, re-reads the current on-disk list and writes
+        atomically -- a concurrent monitor/reconcile write can no longer clobber
+        this newly-opened trade.
+        """
+        json_store.append_item('active_trades.json', trade_info)
 
     def monitor_positions(self):
         """Monitor positions for stop loss and take profit"""
@@ -2168,8 +2252,9 @@ class SmartOptionsTrader:
         if not os.path.exists(active_file):
             return
 
-        with open(active_file, 'r') as f:
-            active_trades = json.load(f)
+        active_trades = json_store.read_json(active_file, [])
+        if not isinstance(active_trades, list):
+            return
 
         positions = self.get_positions()
         updated_trades = []
@@ -2304,9 +2389,18 @@ class SmartOptionsTrader:
 
             updated_trades.append(trade)
 
-        # Save updated active trades
-        with open(active_file, 'w') as f:
-            json.dump(updated_trades, f, indent=2, default=str)
+        # Persist as a MERGE against the current on-disk state instead of a blind
+        # overwrite. `survivors` are the rows this pass kept (with their updated
+        # highest_price / trailing / partial_close / regime fields); `closed_syms`
+        # are symbols from our snapshot that hit a close/exit branch. Any symbol
+        # that appeared on disk during this slow loop (a concurrent append from
+        # the order path) is in neither set and is therefore preserved -- this is
+        # the fix for positions being silently dropped from tracking.
+        survivors = {t['symbol']: t for t in updated_trades if t.get('symbol')}
+        snapshot_syms = {t['symbol'] for t in active_trades if t.get('symbol')}
+        closed_syms = snapshot_syms - set(survivors)
+        json_store.merge_list(active_file, updates=survivors,
+                              removals=closed_syms, key='symbol')
 
     def close_partial_position(self, trade: Dict, position: Dict, percentage: float):
         """Close partial position"""
@@ -2510,16 +2604,18 @@ class SmartOptionsTrader:
         try:
             if not os.path.exists(active_file):
                 return
-            with open(active_file, 'r') as f:
-                trades = json.load(f)
-            for t in trades:
-                if t.get('symbol') == new_symbol and 'rolled_from' not in t:
+            stamped = {'done': False}
+
+            def _mut(t):
+                if (not stamped['done'] and t.get('symbol') == new_symbol
+                        and 'rolled_from' not in t):
                     t['rolled_from'] = old_trade.get('symbol')
                     if old_trade.get('source') is not None:
                         t['source'] = old_trade['source']
-                    break
-            with open(active_file, 'w') as f:
-                json.dump(trades, f, indent=2, default=str)
+                    stamped['done'] = True
+                return t
+
+            json_store.update_items(active_file, 'symbol', _mut)
         except Exception as e:
             print(f"[ROLL] stamp rolled_from failed (ignored): {e}")
 

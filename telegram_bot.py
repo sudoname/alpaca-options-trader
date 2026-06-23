@@ -5,6 +5,7 @@ Send ticker to trade, get real-time position updates
 
 import requests
 import json
+import json_store
 import os
 import time
 import threading
@@ -2849,35 +2850,21 @@ Total symbols: `{len(self.supported_tickers)}`"""
 `YES AAPL` → trade executed"""
 
     def save_active_trade(self, trade_info):
-        """Save trade for monitoring"""
-        trades_file = 'telegram_trades.json'
-
-        if os.path.exists(trades_file):
-            with open(trades_file, 'r') as f:
-                trades = json.load(f)
-        else:
-            trades = []
-
-        trades.append(trade_info)
-
-        with open(trades_file, 'w') as f:
-            json.dump(trades, f, indent=2, default=str)
+        """Save trade for monitoring (locked atomic append via json_store)."""
+        json_store.append_item('telegram_trades.json', trade_info)
 
     def load_active_trades(self):
         """Load active trades"""
-        trades_file = 'telegram_trades.json'
-
-        if os.path.exists(trades_file):
-            with open(trades_file, 'r') as f:
-                return json.load(f)
-
-        return []
+        trades = json_store.read_json('telegram_trades.json', [])
+        return trades if isinstance(trades, list) else []
 
     def update_active_trades(self, trades):
-        """Update active trades file"""
-        trades_file = 'telegram_trades.json'
-        with open(trades_file, 'w') as f:
-            json.dump(trades, f, indent=2, default=str)
+        """Update active trades file. The bot is the sole writer of
+        telegram_trades.json, so a locked atomic overwrite is sufficient (no
+        cross-process append to merge); the lock still guards against the bot's
+        own monitor thread racing a save."""
+        with json_store.locked('telegram_trades.json'):
+            json_store.atomic_write_json('telegram_trades.json', trades)
 
     def start_position_monitoring(self):
         """Start monitoring positions in background"""

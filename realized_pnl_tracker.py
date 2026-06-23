@@ -21,6 +21,7 @@ to the risk engine, gated behind ``USE_REALIZED_PNL_KILLSWITCH``.
 
 import json
 import os
+import json_store
 from datetime import datetime
 from typing import List, Dict, Optional
 
@@ -31,19 +32,13 @@ class RealizedPnLTracker:
 
     # -- storage ---------------------------------------------------------- #
     def _load(self) -> List[Dict]:
-        try:
-            if os.path.exists(self.log_file):
-                with open(self.log_file, "r") as f:
-                    data = json.load(f)
-                    return data if isinstance(data, list) else []
-        except Exception:
-            pass
-        return []
+        data = json_store.read_json(self.log_file, [])
+        return data if isinstance(data, list) else []
 
     def _save(self, rows: List[Dict]) -> None:
         try:
-            with open(self.log_file, "w") as f:
-                json.dump(rows, f, indent=2)
+            with json_store.locked(self.log_file):
+                json_store.atomic_write_json(self.log_file, rows)
         except Exception:
             pass
 
@@ -66,9 +61,9 @@ class RealizedPnLTracker:
             "amount": amt,
             "symbol": symbol or "",
         }
-        rows = self._load()
-        rows.append(row)
-        self._save(rows)
+        # Locked atomic append: both the scheduler and the bot record realized
+        # P/L, so a blind read-append-write could lose entries.
+        json_store.append_item(self.log_file, row)
 
     def get_today_realized(self) -> float:
         """Sum of realized dollar P/L recorded for *today* (local date).

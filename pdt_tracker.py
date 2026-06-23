@@ -6,6 +6,7 @@ Prevents PDT violations for accounts < $25,000
 
 import os
 import json
+import json_store
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
@@ -24,15 +25,13 @@ class PDTTracker:
 
     def load_day_trades(self):
         """Load day trade history from file"""
-        if os.path.exists(self.log_file):
-            with open(self.log_file, 'r') as f:
-                return json.load(f)
-        return []
+        trades = json_store.read_json(self.log_file, [])
+        return trades if isinstance(trades, list) else []
 
     def save_day_trades(self, trades):
-        """Save day trade history to file"""
-        with open(self.log_file, 'w') as f:
-            json.dump(trades, f, indent=2)
+        """Save day trade history to file (lock + atomic via json_store)."""
+        with json_store.locked(self.log_file):
+            json_store.atomic_write_json(self.log_file, trades)
 
     def get_business_days_ago(self, days=5):
         """Get date N business days ago"""
@@ -111,8 +110,6 @@ class PDTTracker:
 
     def log_day_trade(self, trade_info):
         """Record a day trade"""
-        trades = self.load_day_trades()
-
         # Add new day trade
         day_trade = {
             'date': datetime.now().isoformat(),
@@ -123,8 +120,9 @@ class PDTTracker:
             'order_id': trade_info.get('order_id', '')
         }
 
-        trades.append(day_trade)
-        self.save_day_trades(trades)
+        # Locked atomic append: both the scheduler and the bot log day trades,
+        # so a blind read-append-write could lose entries.
+        json_store.append_item(self.log_file, day_trade)
 
         print(f"[PDT] Day trade logged: {day_trade['symbol']}")
         print(f"[PDT] Remaining day trades: {self.get_remaining_day_trades()}/3")
