@@ -70,6 +70,10 @@ body {
 .card h2 { font-size: 14px; margin: 0 0 12px; font-weight: 600; color: var(--text); }
 .card-body { display: flex; flex-direction: column; gap: 10px; }
 .plot { width: 100%; min-height: 260px; }
+/* Big headline label above the regime / sentiment gauges. */
+.gauge-caption { text-align: center; line-height: 1.15; margin: 2px 0 -10px; min-height: 30px; }
+.gauge-caption .g-label { font-size: 26px; font-weight: 700; letter-spacing: .4px; }
+.gauge-caption .g-sub { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; margin-top: 2px; }
 .reasons, .stats { font-size: 13px; color: var(--muted); }
 .reasons ul { margin: 4px 0 0; padding-left: 18px; }
 

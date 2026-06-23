@@ -126,9 +126,13 @@ async function loadEpisodes() {
 async function loadRegime() {
   const d = await api("regime");
   const reasonsEl = document.getElementById("regime-reasons");
-  if (!isUsable(d)) { placeholder("regime-gauge", d); reasonsEl.innerHTML = ""; return; }
+  const capEl = document.getElementById("regime-caption");
+  if (!isUsable(d)) { placeholder("regime-gauge", d); reasonsEl.innerHTML = ""; if (capEl) capEl.innerHTML = ""; return; }
   const conf = Number(d.confidence || 0);
-  const label = d.label || "—";
+  const label = String(d.label || "—").replace(/_/g, " ");
+  if (capEl) capEl.innerHTML =
+    `<div class="g-label" style="color:${C.accent}">${escapeHtml(label)}</div>` +
+    `<div class="g-sub">market regime</div>`;
   g2render("regime-gauge", {
     type: "gauge",
     autoFit: true,
@@ -136,11 +140,15 @@ async function loadRegime() {
     legend: false,
     scale: { color: { range: [C.accent, "#1c2330"] } },
     style: {
-      textContent: (target) => `${label} · ${target}%`,
+      textContent: (target) => `${target}%`,
+      textFontSize: 30,
+      textFontWeight: 700,
+      textFill: "#e6edf3",
+      arcShape: "round",
       pointerStroke: C.accent,
       pinStroke: C.accent,
     },
-  }, 260);
+  }, 240);
   const reasons = Array.isArray(d.reasons) ? d.reasons : [];
   reasonsEl.innerHTML = reasons.length
     ? "<ul>" + reasons.map(r => `<li>${escapeHtml(String(r))}</li>`).join("") + "</ul>"
@@ -179,13 +187,19 @@ async function loadSentiment() {
   const d = await api("sentiment");
   renderSentimentKpi(d);
   const compEl = document.getElementById("sentiment-components");
+  const capEl = document.getElementById("sentiment-caption");
   if (!isUsable(d) || d.score == null) {
     placeholder("sentiment-gauge", d);
     if (compEl) compEl.innerHTML = "";
+    if (capEl) capEl.innerHTML = "";
     return;
   }
   const score = Number(d.score);
   const cls = d.classification || "—";
+  const col = fgColor(score);
+  if (capEl) capEl.innerHTML =
+    `<div class="g-label" style="color:${col}">${escapeHtml(String(cls))}</div>` +
+    `<div class="g-sub">fear &amp; greed</div>`;
   g2render("sentiment-gauge", {
     type: "gauge",
     autoFit: true,
@@ -199,11 +213,15 @@ async function loadSentiment() {
     legend: false,
     scale: { color: { range: FG_BANDS.map(b => b.color) } },
     style: {
-      textContent: (target) => `${cls} · ${target}`,
+      textContent: (target) => `${target}`,
+      textFontSize: 32,
+      textFontWeight: 700,
+      textFill: col,
+      arcShape: "round",
       pointerStroke: "#e6edf3",
       pinStroke: "#e6edf3",
     },
-  }, 260);
+  }, 240);
 
   const src = d.source ? `<span class="muted">source: ${escapeHtml(String(d.source))}` +
     (d.cnn_score != null ? ` · CNN ${Math.round(d.cnn_score)}` : "") +
