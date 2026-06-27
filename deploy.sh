@@ -103,6 +103,7 @@ echo "==> Running self-test gate"
 "$PYTHON" backtest_rl_gate.py --selftest
 "$PYTHON" run_alpaca_intraday.py --selftest
 "$PYTHON" oracle_dashboard.py --selftest
+"$PYTHON" daily_report_v2.py --selftest
 "$PYTHON" single_leg_reports.py --selftest
 "$PYTHON" explain_context.py --selftest
 "$PYTHON" sentiment_report.py --selftest
