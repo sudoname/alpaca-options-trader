@@ -2191,6 +2191,17 @@ class SmartOptionsTrader:
             if getattr(self, 'shadow_recorder', None):
                 try:
                     quote = self.get_option_price(option['symbol'])
+                    # Advisory evidence stamp (agent votes / regime / candlestick /
+                    # feature buckets). Fail-open: a failure here leaves the just-
+                    # placed order untouched and simply stores no evidence.
+                    evidence = None
+                    try:
+                        import evidence_context
+                        evidence = evidence_context.compute_evidence(
+                            self._build_evidence_ctx(
+                                underlying_symbol, option, dynamic_levels))
+                    except Exception as e:
+                        print(f"[SHADOW] evidence stamp skipped: {e}")
                     decision_id = self.shadow_recorder.on_decision(
                         symbol=option['symbol'],
                         underlying=underlying_symbol,
@@ -2202,9 +2213,13 @@ class SmartOptionsTrader:
                         as_of=datetime.now().isoformat(),
                         day_of_week=datetime.now().weekday(),
                         risk=risk_verdict,
+                        evidence=evidence,
                     )
                     if decision_id:
                         trade_info['decision_id'] = decision_id
+                        ev_n = len(evidence) if isinstance(evidence, dict) else 0
+                        print(f"[SHADOW] logged {decision_id} "
+                              f"(evidence fields: {ev_n})")
                 except Exception as e:
                     print(f"[SHADOW] on_decision failed: {e}")
             elif self.rl_advisor:
@@ -2234,6 +2249,49 @@ class SmartOptionsTrader:
             print(f"[ORDER ERROR] Order rejected (HTTP {response.status_code})")
             self.last_block_reason = f"the broker rejected the order (HTTP {response.status_code})"
         return None
+
+    def _build_evidence_ctx(self, underlying_symbol: str, option: Dict,
+                            dynamic_levels: Dict) -> Dict:
+        """Assemble the market ctx for the advisory evidence stamp. Never raises.
+
+        Reuses ``explain_context.build_explain_context`` (the same builder the
+        Oracle shadow uses) for trend / momentum / realized_vol / regime /
+        volume_ratio / rel_strength / candlestick, then enriches with the
+        option-specific dimensions (direction / dte / delta / iv / strength).
+        Every field fails open to absent so a missing slice never blocks the
+        rest. This is advisory only and never affects the order just placed.
+        """
+        ctx: Dict = {}
+        try:
+            import explain_context
+            ctx = explain_context.build_explain_context(underlying_symbol) or {}
+        except Exception:
+            ctx = {}
+        try:
+            action = (option.get('type') or 'call').lower()
+            ctx.setdefault('direction', 'up' if action == 'call' else 'down')
+            if dynamic_levels.get('momentum') is not None:
+                ctx.setdefault('momentum', dynamic_levels.get('momentum'))
+            strength = option.get('score')
+            if strength is None:
+                strength = option.get('confidence')
+            if strength is not None:
+                ctx['signal_strength'] = strength
+            if option.get('delta') is not None:
+                ctx['delta'] = option.get('delta')
+            if option.get('iv') is not None:
+                ctx['iv'] = option.get('iv')
+            exp = option.get('expiration')
+            if exp:
+                try:
+                    from datetime import date
+                    d = datetime.fromisoformat(str(exp)[:10]).date()
+                    ctx['dte'] = max(0, (d - date.today()).days)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return ctx
 
     def save_active_trade(self, trade_info: Dict):
         """Save active trade for monitoring.

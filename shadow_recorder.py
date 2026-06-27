@@ -90,8 +90,15 @@ class ShadowRecorder:
         gate_overrides: Optional[Dict] = None,
         risk: Optional[Dict] = None,
         features: Optional[Dict] = None,
+        evidence: Optional[Dict] = None,
     ) -> Optional[str]:
-        """Record a decision and return its decision_id. Never raises."""
+        """Record a decision and return its decision_id. Never raises.
+
+        ``evidence`` (agent votes / regime / candlestick / feature buckets from
+        ``evidence_context.compute_evidence``) is merged into ``features`` under an
+        ``"evidence"`` namespace so it lands in ``episodes.db.features_json`` with no
+        schema change. It is purely advisory and never affects the trade.
+        """
         try:
             strat = strat or self.strat_name
             as_of = as_of or datetime.now().isoformat()
@@ -100,6 +107,12 @@ class ShadowRecorder:
             feats = features or self._features_from_analysis(
                 analysis, as_of, symbol, strat, pdt_remaining, day_of_week
             )
+            if evidence:
+                try:
+                    feats = dict(feats)
+                    feats["evidence"] = evidence
+                except Exception:
+                    pass
 
             # Modeled round-trip cost from the entry quote (if any).
             modeled_cost = None

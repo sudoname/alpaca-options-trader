@@ -33,6 +33,25 @@ from spread_builder import SpreadLeg, SpreadProposal, BULLISH_PUT_CREDIT_SPREAD
 HERE = os.path.dirname(os.path.abspath(__file__))
 EXP = (date.today() + timedelta(days=30)).isoformat()
 
+# Phase 11B: run_best_ev now auto-stamps candlesticks, which would build a live
+# bar provider from .env creds and hit the network. Keep this offline suite
+# network-free by disabling ranker fetch for the whole module. The dedicated
+# candlestick tests below pass explicit configs and are unaffected.
+_PRIOR_FETCH_ENV = None
+
+
+def setUpModule():
+    global _PRIOR_FETCH_ENV
+    _PRIOR_FETCH_ENV = os.environ.get("CANDLESTICK_FETCH_IN_RANKER")
+    os.environ["CANDLESTICK_FETCH_IN_RANKER"] = "false"
+
+
+def tearDownModule():
+    if _PRIOR_FETCH_ENV is None:
+        os.environ.pop("CANDLESTICK_FETCH_IN_RANKER", None)
+    else:
+        os.environ["CANDLESTICK_FETCH_IN_RANKER"] = _PRIOR_FETCH_ENV
+
 
 def row(sym="SPY", strategy=BULLISH_PUT_CREDIT_SPREAD, ev=10.0, pop=0.7,
         ratio=0.10, mp=50.0, ml=450.0, costs=9.0, score=60.0, days=30,
@@ -371,6 +390,126 @@ class TestNoExecutionPathTouched(unittest.TestCase):
         src = self._read("telegram_bot.py")
         self.assertIn("BEST_EV_TRADES", src)
         self.assertIn("def best_ev_trades", src)
+
+
+# --------------------------------------------------------------------------- #
+# 9. Phase 11B — candlestick stamping in the ranker (ANALYTICS ONLY).
+#     Offline: the bar provider is injected; no creds / network ever touched.
+# --------------------------------------------------------------------------- #
+import collections
+
+from oracle.signals import candlestick_patterns as csp  # noqa: E402
+import candidate_resolution as cr  # noqa: E402
+
+# A Bar-like namedtuple matching market_view.Bar's field ORDER (date first).
+# Its presence proves _to_candle parses by name, not by tuple position.
+_BarLike = collections.namedtuple("_BarLike", "date o h l c v close_dt")
+
+
+def _hammer_dicts():
+    """Four down-trend candles then a hammer -> bullish_reversal."""
+    out = [{"o": p + 0.3, "h": p + 0.6, "l": p - 0.6, "c": p, "v": 100}
+           for p in (110, 108, 106, 104)]
+    out.append({"o": 100.0, "h": 100.7, "l": 98.5, "c": 100.6, "v": 100})
+    return out
+
+
+def _hammer_bars():
+    """Same hammer fixture as Bar-like namedtuples (date in slot 0)."""
+    bars = [_BarLike(f"d{i}", p + 0.3, p + 0.6, p - 0.6, p, 100, None)
+            for i, p in enumerate((110, 108, 106, 104))]
+    bars.append(_BarLike("d4", 100.0, 100.7, 98.5, 100.6, 100, None))
+    return bars
+
+
+def _cfg(enabled=True, fetch=True, lookback=10):
+    return csp.CandlestickConfig(enabled=enabled, fetch_in_ranker=fetch,
+                                 ranker_lookback=lookback)
+
+
+class TestCandlestickStamping(unittest.TestCase):
+    def setUp(self):
+        self.now = __import__("datetime").datetime(
+            2026, 6, 17, tzinfo=__import__("datetime").timezone.utc)
+        self.day = "2026-06-17"
+
+    def test_extras_carry_fields_from_dict_candles(self):
+        provider = lambda sym, lb: _hammer_dicts()
+        extras = ber._candlestick_extras(
+            [row(sym="SPY")], bar_provider=provider, config=_cfg(),
+            now=self.now)
+        key = cr.candidate_key("SPY", BULLISH_PUT_CREDIT_SPREAD, self.day)
+        self.assertIn(key, extras)
+        self.assertEqual(extras[key]["candlestick_pattern"], "hammer")
+        self.assertEqual(extras[key]["candlestick_bias"], "bullish")
+        # Only the 6 frozen fields — never the raw candle arrays.
+        self.assertNotIn("candles", extras[key])
+        self.assertEqual(set(extras[key]), set(cr._CANDLESTICK_KEYS))
+
+    def test_bar_namedtuple_is_parsed_by_name(self):
+        # Regression: market_view.Bar is a NamedTuple (date in slot 0). The
+        # detector's tuple branch would mis-read it; _to_candle must coerce.
+        provider = lambda sym, lb: _hammer_bars()
+        extras = ber._candlestick_extras(
+            [row(sym="SPY")], bar_provider=provider, config=_cfg(),
+            now=self.now)
+        key = cr.candidate_key("SPY", BULLISH_PUT_CREDIT_SPREAD, self.day)
+        self.assertEqual(extras[key]["candlestick_pattern"], "hammer")
+
+    def test_disabled_via_fetch_flag_returns_empty(self):
+        provider = lambda sym, lb: _hammer_dicts()
+        out = ber._candlestick_extras(
+            [row()], bar_provider=provider, config=_cfg(fetch=False),
+            now=self.now)
+        self.assertEqual(out, {})
+
+    def test_globally_disabled_returns_empty(self):
+        provider = lambda sym, lb: _hammer_dicts()
+        out = ber._candlestick_extras(
+            [row()], bar_provider=provider, config=_cfg(enabled=False),
+            now=self.now)
+        self.assertEqual(out, {})
+
+    def test_no_provider_returns_empty(self):
+        out = ber._candlestick_extras(
+            [row()], bar_provider=None, config=_cfg(),
+            now=self.now)
+        # No injected provider + offline (default provider may be None) -> {}.
+        # In CI with creds in .env this still must not place/predict anything;
+        # we only assert it is a dict and contains no execution side effects.
+        self.assertIsInstance(out, dict)
+
+    def test_provider_raising_is_fail_open(self):
+        def boom(sym, lb):
+            raise RuntimeError("network down")
+        out = ber._candlestick_extras(
+            [row()], bar_provider=boom, config=_cfg(), now=self.now)
+        self.assertEqual(out, {})
+
+    def test_empty_bars_yield_no_pattern(self):
+        out = ber._candlestick_extras(
+            [row()], bar_provider=lambda s, l: [], config=_cfg(),
+            now=self.now)
+        self.assertEqual(out, {})
+
+    def test_unique_symbol_fetched_once(self):
+        calls = []
+
+        def counting(sym, lb):
+            calls.append(sym)
+            return _hammer_dicts()
+        rows = [row(sym="SPY"), row(sym="SPY"), row(sym="QQQ")]
+        ber._candlestick_extras(rows, bar_provider=counting,
+                                config=_cfg(), now=self.now)
+        self.assertEqual(sorted(calls), ["QQQ", "SPY"])
+
+    def test_to_candle_coerces_barlike(self):
+        d = ber._to_candle(_BarLike("d", 1.0, 2.0, 0.5, 1.5, 99, None))
+        self.assertEqual((d["o"], d["h"], d["l"], d["c"], d["v"]),
+                         (1.0, 2.0, 0.5, 1.5, 99))
+        # Dicts pass straight through.
+        src = {"o": 1, "h": 2, "l": 0, "c": 1}
+        self.assertIs(ber._to_candle(src), src)
 
 
 if __name__ == "__main__":

@@ -386,6 +386,44 @@ def _self_test() -> int:
     return 0 if ok else 1
 
 
+def load_episode_records(db_path: str = "episodes.db") -> List[dict]:
+    """Closed episodes flattened to the {agent_votes, pnl, ...} shape this module
+    consumes. Reuses ``evidence_attribution.load_completed`` (which lifts
+    ``features_json.evidence.agent_votes`` to the top level). Never raises."""
+    try:
+        import evidence_attribution as ea
+        return ea.load_completed(db_path)
+    except Exception:  # pragma: no cover - fail-open
+        return []
+
+
+def main(argv=None) -> int:
+    import argparse
+    parser = argparse.ArgumentParser(description="Oracle agent-weight learner")
+    parser.add_argument("--live", action="store_true",
+                        help="compute weights from the live episode store")
+    parser.add_argument("--write", action="store_true",
+                        help="persist learned weights to oracle_agent_weights.json")
+    parser.add_argument("--db", default="episodes.db", help="episode store path")
+    args = parser.parse_args(argv)
+
+    if not args.live:
+        return _self_test()
+
+    records = load_episode_records(args.db)
+    result = update_weights(records, persist=args.write)
+    print(f"verdict={result.get('verdict')} "
+          f"sample_size={result.get('sample_size')} "
+          f"base_win_rate={result.get('base_win_rate')}")
+    for name, w in sorted((result.get("weights") or {}).items()):
+        print(f"  {name:14s} {w}")
+    if args.write and result.get("verdict") == "OK":
+        print("[weights] persisted to oracle_agent_weights.json")
+    elif args.write:
+        print("[weights] not persisted (insufficient data)")
+    return 0
+
+
 if __name__ == "__main__":
     import sys
-    sys.exit(_self_test())
+    sys.exit(main())

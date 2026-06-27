@@ -358,6 +358,9 @@ class TelegramTradingBot:
         elif text == 'ORACLE_DAILY_REPORT' or text == '/ORACLE_DAILY_REPORT':
             return self.oracle_daily_report(chat_id)
 
+        elif text == 'DAILY_REPORT_V2' or text == '/DAILY_REPORT_V2':
+            return self.consolidated_daily_report(chat_id)
+
         elif text == 'HYPOTHESIS_REPORT' or text == '/HYPOTHESIS_REPORT':
             return self.hypothesis_report(chat_id)
 
@@ -2519,6 +2522,19 @@ Total symbols: `{len(self.supported_tickers)}`"""
         except Exception as e:
             return f"❌ Could not build the daily report: {e}"
 
+    def consolidated_daily_report(self, chat_id=None):
+        """Phase 10: on-demand consolidated daily report (single-leg live book).
+
+        Read-only 5-section summary — Trading / Portfolio / Execution /
+        Learning / Confidence — over the live episode store and broker export.
+        Places no trades.
+        """
+        try:
+            from daily_report_v2 import generate_consolidated_report_text
+            return generate_consolidated_report_text()
+        except Exception as e:
+            return f"❌ Could not build the consolidated report: {e}"
+
     def hypothesis_report(self, chat_id=None):
         """Phase 8E: advisory hypothesis testing over the simulated book.
 
@@ -2654,6 +2670,16 @@ Total symbols: `{len(self.supported_tickers)}`"""
                 if should_send_daily_report(now, self.daily_oracle_report_hour,
                                             self.daily_oracle_report_minute, last):
                     self._broadcast(generate_daily_report_text())
+                    # Phase 10: consolidated single-leg report + dated artifact.
+                    # Fail-open — must never break the existing spread report.
+                    try:
+                        import daily_report_v2 as drv2
+                        report = drv2.build_consolidated_report(now=now)
+                        self._broadcast(drv2.format_consolidated_report(report))
+                        paths = drv2.write_dated_artifact(report)
+                        print(f"[ORACLE_REPORT] consolidated report written: {paths}")
+                    except Exception as e:
+                        print(f"[ORACLE_REPORT] consolidated report skipped: {e}")
                     write_last_sent_date(now.strftime("%Y-%m-%d"),
                                          self.daily_oracle_report_state_file)
                     print("[ORACLE_REPORT] daily report sent")

@@ -359,6 +359,22 @@ def create_app(config: "DashboardConfig" = None) -> Flask:
             return slr.compute_single_leg_episodes()
         return _cached_json("single-leg-episodes", provider)
 
+    # -- evidence-EV leaderboard + consolidated daily report v2 ---------- #
+    @app.route("/api/evidence-leaderboard")
+    def evidence_leaderboard():
+        def provider():
+            import evidence_attribution as ea
+            return ea.compute_all()
+        return _cached_json("evidence-leaderboard", provider)
+
+    @app.route("/api/daily-v2")
+    def daily_v2():
+        def provider():
+            import daily_report_v2 as drv2
+            report = drv2.build_consolidated_report()
+            return drv2._json_safe(report)
+        return _cached_json("daily-v2", provider)
+
     # -- static frontend ------------------------------------------------- #
     @app.route("/")
     def index():

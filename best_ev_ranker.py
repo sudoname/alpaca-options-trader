@@ -175,6 +175,114 @@ def rank_candidates(results: Sequence[EVResult],
     return sorted(kept, key=_sort_key)
 
 
+# --------------------------------------------------------------------------- #
+# Phase 11B — candlestick stamping (ANALYTICS ONLY).
+#
+# Opt-in: when enabled, the ranker fetches recent daily bars per unique ranked
+# symbol, runs the pure candlestick detector, and freezes the 6 derived
+# ``candlestick_*`` fields onto each candidate via ``extras``. Raw candles are
+# NEVER persisted. This is a market-behaviour annotation only — it can never
+# change ranking, EV, PoP, risk, advisory, gates, sizing, or any order. Fully
+# fail-open: missing creds / network errors / detector errors -> {}.
+# --------------------------------------------------------------------------- #
+def _to_candle(bar) -> dict:
+    """Coerce a bar (``Bar`` namedtuple / object / dict) to an OHLCV dict.
+
+    ``Bar`` is a NamedTuple, so it would mis-parse via the detector's tuple
+    branch (its first field is the date string). Converting to a dict here
+    keeps the shared detector untouched and parses by name.
+    """
+    if isinstance(bar, dict):
+        return bar
+    return {
+        "o": getattr(bar, "o", getattr(bar, "open", None)),
+        "h": getattr(bar, "h", getattr(bar, "high", None)),
+        "l": getattr(bar, "l", getattr(bar, "low", None)),
+        "c": getattr(bar, "c", getattr(bar, "close", None)),
+        "v": getattr(bar, "v", getattr(bar, "volume", None)),
+    }
+
+
+def _default_bar_provider(config=None):
+    """Build a daily-bar fetcher ``(symbol, lookback) -> bars`` from env creds.
+
+    Returns None when credentials are absent or anything fails (offline-safe).
+    Never raises.
+    """
+    try:
+        from config_loader import ConfigLoader
+        c = ConfigLoader()
+        key = c.get_str("ALPACA_API_KEY", "")
+        secret = c.get_str("ALPACA_SECRET_KEY", "")
+        if not key or not secret:
+            return None
+        from market_view import LiveMarketView
+        mv = LiveMarketView(headers={
+            "APCA-API-KEY-ID": key,
+            "APCA-API-SECRET-KEY": secret,
+        })
+        return lambda symbol, lookback: mv.daily_bars(symbol, lookback)
+    except Exception:
+        return None
+
+
+def _candlestick_extras(ranked: Sequence[EVResult], *,
+                        bar_provider=None, config=None, now=None) -> dict:
+    """Map ``candidate_key -> {6 frozen candlestick fields}``. Analytics only.
+
+    Fetches recent daily bars once per unique ranked symbol and runs the pure
+    detector. Returns ``{}`` when disabled, creds/provider missing, or nothing
+    detected. Never raises and never affects ranking/EV/orders.
+    """
+    try:
+        from oracle.signals import candlestick_patterns as csp
+        cfg = config or csp.CandlestickConfig.from_env()
+        if not (getattr(cfg, "enabled", False)
+                and getattr(cfg, "fetch_in_ranker", False)):
+            return {}
+        provider = bar_provider or _default_bar_provider(cfg)
+        if provider is None:
+            return {}
+        import candidate_resolution as cr
+        from datetime import datetime, timezone
+        ts = now or datetime.now(timezone.utc)
+        day = ts.strftime("%Y-%m-%d")
+        lookback = getattr(cfg, "ranker_lookback", 15) or 15
+
+        extras: dict = {}
+        stamp_by_symbol: dict = {}
+        for r in ranked or []:
+            symbol = getattr(r, "symbol", None)
+            strategy = getattr(r, "strategy", None)
+            if not symbol or not strategy:
+                continue
+            sym = str(symbol).upper()
+            if sym not in stamp_by_symbol:
+                stamp = None
+                try:
+                    bars = provider(sym, lookback)
+                    candles = [_to_candle(b) for b in (bars or [])]
+                    stamp = csp.detect_primary(candles, cfg)
+                except Exception:
+                    stamp = None
+                stamp_by_symbol[sym] = stamp
+            stamp = stamp_by_symbol.get(sym)
+            if stamp is None:
+                continue
+            key = cr.candidate_key(sym, strategy, day)
+            extras[key] = {
+                "candlestick_pattern": stamp.pattern_name,
+                "candlestick_bias": stamp.bias,
+                "candlestick_strength": stamp.strength,
+                "candlestick_confidence": stamp.confidence,
+                "candlestick_reason": stamp.reason,
+                "candlestick_requires_confirmation": stamp.requires_confirmation,
+            }
+        return extras
+    except Exception:
+        return {}
+
+
 def run_best_ev(symbols: Union[str, Sequence[str], None],
                 trader_factory: Callable[[str], object],
                 config: Optional[BestEVConfig] = None,
@@ -189,7 +297,13 @@ def run_best_ev(symbols: Union[str, Sequence[str], None],
     # Recording only — cannot affect the ranking or any trade. Fail-open.
     try:
         import candidate_resolution as cr
-        cr.record_candidates(ranked, source="best_ev_ranker")
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        # Phase 11B: freeze candlestick annotations onto the candidates. Opt-in,
+        # analytics-only, fail-open — {} when disabled or candles unavailable.
+        extras = _candlestick_extras(ranked, now=now)
+        cr.record_candidates(ranked, source="best_ev_ranker",
+                             extras=extras, now=now)
     except Exception as exc:
         print(f"[BEST_EV] candidate recording skipped: {exc}")
     return ranked, len(universe)

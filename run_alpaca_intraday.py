@@ -645,6 +645,16 @@ class IntradayScheduler:
             # underlying price so the resolver can score the forward return later.
             rec = getattr(self.trader, "shadow_recorder", None)
             if rec:
+                # Advisory evidence stamp for the SKIP counterfactual too, so the
+                # blocked setups carry the same evidence dimensions as placed
+                # trades. Fail-open: a failure here never affects the scheduler.
+                evidence = None
+                try:
+                    import evidence_context
+                    evidence = evidence_context.compute_evidence(
+                        self.trader._build_evidence_ctx(sym, opt, {}))
+                except Exception:
+                    evidence = None
                 try:
                     rec.on_decision(
                         symbol=opt.get("symbol"),
@@ -659,6 +669,7 @@ class IntradayScheduler:
                         mode="live-paper-blocked",
                         risk={"block_reason": getattr(self.trader,
                                                       "last_block_reason", None)},
+                        evidence=evidence,
                     )
                 except Exception as e:
                     log(f"[SKIP-CF] capture failed for {sym}: {e}")

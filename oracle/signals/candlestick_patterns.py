@@ -129,6 +129,10 @@ class CandlestickConfig:
     max_boost: float = 0.05
     require_trend_context: bool = True
     require_volume_confirmation: bool = False
+    # Opt-in: fetch daily bars in the live ranker and stamp candidates.
+    # Analytics only — never feeds advisory/EV/gates/orders.
+    fetch_in_ranker: bool = True
+    ranker_lookback: int = 15
 
     @staticmethod
     def from_env(path: str = ".env") -> "CandlestickConfig":
@@ -143,6 +147,10 @@ class CandlestickConfig:
                     "CANDLESTICK_REQUIRE_TREND_CONTEXT", True),
                 require_volume_confirmation=c.get_bool(
                     "CANDLESTICK_REQUIRE_VOLUME_CONFIRMATION", False),
+                fetch_in_ranker=c.get_bool(
+                    "CANDLESTICK_FETCH_IN_RANKER", True),
+                ranker_lookback=c.get_int(
+                    "CANDLESTICK_RANKER_LOOKBACK", 15),
             )
         except Exception:
             return CandlestickConfig()
