@@ -567,6 +567,28 @@ class IntradayScheduler:
         # across scans instead of being one-and-done for the day.
         cap = getattr(self.cfg, "max_per_underlying", 1)
         held = self._underlying_position_count(sym)
+        # Low-IV regime throttle (opt-in, fail-open): on a calm/low realized-vol
+        # underlying, shrink the per-underlying cap so fewer long-premium
+        # positions stack. Vol is computed lazily only when the base cap would
+        # otherwise still allow an entry (held >= cap-delta) so we don't fetch
+        # history for every name every scan. is_low_iv fails open to False.
+        if getattr(self.trader, "use_low_iv_filter", False) and cap and held >= 1:
+            try:
+                import low_iv_filter
+                cap_delta = getattr(self.trader, "low_iv_cap_delta", 1)
+                # Only the marginal band can be affected; below it the base cap
+                # already permits the entry regardless of regime.
+                if held >= cap - cap_delta:
+                    rvol = self.trader.calculate_volatility(sym)
+                    if low_iv_filter.is_low_iv(
+                            rvol, getattr(self.trader, "low_iv_vol_threshold", 0.15)):
+                        eff = low_iv_filter.effective_cap(cap, True, cap_delta)
+                        if eff != cap:
+                            log(f"[LOW-IV] {sym}: realized_vol={rvol:.2f} "
+                                f"-> cap {cap}->{eff}")
+                            cap = eff
+            except Exception as e:
+                log(f"[LOW-IV] cap check failed for {sym} (ignored): {e}")
         if cap and held >= cap:
             log(f"[SKIP] {sym}: at per-underlying cap ({held}/{cap})")
             return None

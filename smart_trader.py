@@ -277,6 +277,15 @@ class SmartOptionsTrader:
             self.portfolio_limits and self.portfolio_limits.enabled)
         self.use_realized_pnl_killswitch = _flag('USE_REALIZED_PNL_KILLSWITCH')
 
+        # Low-IV regime filter (opt-in, fail-open, advisory): on a calm/low
+        # realized-vol underlying, throttle NEW long-premium entries — shrink
+        # the per-underlying cap (fewer concurrent positions) and scale order
+        # size down (floored at 1). Existing positions/exits are untouched.
+        self.use_low_iv_filter = _flag('USE_LOW_IV_REGIME_FILTER')
+        self.low_iv_vol_threshold = _f2('LOW_IV_VOL_THRESHOLD', 0.15)
+        self.low_iv_size_factor = _f2('LOW_IV_SIZE_FACTOR', 0.5)
+        self.low_iv_cap_delta = _i2('LOW_IV_CAP_DELTA', 1)
+
         # Load profit/loss thresholds from .env with defaults
         self.base_stop_loss = float(env_vars.get('BASE_STOP_LOSS', '0.10'))
         self.base_take_profit = float(env_vars.get('BASE_TAKE_PROFIT', '0.20'))
@@ -333,6 +342,7 @@ class SmartOptionsTrader:
                 'USE_NORMALIZED_CONFIDENCE': self.use_normalized_confidence,
                 'USE_PORTFOLIO_GREEK_LIMITS': self.use_portfolio_greek_limits,
                 'USE_REALIZED_PNL_KILLSWITCH': self.use_realized_pnl_killswitch,
+                'USE_LOW_IV_REGIME_FILTER': self.use_low_iv_filter,
             }
             print("[ORACLE] mode flags: " + " ".join(
                 f"{k}={'on' if v else 'off'}" for k, v in _mode_flags.items()))
@@ -1992,6 +2002,29 @@ class SmartOptionsTrader:
                           f"contract(s), cost: ${total_cost:.2f}")
             except Exception as e:
                 print(f"[NEWS] gate error (ignored): {e}")
+
+        # Low-IV regime size throttle (opt-in, fail-open): on a calm/low
+        # realized-vol underlying, scale the order size down (floored at 1). A
+        # no-op for the current qty=1 sizing, but it bites once conviction
+        # sizing grows. The scheduler-side cap reduction is the lever that
+        # actually reduces position count today; this keeps both levers wired.
+        if getattr(self, 'use_low_iv_filter', False) and order_quantity > 1:
+            try:
+                import low_iv_filter
+                rvol = self.calculate_volatility(self.ticker)
+                if low_iv_filter.is_low_iv(
+                        rvol, getattr(self, 'low_iv_vol_threshold', 0.15)):
+                    new_qty = low_iv_filter.adjusted_quantity(
+                        order_quantity, True,
+                        getattr(self, 'low_iv_size_factor', 0.5))
+                    if new_qty != order_quantity:
+                        order_quantity = new_qty
+                        total_cost = entry_price * 100 * order_quantity
+                        print(f"[LOW-IV] realized_vol={rvol:.2f} -> "
+                              f"size {order_quantity} contract(s), "
+                              f"cost: ${total_cost:.2f}")
+            except Exception as e:
+                print(f"[LOW-IV] size throttle error (ignored): {e}")
 
         # ---- EV entry gate (opt-in, fail-open) --------------------------------
         # Runs AFTER sizing so the stamp's premium reflects the final size, and
