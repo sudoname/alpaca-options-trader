@@ -286,6 +286,13 @@ class SmartOptionsTrader:
         self.low_iv_size_factor = _f2('LOW_IV_SIZE_FACTOR', 0.5)
         self.low_iv_cap_delta = _i2('LOW_IV_CAP_DELTA', 1)
 
+        # Cap-skip counterfactual capture (opt-in, fail-open, advisory): when the
+        # per-underlying capacity gate blocks a 2nd+ entry, record the contract we
+        # would have bought (+ entry ask) as a SKIP episode tagged 'cap-skip-cf'
+        # so capskip_cf can reprice it at EOD and measure the throttle's edge.
+        # Never blocks or alters an order. Default off -> byte-identical behavior.
+        self.record_capskip_cf = _flag('RECORD_CAPSKIP_CF')
+
         # Load profit/loss thresholds from .env with defaults
         self.base_stop_loss = float(env_vars.get('BASE_STOP_LOSS', '0.10'))
         self.base_take_profit = float(env_vars.get('BASE_TAKE_PROFIT', '0.20'))
@@ -343,6 +350,7 @@ class SmartOptionsTrader:
                 'USE_PORTFOLIO_GREEK_LIMITS': self.use_portfolio_greek_limits,
                 'USE_REALIZED_PNL_KILLSWITCH': self.use_realized_pnl_killswitch,
                 'USE_LOW_IV_REGIME_FILTER': self.use_low_iv_filter,
+                'RECORD_CAPSKIP_CF': self.record_capskip_cf,
             }
             print("[ORACLE] mode flags: " + " ".join(
                 f"{k}={'on' if v else 'off'}" for k, v in _mode_flags.items()))

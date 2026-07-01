@@ -201,11 +201,26 @@ class EpisodeStore:
         """Open SKIP decisions awaiting a counterfactual outcome.
 
         Returns the columns the skip_counterfactual resolver needs:
-        decision_id, underlying, rule_action, features_json, created_at.
+        decision_id, underlying, rule_action, features_json, created_at, mode.
+        `mode` lets the underlying-move resolver exclude the option-repriced
+        cap-skip class (mode='cap-skip-cf'), which capskip_cf resolves instead.
         """
         return self._rows(
-            "SELECT decision_id, underlying, rule_action, features_json, created_at "
+            "SELECT decision_id, underlying, rule_action, features_json, created_at, mode "
             "FROM episodes WHERE chosen_action='SKIP' AND outcome IS NULL "
+            "ORDER BY created_at"
+        )
+
+    def open_capskips(self) -> List[Dict]:
+        """Open per-underlying cap-skip decisions awaiting an option-repriced
+        counterfactual (mode='cap-skip-cf'). Resolved by capskip_cf, which
+        reprices the recorded contract rather than measuring the underlying move.
+
+        Returns: decision_id, underlying, symbol, features_json, created_at.
+        """
+        return self._rows(
+            "SELECT decision_id, underlying, symbol, features_json, created_at "
+            "FROM episodes WHERE mode='cap-skip-cf' AND outcome IS NULL "
             "ORDER BY created_at"
         )
 

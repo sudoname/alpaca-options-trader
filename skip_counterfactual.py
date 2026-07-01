@@ -106,6 +106,11 @@ def resolve_due_skips(
     price_cache: Dict[str, Optional[float]] = {}
     for row in rows:
         try:
+            # The option-repriced cap-skip class (mode='cap-skip-cf') is resolved
+            # by capskip_cf against the contract, not the underlying move; leave
+            # those rows for that resolver.
+            if row.get("mode") == "cap-skip-cf":
+                continue
             age = _age_minutes(row.get("created_at"), now)
             if age is None or age < horizon_min:
                 continue

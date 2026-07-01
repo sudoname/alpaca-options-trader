@@ -403,6 +403,10 @@ class IntradayScheduler:
         self.current_session = None
         self.trades_today = 0
         self.entered_today = set()
+        # Underlyings whose cap-skip counterfactual was already captured this
+        # session (one record per name per day; the cap gate recurs every scan).
+        self._capskip_recorded = set()
+        self._capskip_resolved_session = None
         # Active trading universe: base symbols now; screener picks are folded in
         # at runtime (refreshed each session). Held separately from cfg so the
         # pure-helper --selftest stays deterministic.
@@ -435,6 +439,8 @@ class IntradayScheduler:
             self.current_session = sk
             self.trades_today = 0
             self.entered_today = set()
+            self._capskip_recorded = set()
+            self._capskip_resolved_session = None
             if self.trader is not None:  # skip the file read during --selftest
                 self._refresh_universe()
             log(f"[SESSION] new session {sk}: counters reset")
@@ -550,6 +556,84 @@ class IntradayScheduler:
         except Exception as e:
             log(f"[WARN] skip-counterfactual resolve failed: {e}")
 
+    def _record_capskip_cf(self, sym, base_cap, eff_cap, held, low_iv, rvol):
+        """Record the contract the per-underlying cap just blocked as a SKIP
+        episode tagged mode='cap-skip-cf' (option-repriced counterfactual).
+
+        Resolves the setup we WOULD have entered (direction + concrete contract +
+        entry ask) and stamps it under features.capskip so capskip_cf can reprice
+        it at EOD. Deduped to one record per underlying per session (the cap gate
+        recurs every scan). Fail-open: any failure is swallowed by the caller and
+        the skip decision is unaffected."""
+        rec = getattr(self.trader, "shadow_recorder", None)
+        if not rec or sym in self._capskip_recorded:
+            return
+        self.trader.ticker = sym  # keep direction/underlying defaults correct
+        price = self.trader.get_current_price(sym)
+        if not price:
+            return
+        direction = self.trader.determine_option_strategy(sym)
+        if str(direction).lower() in ("skip", "no_trade"):
+            return
+        contracts = self.trader.get_option_contracts(sym)
+        if not contracts:
+            return
+        opt = self.trader.select_best_option(contracts, price, strategy=direction)
+        if not opt:
+            return
+        entry_ask = opt.get("ask")
+        features = {
+            "raw": {"underlying_price": price},
+            "capskip": {
+                "entry_ask": entry_ask,
+                "low_iv": bool(low_iv),
+                "base_cap": base_cap,
+                "eff_cap": eff_cap,
+                "held": held,
+                "realized_vol": rvol,
+                "direction": direction,
+                "contract": opt.get("symbol"),
+            },
+        }
+        did = rec.on_decision(
+            symbol=opt.get("symbol"),
+            underlying=sym,
+            analysis={
+                "should_trade": False,
+                "direction": direction,
+                "underlying_price": price,
+                "confidence": opt.get("score"),
+            },
+            quote=None,
+            mode="cap-skip-cf",
+            risk={"block_reason": f"per-underlying cap ({held}/{eff_cap})"},
+            features=features,
+        )
+        self._capskip_recorded.add(sym)
+        if did:
+            log(f"[CAPSKIP-CF] recorded {sym} {direction.upper()} "
+                f"{opt.get('symbol')} ask={entry_ask} low_iv={bool(low_iv)}")
+
+    def _resolve_capskip_counterfactuals(self, parsed):
+        """At session close, reprice each recorded cap-skip contract and book its
+        option counterfactual. No-op unless RECORD_CAPSKIP_CF is on and the
+        episode store is active. Runs once per session (guarded)."""
+        if not getattr(self.trader, "record_capskip_cf", False):
+            return
+        store = getattr(self.trader, "_episode_store", None)
+        if not store:
+            return
+        if self._capskip_resolved_session == self.current_session:
+            return
+        try:
+            from capskip_cf import resolve_due_capskips
+            n = resolve_due_capskips(store, self.trader.get_option_price)
+            self._capskip_resolved_session = self.current_session
+            if n:
+                log(f"[CAPSKIP-CF] resolved {n} option-repriced cap-skips")
+        except Exception as e:
+            log(f"[WARN] capskip-cf resolve failed: {e}")
+
     # -- entries ------------------------------------------------------------- #
     def _evaluate(self, sym):
         """Score a symbol's best contract WITHOUT entering. Returns a candidate
@@ -566,7 +650,10 @@ class IntradayScheduler:
         # for the heartbeat/status display -- so a below-cap name is re-evaluated
         # across scans instead of being one-and-done for the day.
         cap = getattr(self.cfg, "max_per_underlying", 1)
+        base_cap = cap
         held = self._underlying_position_count(sym)
+        low_iv_fired = False
+        rvol_seen = None
         # Low-IV regime throttle (opt-in, fail-open): on a calm/low realized-vol
         # underlying, shrink the per-underlying cap so fewer long-premium
         # positions stack. Vol is computed lazily only when the base cap would
@@ -580,6 +667,7 @@ class IntradayScheduler:
                 # already permits the entry regardless of regime.
                 if held >= cap - cap_delta:
                     rvol = self.trader.calculate_volatility(sym)
+                    rvol_seen = rvol
                     if low_iv_filter.is_low_iv(
                             rvol, getattr(self.trader, "low_iv_vol_threshold", 0.15)):
                         eff = low_iv_filter.effective_cap(cap, True, cap_delta)
@@ -587,10 +675,20 @@ class IntradayScheduler:
                             log(f"[LOW-IV] {sym}: realized_vol={rvol:.2f} "
                                 f"-> cap {cap}->{eff}")
                             cap = eff
+                            low_iv_fired = True
             except Exception as e:
                 log(f"[LOW-IV] cap check failed for {sym} (ignored): {e}")
         if cap and held >= cap:
             log(f"[SKIP] {sym}: at per-underlying cap ({held}/{cap})")
+            # Capture the blocked setup as an option-repriced counterfactual so we
+            # can measure the cap's edge at EOD. Fail-open + deduped per name/day;
+            # never alters the skip decision itself.
+            if getattr(self.trader, "record_capskip_cf", False):
+                try:
+                    self._record_capskip_cf(
+                        sym, base_cap, cap, held, low_iv_fired, rvol_seen)
+                except Exception as e:
+                    log(f"[CAPSKIP-CF] capture failed for {sym} (ignored): {e}")
             return None
 
         self.trader.ticker = sym  # keep direction/underlying defaults correct
@@ -822,6 +920,9 @@ class IntradayScheduler:
                 self.force_close_scheduler_positions()
             else:
                 log("[EOD] hold-overnight mode: leaving positions open")
+            # Reprice any cap-skip contracts recorded earlier this session and
+            # book their option counterfactual (once per session, at close).
+            self._resolve_capskip_counterfactuals(parsed)
             self._write_status(parsed)
             return parsed
 
