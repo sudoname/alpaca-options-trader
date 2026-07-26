@@ -90,6 +90,78 @@ class TestWiringGuards(unittest.TestCase):
         self.assertIn("should_arm_trailing", src)
         self.assertIn("trailing_arm_profit_pct", src)
 
+    def test_overshoot_flags_are_wired(self):
+        # Both overshoot controls must exist behind their env flags, default-off,
+        # and surface in the mode banner.
+        src = self._src("smart_trader.py")
+        self.assertIn("USE_BID_TRIGGERED_STOPS", src)
+        self.assertIn("use_bid_triggered_stops", src)
+        self.assertIn("USE_LIMIT_EXITS", src)
+        self.assertIn("use_limit_exits", src)
+        self.assertIn("LIMIT_EXIT_SLIP_PCT", src)
+        # The bid stop must record the legacy reason code so learning/reporting
+        # buckets stay consistent, and the limit exit must derive from the bid.
+        self.assertIn("[STOP LOSS/BID]", src)
+        self.assertIn("'limit_price'", src)
+
+
+class TestOvershootExits(unittest.TestCase):
+    """close_position marketable-limit behavior (no network)."""
+
+    def _trader(self, **flags):
+        import smart_trader
+        t = smart_trader.SmartOptionsTrader.__new__(smart_trader.SmartOptionsTrader)
+        t.base_url = "http://x"
+        t.headers = {}
+        t.use_limit_exits = flags.get("use_limit_exits", False)
+        t.limit_exit_slip_pct = flags.get("limit_exit_slip_pct", 0.03)
+        t._bid = flags.get("bid", 1.00)
+        t.get_option_price = lambda sym: ({"bid": t._bid, "ask": t._bid + 0.10,
+                                           "mid": t._bid + 0.05} if t._bid else None)
+        return t
+
+    def _capture_order(self, trader, trade, position):
+        import smart_trader
+        captured = {}
+
+        class _Resp:
+            status_code = 200
+
+            def json(self):
+                return {}
+
+        def _post(url, headers=None, json=None):
+            captured.update(json or {})
+            return _Resp()
+
+        orig = smart_trader.requests.post
+        smart_trader.requests.post = _post
+        try:
+            trader.close_position(trade, position, "dynamic_stop_loss")
+        finally:
+            smart_trader.requests.post = orig
+        return captured
+
+    def test_flag_off_uses_market(self):
+        t = self._trader(use_limit_exits=False, bid=1.00)
+        order = self._capture_order(t, {"symbol": "SPY..C"}, {"qty": "1"})
+        self.assertEqual(order.get("type"), "market")
+        self.assertNotIn("limit_price", order)
+
+    def test_flag_on_uses_marketable_limit_below_bid(self):
+        t = self._trader(use_limit_exits=True, bid=1.00, limit_exit_slip_pct=0.03)
+        order = self._capture_order(t, {"symbol": "SPY..C"}, {"qty": "1"})
+        self.assertEqual(order.get("type"), "limit")
+        # limit = bid*(1-0.03) = 0.97, i.e. at/through the bid so it stays
+        # marketable but caps the worst fill.
+        self.assertEqual(order.get("limit_price"), "0.97")
+
+    def test_flag_on_missing_bid_falls_back_to_market(self):
+        t = self._trader(use_limit_exits=True, bid=0)
+        order = self._capture_order(t, {"symbol": "SPY..C"}, {"qty": "1"})
+        self.assertEqual(order.get("type"), "market")
+        self.assertNotIn("limit_price", order)
+
 
 class TestEvaluateExit(unittest.TestCase):
     def test_stop_loss_fires(self):

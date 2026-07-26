@@ -334,6 +334,28 @@ class SmartOptionsTrader:
         # Upper bound on OTM distance so the roll doesn't buy a worthless lotto.
         self.roll_max_otm_pct = float(env_vars.get('ROLL_MAX_OTM_PCT', '0.20'))
 
+        # --- Stop-loss overshoot controls --------------------------------- #
+        # The dynamic_stop_loss bucket realizes ~-69% vs the ~configured stop
+        # because (a) the stop is measured off the MARK but the position can only
+        # be sold at the BID (mark sits above bid -> breach hides until the next
+        # 5-min poll), and (b) the exit is a plain market order that sweeps to the
+        # bid or worse. Both fixes are flag-gated and fail-open: off -> byte-
+        # identical legacy behavior.
+        #
+        # USE_BID_TRIGGERED_STOPS: also test the stop against the realizable live
+        # BID so it fires on true exit value and earlier. Only ADDS a stop exit;
+        # never suppresses an existing mark-based exit. Missing quote -> falls
+        # through to the existing mark path.
+        self.use_bid_triggered_stops = _flag('USE_BID_TRIGGERED_STOPS')
+        # USE_LIMIT_EXITS: close positions with a marketable-limit sell at
+        # bid*(1 - LIMIT_EXIT_SLIP_PCT) instead of a plain market sell, so a
+        # stopped-out exit fills at the bid in normal conditions but can't sweep
+        # the book to an arbitrarily bad fill. Missing bid -> market fallback.
+        self.use_limit_exits = _flag('USE_LIMIT_EXITS')
+        # How far THROUGH the bid the marketable limit is placed (fraction of
+        # bid). Aggressive enough to fill at the bid normally; caps tail slippage.
+        self.limit_exit_slip_pct = _f2('LIMIT_EXIT_SLIP_PCT', 0.03)
+
         # --- Startup mode banner (Phase 4.5) ------------------------------ #
         # One line summarizing every Oracle mode flag so the operator can see at
         # a glance which optional gates are active for this process. Purely a log
@@ -351,6 +373,8 @@ class SmartOptionsTrader:
                 'USE_REALIZED_PNL_KILLSWITCH': self.use_realized_pnl_killswitch,
                 'USE_LOW_IV_REGIME_FILTER': self.use_low_iv_filter,
                 'RECORD_CAPSKIP_CF': self.record_capskip_cf,
+                'USE_BID_TRIGGERED_STOPS': self.use_bid_triggered_stops,
+                'USE_LIMIT_EXITS': self.use_limit_exits,
             }
             print("[ORACLE] mode flags: " + " ".join(
                 f"{k}={'on' if v else 'off'}" for k, v in _mode_flags.items()))
@@ -2417,6 +2441,29 @@ class SmartOptionsTrader:
                     take_profit_percent = current_dynamic['take_profit_percent'] * 100
                     trailing_distance = current_dynamic['trailing_stop_distance']
 
+            # Bid-triggered stop (flag-gated, fail-open). The mark can sit above
+            # the realizable bid, hiding a stop breach until the next 5-min poll
+            # -> the ~-69% overshoot. When enabled, also test the stop against the
+            # live bid so it fires on true exit value. Only ADDS a stop exit; a
+            # missing/zero bid falls through to the existing mark-based
+            # evaluate_exit below, so behavior is unchanged when off or on error.
+            if getattr(self, 'use_bid_triggered_stops', False):
+                try:
+                    _q = self.get_option_price(trade['symbol'])
+                    _bid = float((_q or {}).get('bid') or 0)
+                except Exception:
+                    _bid = 0
+                if _bid > 0:
+                    _bid_pnl = ((_bid - entry_price) / entry_price) * 100
+                    if _bid_pnl <= -stop_loss_percent:
+                        from exit_manager import enforce_exit
+                        print(f"[STOP LOSS/BID] Bid stop at {_bid_pnl:.1f}% "
+                              f"(mark {pnl_percent:.1f}%, trigger "
+                              f"-{stop_loss_percent:.1f}%)")
+                        enforce_exit(self, trade, position, 'dynamic_stop_loss',
+                                     _bid_pnl, 'scheduler', _bid)
+                        continue
+
             # Check for partial close at dynamic take profit level
             partial_threshold = take_profit_percent * 0.6  # 60% of take profit target
             if pnl_percent >= partial_threshold and not trade['partial_close_done']:
@@ -2519,7 +2566,16 @@ class SmartOptionsTrader:
             print(f"[PARTIAL CLOSE] Closed {qty_to_close} contracts at +20% profit")
 
     def close_position(self, trade: Dict, position: Dict, reason: str):
-        """Close entire position"""
+        """Close entire position.
+
+        Default: plain market sell (byte-identical legacy behavior). When
+        USE_LIMIT_EXITS is on, place a marketable-limit sell at
+        bid*(1 - LIMIT_EXIT_SLIP_PCT): since that limit is BELOW the current bid
+        the order still matches the resting bid and fills at the bid in normal
+        conditions, but the fill can never sweep below the limit -> the stop
+        overshoot tail is capped. Fail-open: any missing bid / error falls back
+        to the market order.
+        """
         order_data = {
             'symbol': trade['symbol'],
             'qty': position['qty'],
@@ -2529,8 +2585,21 @@ class SmartOptionsTrader:
             'asset_class': 'us_option'
         }
 
+        if getattr(self, 'use_limit_exits', False):
+            try:
+                _q = self.get_option_price(trade['symbol'])
+                _bid = float((_q or {}).get('bid') or 0)
+            except Exception:
+                _bid = 0
+            if _bid > 0:
+                _slip = max(0.0, min(getattr(self, 'limit_exit_slip_pct', 0.03), 0.5))
+                _limit = round(_bid * (1.0 - _slip), 2)
+                if _limit > 0:
+                    order_data['type'] = 'limit'
+                    order_data['limit_price'] = f"{_limit:.2f}"
+
         requests.post(f"{self.base_url}/v2/orders", headers=self.headers, json=order_data)
-        print(f"[CLOSE] Position closed - Reason: {reason}")
+        print(f"[CLOSE] Position closed ({order_data['type']}) - Reason: {reason}")
 
     @staticmethod
     def direction_from_occ(occ_symbol: str) -> Optional[str]:
