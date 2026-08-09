@@ -35,12 +35,20 @@ class ShadowRecorder:
         advisor=None,
         mode: str = "shadow",
         strat_name: str = "smart_trader",
+        clamp_net_to_gross: bool = False,
+        net_gross_eps: float = 5.0,
     ):
         self.store = store
         self.cost_model = cost_model
         self.advisor = advisor
         self.mode = mode
         self.strat_name = strat_name
+        # Invariant guard (default OFF): net = gross - costs, so net can never
+        # exceed gross. A re-fetched indicative exit quote can be stale/one-sided
+        # (phantom ask, no bid) and inflate net into the impossible region. When
+        # this is on, on_close re-anchors any such row to the gross-implied exit.
+        self.clamp_net_to_gross = clamp_net_to_gross
+        self.net_gross_eps = net_gross_eps
 
     # ------------------------------------------------------------- features
     def _features_from_analysis(
@@ -215,11 +223,43 @@ class ShadowRecorder:
         if net_pct is None:
             net_pct = gross_pnl_pct
 
+        # Invariant guard (default OFF via clamp_net_to_gross): net = gross -
+        # costs, so net can never exceed gross. A re-fetched indicative exit
+        # quote can be stale/one-sided (phantom ask with no bid -> a "mid" equal
+        # to that ask), inflating net into the impossible region. When that
+        # happens, discard the modeled exit and re-anchor to the gross-implied
+        # exit so net/exit_price reflect the real outcome. The label is never
+        # touched, and rows already at/below gross are left byte-identical.
+        corrected_exit_price = exit_price
+        if (self.clamp_net_to_gross and gross_pnl_pct is not None
+                and net_pct is not None
+                and net_pct > gross_pnl_pct + self.net_gross_eps):
+            implied = (float(entry_price) * (1.0 + gross_pnl_pct / 100.0)
+                       if entry_price else None)
+            recomputed = False
+            if implied is not None and None not in (eb, ea):
+                try:
+                    res = self.cost_model.net_pnl(
+                        float(eb), float(ea), implied, implied,
+                        qty=qty, hold_days=hold_days,
+                    )
+                    net_pct = res["net_pnl_pct"]
+                    net_dollars = res["net_pnl_dollars"]
+                    corrected_exit_price = implied
+                    recomputed = True
+                except Exception:
+                    recomputed = False
+            if not recomputed:
+                net_pct = gross_pnl_pct
+                net_dollars = None
+                if implied is not None:
+                    corrected_exit_price = implied
+
         try:
             self.store.record_outcome(
                 decision_id,
                 fill_price=entry_price,
-                exit_price=exit_price,
+                exit_price=corrected_exit_price,
                 gross_pnl_pct=gross_pnl_pct,
                 net_pnl_pct=net_pct,
                 net_pnl_dollars=net_dollars,
@@ -334,6 +374,46 @@ def _self_test() -> int:
     f2 = rec._features_from_analysis(analysis, "2026-01-07T16:00:00", "SPY", "spy_1dte", None, 2)
     if f1["state_key"] != f2["state_key"]:
         print("FAIL: non-deterministic state key"); ok = False
+
+    # --- Net<=gross invariant clamp ------------------------------------- #
+    # A one-sided/stale re-fetched exit quote historically produced a "mid"
+    # far above the true exit, recording a genuine -53% stop as a +1140%
+    # phantom. Reproduce with clamp OFF, then confirm clamp ON re-anchors it.
+    did_off = rec.on_decision(
+        symbol="NKE260821C00042500", underlying="NKE", analysis=analysis,
+        quote={"bid": 1.14, "ask": 1.16}, entry_premium=1.15, qty=2,
+        mode="shadow", as_of="2026-01-07T16:00:00", day_of_week=2)
+    net_off = rec.on_close(
+        did_off, entry_price=1.15, exit_price=14.79,
+        gross_pnl_pct=-53.04, qty=2, outcome="dynamic_stop_loss")
+    if net_off is None or net_off <= 0:
+        print("FAIL: clamp-off should reproduce phantom-positive net", net_off); ok = False
+
+    rec_clamp = ShadowRecorder(store, cm, advisor=None, strat_name="spy_1dte",
+                               clamp_net_to_gross=True, net_gross_eps=5.0)
+    did_on = rec_clamp.on_decision(
+        symbol="NKE260821C00042500", underlying="NKE", analysis=analysis,
+        quote={"bid": 1.14, "ask": 1.16}, entry_premium=1.15, qty=2,
+        mode="shadow", as_of="2026-01-07T16:00:00", day_of_week=2)
+    net_on = rec_clamp.on_close(
+        did_on, entry_price=1.15, exit_price=14.79,
+        gross_pnl_pct=-53.04, qty=2, outcome="dynamic_stop_loss")
+    if net_on is None or net_on > -53.04 + 5.0:
+        print("FAIL: clamp-on should re-anchor net to <= gross+eps", net_on); ok = False
+    if net_on is None or net_on >= 0:
+        print("FAIL: clamp-on net should stay negative for a real stop", net_on); ok = False
+
+    # A legitimate winner (net already below gross) must pass through untouched.
+    did_ok = rec_clamp.on_decision(
+        symbol="SPY260108C00475000", underlying="SPY", analysis=analysis,
+        quote={"bid": 1.00, "ask": 1.06}, entry_premium=1.03, qty=1,
+        mode="shadow", as_of="2026-01-07T16:00:00", day_of_week=2)
+    net_ok = rec_clamp.on_close(
+        did_ok, entry_bid=1.00, entry_ask=1.06, exit_bid=1.60, exit_ask=1.66,
+        entry_price=1.03, exit_price=1.63, gross_pnl_pct=58.0, qty=1,
+        outcome="take_profit")
+    if net_ok is None or net_ok <= 0 or net_ok >= 58.0:
+        print("FAIL: clamp must leave a legitimate net (0<net<gross) intact", net_ok); ok = False
 
     store.close()
     for fn in (qf, ef):

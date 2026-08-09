@@ -58,13 +58,22 @@ class SmartOptionsTrader:
                 from episode_store import EpisodeStore
                 from cost_model import CostModel, load_cost_config_from_env
                 self._episode_store = EpisodeStore('episodes.db')
+                # Net<=gross invariant guard for the recording path (default
+                # OFF, resolved in load_credentials). When USE_NET_GROSS_CLAMP
+                # is on, on_close re-anchors any row where a stale/one-sided
+                # re-fetched exit quote inflated net above gross (the phantom-net
+                # bug) to the gross-implied exit.
+                _clamp_on = getattr(self, 'use_net_gross_clamp', False)
                 self.shadow_recorder = ShadowRecorder(
                     self._episode_store,
                     CostModel(load_cost_config_from_env()),
                     advisor=self.rl_advisor,
                     strat_name='smart_trader',
+                    clamp_net_to_gross=_clamp_on,
+                    net_gross_eps=getattr(self, 'net_gross_eps', 5.0),
                 )
-                print("[SHADOW] Recorder active -> episodes.db")
+                print(f"[SHADOW] Recorder active -> episodes.db "
+                      f"(net<=gross clamp {'ON' if _clamp_on else 'off'})")
         except Exception as e:
             print(f"[SHADOW] Recorder unavailable: {e}")
 
@@ -206,6 +215,15 @@ class SmartOptionsTrader:
         self.min_option_open_interest = _f2('MIN_OPTION_OPEN_INTEREST', 0)
         self.use_option_liquidity_filter = _flag('USE_OPTION_LIQUIDITY_FILTER')
         self.require_option_liquidity_data = _flag('REQUIRE_OPTION_LIQUIDITY_DATA')
+
+        # Net<=gross invariant guard for the shadow recorder's close path (OFF
+        # by default). Enforces the identity net = gross - costs: any recorded
+        # row whose net exceeds gross by more than NET_GROSS_EPS points is a
+        # phantom from a stale/one-sided re-fetched exit quote and gets
+        # re-anchored to the gross-implied exit. Consumed when the recorder is
+        # constructed in __init__.
+        self.use_net_gross_clamp = _flag('USE_NET_GROSS_CLAMP')
+        self.net_gross_eps = _f2('NET_GROSS_EPS', 5.0)
 
         # Lazily-built cost model for the EV gate (fail-open if unavailable).
         self._phase2_cm = None
@@ -375,6 +393,7 @@ class SmartOptionsTrader:
                 'RECORD_CAPSKIP_CF': self.record_capskip_cf,
                 'USE_BID_TRIGGERED_STOPS': self.use_bid_triggered_stops,
                 'USE_LIMIT_EXITS': self.use_limit_exits,
+                'USE_NET_GROSS_CLAMP': self.use_net_gross_clamp,
             }
             print("[ORACLE] mode flags: " + " ".join(
                 f"{k}={'on' if v else 'off'}" for k, v in _mode_flags.items()))
@@ -2960,9 +2979,15 @@ class SmartOptionsTrader:
                 if exit_quote:
                     eb_q = exit_quote.get('bid') or 0
                     ea_q = exit_quote.get('ask') or 0
+                    # Only trust a genuinely two-sided quote. A one-sided
+                    # indicative quote (phantom ask, no bid) makes get_option_
+                    # price return mid == that ask, which historically leaked
+                    # through as a fabricated exit_price (e.g. a -53% stop
+                    # recorded as +1140%). Leave exit_mid None so the gross-
+                    # implied fallback below governs instead.
                     if eb_q > 0 and ea_q > 0:
                         exit_bid, exit_ask = eb_q, ea_q
-                    exit_mid = exit_quote.get('mid')
+                        exit_mid = exit_quote.get('mid')
 
                 # Last-resort mid if no quote at all (keeps the loop closing).
                 if exit_mid is None and entry_price:
