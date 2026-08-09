@@ -56,6 +56,57 @@ def _d(evidence: dict, key: str) -> dict:
     return v if isinstance(v, dict) else {}
 
 
+def _f(x) -> float:
+    """Best-effort float, else 0.0. Never raises."""
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _summarize_slate(prob: dict, conviction, tier, exp_move,
+                     ext: dict, rep: dict, cat: dict) -> str:
+    """Condense the Oracle slate into one plain-English sentence.
+
+    Fail-open: every clause degrades to a safe default, never raises.
+    """
+    prob = prob if isinstance(prob, dict) else {}
+    p_call, p_put, p_nt = (
+        _f(prob.get("p_call")), _f(prob.get("p_put")),
+        _f(prob.get("p_no_trade")))
+
+    if p_nt >= max(p_call, p_put):
+        stance = f"stands aside (no-trade {_pct(p_nt)})"
+    elif p_call >= p_put:
+        stance = f"leans bullish/call ({_pct(p_call)})"
+    else:
+        stance = f"leans bearish/put ({_pct(p_put)})"
+
+    conv_txt = ""
+    if conviction is not None:
+        conv_txt = f" on {tier or 'regular'} conviction ({_num(conviction)})"
+
+    cat = cat if isinstance(cat, dict) else {}
+    ctype = cat.get("catalyst_type")
+    has_cat = bool(ctype) and str(ctype).strip().lower() not in ("none", "n/a")
+    cat_txt = (f", flagging a {ctype} (severity {_num(cat.get('severity'))})"
+               if has_cat else "")
+
+    ext = ext if isinstance(ext, dict) else {}
+    rep = rep if isinstance(rep, dict) else {}
+    if ext.get("extended") is True:
+        time_txt = "; price looks extended (chase risk)"
+    elif rep.get("opportunity") is True:
+        time_txt = "; a pullback entry is setting up"
+    else:
+        time_txt = ""
+
+    em_txt = (f"; expected 1σ move ±{_num(exp_move, '{:.1f}')}%"
+              if exp_move is not None else "")
+
+    return f"Oracle {stance}{conv_txt}{cat_txt}{time_txt}{em_txt}."
+
+
 # --------------------------------------------------------------------------- #
 # live context assembly (read-only)
 # --------------------------------------------------------------------------- #
@@ -223,6 +274,8 @@ def analyze_symbol_text(symbol: str, trader=None,
                 f"• Thesis: invalidation `{_num(inv, '{:.1f}')}%`, "
                 f"decay `{_num(decay, '{:.0f}')}d`")
 
+        lines += ["", f"*Summary:* {_summarize_slate(prob, cval, tier, emp, ext, rep, cat)}"]
+
         lines += ["", "_Advisory only — no order placed, nothing recorded. "
                   "Reply_ `" + symbol + "` _for the tradeable contract + Greeks._"]
         return "\n".join(lines)
@@ -254,7 +307,7 @@ if __name__ == "__main__":
     print(_safe(txt))
     print("\n" + "=" * 60)
     ok = ("Oracle Analysis" in txt and "2.1 slate" in txt
-          and "P(call)" in txt and "Mode:" in txt)
+          and "P(call)" in txt and "Mode:" in txt and "Summary:" in txt)
     # empty ctx must fail open to a clean INSUFFICIENT_DATA report
     empty = analyze_symbol_text("TESTX", ctx={})
     ok_empty = "INSUFFICIENT_DATA" in empty and "Advisory only" in empty
