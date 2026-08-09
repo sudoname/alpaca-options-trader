@@ -310,6 +310,17 @@ class SmartOptionsTrader:
             except Exception as _e:
                 print(f"[ORACLE] mode DTE override failed (ignored): {_e}")
 
+        # Phase F (Oracle 2.1): thesis-decay exits. Default OFF -> the decay
+        # signal is never consulted and monitoring is byte-identical. When on,
+        # the monitor may close an OPEN position once its frozen entry thesis
+        # has decayed: either the underlying moved a full adverse sigma against
+        # the trade (invalidation) or the position was held past its decay
+        # horizon (stale). It runs AFTER hard stops / take-profit / trailing, so
+        # those keep priority; it never opens/sizes/prices a trade or flips
+        # direction. THESIS_DECAY_GRACE_DAYS adds slack before the horizon fires.
+        self.use_thesis_decay_exit = _flag('USE_THESIS_DECAY_EXIT')
+        self.thesis_decay_grace_days = _f2('THESIS_DECAY_GRACE_DAYS', 0.0)
+
         # Set by determine_option_strategy when it returns 'skip'; surfaced by
         # the scheduler and Telegram so the operator sees *why* nothing traded.
         self.last_skip_reason = None
@@ -455,6 +466,7 @@ class SmartOptionsTrader:
                 'ENABLE_REPRICING_TILT': self.enable_repricing_tilt,
                 'ENABLE_CONVICTION_SIZING': self.enable_conviction_sizing,
                 'USE_ORACLE_MODE_DTE': self.use_oracle_mode_dte,
+                'USE_THESIS_DECAY_EXIT': self.use_thesis_decay_exit,
             }
             print("[ORACLE] mode flags: " + " ".join(
                 f"{k}={'on' if v else 'off'}" for k, v in _mode_flags.items())
@@ -2371,6 +2383,18 @@ class SmartOptionsTrader:
                 }
             }
 
+            # Phase F (Oracle 2.1): record the UNDERLYING price at entry so a
+            # thesis-decay exit can later measure adverse movement against the
+            # thesis. Advisory metadata — fail-open: if the fetch fails the
+            # invalidation check simply won't fire and the just-placed order is
+            # untouched.
+            try:
+                _entry_u = self.get_current_price(underlying_symbol)
+                if _entry_u is not None:
+                    trade_info['entry_underlying_price'] = float(_entry_u)
+            except Exception:
+                pass
+
             # Phase 10H: freeze the entry-time belief (expected EV, POP,
             # max loss) so the calibration analytics can score this trade
             # when it closes. Analytics-only metadata — a failed stamp never
@@ -2427,6 +2451,22 @@ class SmartOptionsTrader:
                                 underlying_symbol, option, dynamic_levels))
                     except Exception as e:
                         print(f"[SHADOW] evidence stamp skipped: {e}")
+                    # Phase F: freeze the decay-relevant thesis fields onto the
+                    # trade so the monitor can evaluate thesis-decay exits
+                    # without an episodes.db lookup. Advisory only.
+                    try:
+                        _th = (evidence or {}).get('thesis') \
+                            if isinstance(evidence, dict) else None
+                        if isinstance(_th, dict):
+                            trade_info['thesis'] = {
+                                'direction': _th.get('direction'),
+                                'mode': _th.get('mode'),
+                                'invalidation_pct': _th.get('invalidation_pct'),
+                                'decay_horizon_days': _th.get(
+                                    'decay_horizon_days'),
+                            }
+                    except Exception:
+                        pass
                     decision_id = self.shadow_recorder.on_decision(
                         symbol=option['symbol'],
                         underlying=underlying_symbol,
@@ -2710,6 +2750,51 @@ class SmartOptionsTrader:
                 self.close_position(trade, position, 'dynamic_exit')
                 self.record_trade_outcome(trade, 'dynamic_exit', pnl_percent)
                 continue
+
+            # Phase F: thesis-decay exit (flag-gated, fail-open). Runs LAST so
+            # hard stops / take-profit / trailing / dynamic exits keep priority.
+            # Closes the position when its frozen entry thesis has decayed: the
+            # underlying moved a full adverse sigma against it (invalidation) or
+            # it was held past its decay horizon (stale). When the flag is off,
+            # or the thesis snapshot / underlying price is missing, it never
+            # fires -> monitoring is byte-identical.
+            if getattr(self, 'use_thesis_decay_exit', False):
+                try:
+                    from oracle.decay import evaluate_thesis_decay
+                    from exit_manager import enforce_exit
+                    _th = trade.get('thesis') \
+                        if isinstance(trade.get('thesis'), dict) else {}
+                    _entry_dt = None
+                    try:
+                        _entry_dt = datetime.fromisoformat(
+                            str(trade.get('entry_time')))
+                    except Exception:
+                        _entry_dt = None
+                    _hold_days = None
+                    if _entry_dt is not None:
+                        _hold_days = max(
+                            0.0,
+                            (datetime.now() - _entry_dt).total_seconds() / 86400.0)
+                    _cur_u = None
+                    try:
+                        _cur_u = self.get_current_price(underlying_symbol)
+                    except Exception:
+                        _cur_u = None
+                    _decay = evaluate_thesis_decay(
+                        _hold_days, _th.get('decay_horizon_days'),
+                        _th.get('direction'), _th.get('invalidation_pct'),
+                        trade.get('entry_underlying_price'), _cur_u,
+                        horizon_grace_days=getattr(
+                            self, 'thesis_decay_grace_days', 0.0))
+                    if _decay.get('exit'):
+                        _reason = 'thesis_' + (_decay.get('kind') or 'decay')
+                        print(f"[THESIS DECAY] {_reason}: "
+                              f"{_decay.get('reason')} (pnl {pnl_percent:.1f}%)")
+                        enforce_exit(self, trade, position, _reason,
+                                     pnl_percent, 'scheduler', current_price)
+                        continue
+                except Exception as e:
+                    print(f"[THESIS DECAY] diagnostic error (ignored): {e}")
 
             updated_trades.append(trade)
 

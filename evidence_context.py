@@ -45,6 +45,15 @@ import oracle_regime
 import feature_buckets
 from oracle.signals import candlestick_patterns as cs
 
+# Version of the EVIDENCE slate schema (the flat dict this module produces).
+# This is DISTINCT from the model feature_version in features.py /
+# shadow_recorder.py, which versions the raw+discrete model feature vector /
+# Q-table state and is intentionally UNCHANGED by Oracle 2.1 (the state key and
+# model inputs did not change). Oracle 2.1 grew the evidence slate (thesis,
+# catalyst, attention, extension, repricing, conviction, mode-aware thesis),
+# so the slate carries its own version for leaderboard/analytics slicing.
+EVIDENCE_VERSION = "2.1.0"
+
 
 # --------------------------------------------------------------------------- #
 # Helpers
@@ -341,6 +350,44 @@ def compute_evidence(ctx: Optional[dict]) -> dict:
     except Exception:
         evidence["conviction"] = None
 
+    # 10) Oracle 2.1 slate version + observability roll-up. Advisory only: stamps
+    #     the evidence-schema version and a compact summary of WHICH Oracle 2.1
+    #     producers fired plus their headline values, so leaderboards can slice by
+    #     evidence_version and quickly read the 2.1 story of a decision without
+    #     digging into every sub-dict. Never raises; fails open to a minimal stamp.
+    evidence["evidence_version"] = EVIDENCE_VERSION
+    try:
+        def _d(key):
+            v = evidence.get(key)
+            return v if isinstance(v, dict) else {}
+        _thesis = _d("thesis")
+        _conv = _d("conviction")
+        _ext = _d("extension")
+        _rep = _d("repricing")
+        _cat = _d("catalyst")
+        evidence["oracle21"] = {
+            "version": EVIDENCE_VERSION,
+            # which producers assembled a slice (present == not None/absent)
+            "producers": {
+                "expected_move": evidence.get("expected_move") is not None,
+                "thesis": bool(_thesis),
+                "catalyst": bool(_cat),
+                "attention": evidence.get("attention") is not None,
+                "extension": bool(_ext),
+                "repricing": bool(_rep),
+                "conviction": bool(_conv),
+            },
+            # headline values for quick leaderboard slicing
+            "mode": _thesis.get("mode"),
+            "conviction": _conv.get("conviction"),
+            "conviction_tier": _conv.get("tier"),
+            "extended": _ext.get("extended"),
+            "opportunity": _rep.get("opportunity"),
+            "catalyst_severity": _cat.get("severity"),
+        }
+    except Exception:
+        evidence["oracle21"] = {"version": EVIDENCE_VERSION}
+
     return evidence
 
 
@@ -504,6 +551,31 @@ def _self_test() -> int:
             and evs["thesis"].get("decay_horizon_days") == 30):
         print("FAIL: swing mode should ride to dte horizon",
               evs.get("thesis")); ok = False
+
+    # Phase G: evidence-slate version + observability roll-up. The slate carries
+    # its own version (distinct from the model feature_version), and oracle21
+    # summarizes which 2.1 producers fired plus headline values.
+    if ev.get("evidence_version") != EVIDENCE_VERSION:
+        print("FAIL: evidence_version stamp", ev.get("evidence_version")); ok = False
+    o21 = ev.get("oracle21")
+    if not isinstance(o21, dict) or o21.get("version") != EVIDENCE_VERSION:
+        print("FAIL: oracle21 roll-up missing/version", o21); ok = False
+    else:
+        prod = o21.get("producers") or {}
+        for p in ("expected_move", "thesis", "catalyst", "attention",
+                  "extension", "repricing", "conviction"):
+            if p not in prod:
+                print("FAIL: oracle21 producer flag missing", p, o21); ok = False
+        # On the fully-populated ctx, thesis/conviction/extension/repricing fired.
+        if not (prod.get("thesis") and prod.get("conviction")
+                and prod.get("extension") and prod.get("repricing")):
+            print("FAIL: oracle21 producers should be present on full ctx", o21)
+            ok = False
+        if o21.get("mode") != "intraday":
+            print("FAIL: oracle21 headline mode", o21); ok = False
+    # Fail-open: even a garbage ctx still stamps the version.
+    if compute_evidence({}).get("evidence_version") != EVIDENCE_VERSION:
+        print("FAIL: evidence_version must stamp on empty ctx"); ok = False
 
     # Determinism.
     if compute_evidence(ctx) != compute_evidence(ctx):
