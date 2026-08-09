@@ -282,6 +282,34 @@ class SmartOptionsTrader:
             'CONVICTION_REPRICING_BONUS', 0.10)
         self.conviction_skip_below = _f2('CONVICTION_SKIP_BELOW', 0.0)
         self.last_conviction = None
+
+        # Phase E (Oracle 2.1): strategy-mode profile (intraday vs swing). The
+        # resolved mode LABEL is always threaded into the thesis so the shadow
+        # learning slate records the decay horizon that matches the style in
+        # force. ORACLE_MODE defaults to 'intraday', which equals the existing
+        # hardcoded thesis default, so the thesis record is byte-identical unless
+        # overridden. The DTE-window override is a SEPARATE opt-in
+        # (USE_ORACLE_MODE_DTE, default OFF): when on, the contract-selection
+        # window is taken from oracle/mode.py's profile instead of the
+        # OPTION_MIN/TARGET/MAX_DTE values. Mode never computes direction and is
+        # never a standalone trigger.
+        try:
+            from oracle.mode import resolve_mode
+            self.oracle_mode = resolve_mode(env_vars.get('ORACLE_MODE'))
+        except Exception:
+            self.oracle_mode = 'intraday'
+        self.use_oracle_mode_dte = _flag('USE_ORACLE_MODE_DTE')
+        if self.use_oracle_mode_dte:
+            try:
+                from oracle.mode import mode_profile
+                _prof = mode_profile(self.oracle_mode)
+                self.option_min_dte = int(_prof['min_dte'])
+                self.option_target_dte = int(_prof['target_dte'])
+                self.option_max_dte = int(_prof['max_dte'])
+                self.use_dte_targeting = True
+            except Exception as _e:
+                print(f"[ORACLE] mode DTE override failed (ignored): {_e}")
+
         # Set by determine_option_strategy when it returns 'skip'; surfaced by
         # the scheduler and Telegram so the operator sees *why* nothing traded.
         self.last_skip_reason = None
@@ -426,9 +454,11 @@ class SmartOptionsTrader:
                 'ENABLE_EXTENSION_GUARD': self.enable_extension_guard,
                 'ENABLE_REPRICING_TILT': self.enable_repricing_tilt,
                 'ENABLE_CONVICTION_SIZING': self.enable_conviction_sizing,
+                'USE_ORACLE_MODE_DTE': self.use_oracle_mode_dte,
             }
             print("[ORACLE] mode flags: " + " ".join(
-                f"{k}={'on' if v else 'off'}" for k, v in _mode_flags.items()))
+                f"{k}={'on' if v else 'off'}" for k, v in _mode_flags.items())
+                + f" ORACLE_MODE={self.oracle_mode}")
         except Exception:
             pass
 
@@ -2465,6 +2495,10 @@ class SmartOptionsTrader:
         try:
             action = (option.get('type') or 'call').lower()
             ctx.setdefault('direction', 'up' if action == 'call' else 'down')
+            # Phase E (Oracle 2.1): thread the resolved strategy mode so the
+            # thesis decay horizon in the shadow slate matches the style in
+            # force. Defaults to 'intraday' == the existing thesis default.
+            ctx.setdefault('mode', getattr(self, 'oracle_mode', 'intraday'))
             if dynamic_levels.get('momentum') is not None:
                 ctx.setdefault('momentum', dynamic_levels.get('momentum'))
             strength = option.get('score')

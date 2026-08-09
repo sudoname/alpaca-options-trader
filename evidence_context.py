@@ -256,7 +256,15 @@ def compute_evidence(ctx: Optional[dict]) -> dict:
         evidence["expected_move"] = None
     try:
         from oracle.thesis import build_thesis
-        evidence["thesis"] = build_thesis(ctx, evidence.get("expected_move"))
+        # Phase E: thread the strategy mode ('intraday'/'swing') so the recorded
+        # decay horizon matches the style in force. Absent -> build_thesis's own
+        # intraday default (byte-identical to pre-Phase-E behavior).
+        _mode = ctx.get("mode")
+        if isinstance(_mode, str) and _mode.strip():
+            evidence["thesis"] = build_thesis(
+                ctx, evidence.get("expected_move"), mode=_mode)
+        else:
+            evidence["thesis"] = build_thesis(ctx, evidence.get("expected_move"))
     except Exception:
         evidence["thesis"] = None
 
@@ -479,6 +487,23 @@ def _self_test() -> int:
         if not (cvr["conviction"] > cvx["conviction"]):
             print("FAIL: pullback conviction should exceed chase", cvx, cvr)
             ok = False
+
+    # Phase E: mode threads into the thesis decay horizon. Intraday (default)
+    # holds 1 day; swing rides to the contract's dte.
+    evi = compute_evidence({"direction": "call", "signal_strength": 3,
+                            "dte": 30})
+    if not (isinstance(evi.get("thesis"), dict)
+            and evi["thesis"].get("mode") == "intraday"
+            and evi["thesis"].get("decay_horizon_days") == 1):
+        print("FAIL: default mode should be intraday, 1-day horizon",
+              evi.get("thesis")); ok = False
+    evs = compute_evidence({"direction": "call", "signal_strength": 3,
+                            "dte": 30, "mode": "swing"})
+    if not (isinstance(evs.get("thesis"), dict)
+            and evs["thesis"].get("mode") == "swing"
+            and evs["thesis"].get("decay_horizon_days") == 30):
+        print("FAIL: swing mode should ride to dte horizon",
+              evs.get("thesis")); ok = False
 
     # Determinism.
     if compute_evidence(ctx) != compute_evidence(ctx):
