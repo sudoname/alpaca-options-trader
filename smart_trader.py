@@ -2373,6 +2373,20 @@ class SmartOptionsTrader:
                     ctx['dte'] = max(0, (d - date.today()).days)
                 except Exception:
                     pass
+            # Advisory-only news enrichment for the Oracle 2.1 catalyst engine.
+            # Fail-open: a news lookup failure must never disturb the ctx or the
+            # order just placed. Reuses the already-initialized news_service.
+            try:
+                svc = getattr(self, 'news_service', None)
+                if svc is not None:
+                    news = svc.get_news(underlying_symbol)
+                    if isinstance(news, dict):
+                        if news.get('score') is not None:
+                            ctx.setdefault('news_score', news.get('score'))
+                        if news.get('count') is not None:
+                            ctx['news_count'] = news.get('count')
+            except Exception:
+                pass
         except Exception:
             pass
         return ctx

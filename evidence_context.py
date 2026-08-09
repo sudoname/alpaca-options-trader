@@ -11,6 +11,8 @@ a flat ``evidence`` dict combining EVERY orphaned evidence producer:
   * IV bucket (iv_rank thresholds) + iv-vs-hv (``spread_builder``)
   * ``oracle.expected_move.compute_expected_move`` -> 1-sigma expected move
   * ``oracle.thesis.build_thesis``        -> machine-readable trade thesis
+  * ``oracle.catalyst.detect_catalyst``   -> news-shock / earnings catalyst
+  * ``oracle.attention.compute_attention`` -> relative-volume attention slate
 
 The result is what the shadow recorder persists under ``features_json.evidence``
 so the learning engine can later build ``Feature | Trades | Avg Return | Win% |
@@ -29,7 +31,8 @@ Standard ``ctx`` fields (all optional; missing -> None/neutral):
     realized_vol, vix, volume_ratio, news_score, breadth, candles (OHLCV oldest
     -> newest) or candlestick (a PatternStamp dict), skew, iv_rank, iv, hv,
     rel_strength, rl_preference, spread_pct, open_interest, option_volume,
-    signal_strength, dte, delta.
+    signal_strength, dte, delta, news_count, earnings_days,
+    prior_volume_ratio.
 """
 
 from typing import Dict, Optional
@@ -254,6 +257,22 @@ def compute_evidence(ctx: Optional[dict]) -> dict:
     except Exception:
         evidence["thesis"] = None
 
+    # 7) Oracle 2.1 shadow — catalyst + attention. Advisory only: these RECORD
+    #    an exogenous catalyst (news shock / earnings window) and crowd
+    #    attention (relative volume + optional velocity). The catalyst's
+    #    direction_hint is evidence, never a trigger — direction stays an
+    #    OUTPUT of the rule engine. Each slice fails open to None.
+    try:
+        from oracle.catalyst import detect_catalyst
+        evidence["catalyst"] = detect_catalyst(ctx)
+    except Exception:
+        evidence["catalyst"] = None
+    try:
+        from oracle.attention import compute_attention
+        evidence["attention"] = compute_attention(ctx)
+    except Exception:
+        evidence["attention"] = None
+
     return evidence
 
 
@@ -269,7 +288,8 @@ def _self_test() -> int:
     ctx = {
         "regime": "trending", "trend": "up", "momentum": 0.08,
         "realized_vol": 0.18, "vix": 16.0, "volume_ratio": 1.6,
-        "news_score": 0.5, "breadth": 0.4, "skew": 0.3, "iv_rank": 40.0,
+        "news_score": 0.5, "news_count": 6, "breadth": 0.4, "skew": 0.3,
+        "iv_rank": 40.0,
         "rel_strength": 0.04, "rl_preference": 0.6, "spread_pct": 0.01,
         "open_interest": 5000, "option_volume": 2000,
         "signal_strength": 3, "dte": 30, "delta": 0.45,
@@ -333,6 +353,19 @@ def _self_test() -> int:
         print("FAIL: thesis conviction", th); ok = False
     elif th.get("direction") is not None:  # ctx has no direction -> None
         print("FAIL: thesis must not invent direction", th); ok = False
+
+    # Oracle 2.1 shadow: catalyst (news_score 0.5, count 6 -> call news_shock)
+    # + attention (volume_ratio 1.6 -> elevated, no prior -> no velocity).
+    cat = ev.get("catalyst")
+    if not isinstance(cat, dict) or cat.get("catalyst_type") != "news_shock":
+        print("FAIL: catalyst slice", cat); ok = False
+    elif cat.get("direction_hint") != "call":
+        print("FAIL: catalyst direction_hint", cat); ok = False
+    att = ev.get("attention")
+    if not isinstance(att, dict) or att.get("level_label") != "elevated":
+        print("FAIL: attention slice", att); ok = False
+    elif att.get("velocity") is not None:  # no prior baseline in ctx
+        print("FAIL: attention velocity should be None", att); ok = False
 
     # Determinism.
     if compute_evidence(ctx) != compute_evidence(ctx):
