@@ -266,6 +266,22 @@ class SmartOptionsTrader:
         self.repricing_conv_bonus = _i2('REPRICING_CONV_BONUS', 1)
         self.last_extension = None
         self.last_repricing = None
+
+        # Phase D (Oracle 2.1): conviction-based sizing. Default OFF -> the
+        # folded conviction score is always computed and logged/stamped but the
+        # position is still sized by the legacy signal-count step function, so
+        # trade behavior is byte-identical until explicitly enabled. When on,
+        # position size comes from the conviction ladder (oracle/conviction.py)
+        # instead of _confidence_to_quantity. It never flips direction and is
+        # never a standalone trigger. EXTENSION_PENALTY/REPRICING_BONUS reuse the
+        # Phase C chase/pullback diagnostics as multiplicative modifiers.
+        self.enable_conviction_sizing = _flag('ENABLE_CONVICTION_SIZING')
+        self.conviction_extension_penalty = _f2(
+            'CONVICTION_EXTENSION_PENALTY', 0.15)
+        self.conviction_repricing_bonus = _f2(
+            'CONVICTION_REPRICING_BONUS', 0.10)
+        self.conviction_skip_below = _f2('CONVICTION_SKIP_BELOW', 0.0)
+        self.last_conviction = None
         # Set by determine_option_strategy when it returns 'skip'; surfaced by
         # the scheduler and Telegram so the operator sees *why* nothing traded.
         self.last_skip_reason = None
@@ -409,6 +425,7 @@ class SmartOptionsTrader:
                 'USE_NET_GROSS_CLAMP': self.use_net_gross_clamp,
                 'ENABLE_EXTENSION_GUARD': self.enable_extension_guard,
                 'ENABLE_REPRICING_TILT': self.enable_repricing_tilt,
+                'ENABLE_CONVICTION_SIZING': self.enable_conviction_sizing,
             }
             print("[ORACLE] mode flags: " + " ".join(
                 f"{k}={'on' if v else 'off'}" for k, v in _mode_flags.items()))
@@ -1567,6 +1584,32 @@ class SmartOptionsTrader:
 
         self.last_signal_strength = confidence
 
+        # Phase D (Oracle 2.1): conviction fold. ALWAYS computed (cheap) and
+        # recorded on self for observability/leaderboard; it only drives sizing
+        # when ENABLE_CONVICTION_SIZING is on (consumed in place_order_with_stops)
+        # so default behavior is byte-identical. Direction is an INPUT here — the
+        # engine only measures agreement with the already-chosen side. Only the
+        # subset available before the order is folded (rule confidence + the
+        # chase/pullback flags); the full slate is folded in evidence_context.
+        self.last_conviction = None
+        if strategy in ('put', 'call'):
+            try:
+                from oracle.conviction import compute_conviction
+                denom = float(self.conf_very_high_signals) or 4.0
+                base = max(0.0, min(1.0, float(confidence) / denom))
+                comp = {
+                    "base": base,
+                    "extended": (self.last_extension or {}).get("extended"),
+                    "opportunity": (self.last_repricing or {}).get("opportunity"),
+                }
+                self.last_conviction = compute_conviction(
+                    comp, direction=strategy,
+                    extension_penalty=self.conviction_extension_penalty,
+                    repricing_bonus=self.conviction_repricing_bonus,
+                    skip_below=self.conviction_skip_below)
+            except Exception as e:
+                print(f"[CONVICTION] diagnostic error (ignored): {e}")
+
         # Phase 3 (5): structured logging of the decision inputs.
         print(f"[STRATEGY] Analysis for {symbol}:")
         print(f"[STRATEGY] Momentum: {momentum:.3f}, Volatility: {volatility:.1%}")
@@ -1931,6 +1974,9 @@ class SmartOptionsTrader:
             # Carry the directional conviction (signal strength) onto the chosen
             # option so place_order_with_stops can size the position by confidence.
             best_option['confidence'] = self.last_signal_strength
+            # Phase D: carry the folded conviction stamp too (used for sizing
+            # only when ENABLE_CONVICTION_SIZING is on; otherwise informational).
+            best_option['conviction'] = getattr(self, 'last_conviction', None)
 
         if best_option and not best_option.get('mock', False):
             print(f"[BEST OPTION] Strike: ${best_option['strike']:.2f} {best_option['type'].upper()}")
@@ -1979,6 +2025,20 @@ class SmartOptionsTrader:
             order_quantity = self._confidence_to_quantity(strength)
             tier = {3: "very high", 2: "high", 1: "regular", 0: "skip"}.get(order_quantity, "regular")
             print(f"[SIZE] conviction {strength} -> {order_quantity} contract(s) ({tier})")
+            # Phase D: conviction-based sizing (flag-gated, default OFF). When on,
+            # size from the folded conviction ladder (oracle/conviction.py)
+            # instead of the crude signal-count step function. Fail-open: a
+            # missing/None conviction leaves the legacy size untouched.
+            if getattr(self, 'enable_conviction_sizing', False):
+                conv = option.get('conviction') or getattr(
+                    self, 'last_conviction', None)
+                if isinstance(conv, dict) and conv.get('contracts') is not None:
+                    prev = order_quantity
+                    order_quantity = int(conv['contracts'])
+                    print(f"[CONVICTION] sizing {option.get('symbol')}: "
+                          f"score={conv.get('conviction')} "
+                          f"tier={conv.get('tier')} "
+                          f"contracts {prev}->{order_quantity}")
         self.last_block_reason = None
 
         # Phase 3 sizing safety: a confidence that collapses to 0 contracts is a

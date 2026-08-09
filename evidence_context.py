@@ -15,6 +15,7 @@ a flat ``evidence`` dict combining EVERY orphaned evidence producer:
   * ``oracle.attention.compute_attention`` -> relative-volume attention slate
   * ``oracle.extension.detect_extension`` -> chase / over-extension measure
   * ``oracle.repricing.detect_repricing`` -> favorable-pullback opportunity
+  * ``oracle.conviction.compute_conviction`` -> folded [0,1] conviction score
 
 The result is what the shadow recorder persists under ``features_json.evidence``
 so the learning engine can later build ``Feature | Trades | Avg Return | Win% |
@@ -297,6 +298,41 @@ def compute_evidence(ctx: Optional[dict]) -> dict:
         evidence["extension"] = None
         evidence["repricing"] = None
 
+    # 9) Oracle 2.1 shadow — conviction fold. Advisory only: folds the slices
+    #    already assembled above (rule confidence, thesis, agent consensus,
+    #    catalyst, candlestick, regime, chase/pullback) into one normalized
+    #    [0,1] agreement-with-direction score for the leaderboard. Direction is
+    #    an INPUT copied from ctx (an OUTPUT of the rule engine), never decided
+    #    here. Fails open to None so it never blocks the slate.
+    try:
+        from oracle.conviction import compute_conviction
+        _ss = _to_float(ctx.get("signal_strength"))
+        _cat = evidence.get("catalyst") if isinstance(
+            evidence.get("catalyst"), dict) else {}
+        _ext = evidence.get("extension") if isinstance(
+            evidence.get("extension"), dict) else {}
+        _rep = evidence.get("repricing") if isinstance(
+            evidence.get("repricing"), dict) else {}
+        _th = evidence.get("thesis") if isinstance(
+            evidence.get("thesis"), dict) else {}
+        components = {
+            # rule-engine confidence normalized onto [0,1] (strength ~0-4).
+            "base": (_ss / 4.0) if _ss is not None else None,
+            "thesis_conviction": _th.get("conviction"),
+            "agent_consensus": evidence.get("agent_consensus"),
+            "catalyst_severity": _cat.get("severity"),
+            "catalyst_dir": _cat.get("direction_hint"),
+            "candlestick_confidence": evidence.get("candlestick_confidence"),
+            "candlestick_bias": evidence.get("candlestick_bias"),
+            "regime_confidence": evidence.get("regime_confidence"),
+            "extended": _ext.get("extended"),
+            "opportunity": _rep.get("opportunity"),
+        }
+        evidence["conviction"] = compute_conviction(
+            components, direction=ctx.get("direction"))
+    except Exception:
+        evidence["conviction"] = None
+
     return evidence
 
 
@@ -400,6 +436,18 @@ def _self_test() -> int:
     if not isinstance(rp, dict) or rp.get("opportunity") is not False:
         print("FAIL: repricing slice (no direction -> no opportunity)", rp); ok = False
 
+    # Oracle 2.1 shadow: conviction fold present. ctx carries no trade direction,
+    # so only the magnitude components (base from signal_strength 3, thesis
+    # conviction 0.75, regime_confidence) fold — conviction is still non-None.
+    cv = ev.get("conviction")
+    if not isinstance(cv, dict) or cv.get("conviction") is None:
+        print("FAIL: conviction slice should fold magnitude components", cv)
+        ok = False
+    elif not (0.0 <= cv["conviction"] <= 1.0):
+        print("FAIL: conviction out of [0,1]", cv); ok = False
+    elif cv.get("contracts") not in (1, 2, 3):
+        print("FAIL: conviction contracts ladder", cv); ok = False
+
     # Directional end-to-end: a call after a large aligned up-move (8% vs a ~1.6%
     # 3-day expected move from realized_vol 0.15) is an extended chase.
     evx = compute_evidence({"direction": "call", "momentum": 0.08,
@@ -415,6 +463,22 @@ def _self_test() -> int:
             and evr["repricing"].get("opportunity") is True):
         print("FAIL: dip should be a repricing opportunity", evr.get("repricing"))
         ok = False
+
+    # Directional conviction: both evx (call) and evr (call) know direction, so
+    # the agent-consensus component folds in (direction-aware). The chase in evx
+    # discounts conviction; the pullback in evr lifts it -> evr > evx.
+    cvx = evx.get("conviction")
+    cvr = evr.get("conviction")
+    if not (isinstance(cvx, dict) and cvx.get("conviction") is not None):
+        print("FAIL: directional conviction (chase) missing", cvx); ok = False
+    elif "agent_consensus" not in (cvx.get("components_used") or []):
+        print("FAIL: known direction should fold agent_consensus", cvx); ok = False
+    if isinstance(cvx, dict) and isinstance(cvr, dict) \
+            and cvx.get("conviction") is not None \
+            and cvr.get("conviction") is not None:
+        if not (cvr["conviction"] > cvx["conviction"]):
+            print("FAIL: pullback conviction should exceed chase", cvx, cvr)
+            ok = False
 
     # Determinism.
     if compute_evidence(ctx) != compute_evidence(ctx):
