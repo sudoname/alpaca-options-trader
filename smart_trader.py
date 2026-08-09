@@ -253,6 +253,19 @@ class SmartOptionsTrader:
         self.use_skip_on_weak_signal = _flag('USE_SKIP_ON_WEAK_SIGNAL')
         self.min_direction_signals = _i2('MIN_DIRECTION_SIGNALS', 2)
         self.use_normalized_confidence = _flag('USE_NORMALIZED_CONFIDENCE')
+
+        # Phase C (Oracle 2.1): chase/extension guard + repricing tilt. Both
+        # default OFF -> the diagnostics are always computed and logged/stamped
+        # but never alter conviction, so trade behavior is byte-identical until
+        # explicitly enabled. When on they only ADJUST the conviction that feeds
+        # sizing; they never flip direction and are never a standalone trigger.
+        self.enable_extension_guard = _flag('ENABLE_EXTENSION_GUARD')
+        self.extension_chase_ratio = _f2('EXTENSION_CHASE_RATIO', 2.0)
+        self.extension_conv_penalty = _i2('EXTENSION_CONV_PENALTY', 1)
+        self.enable_repricing_tilt = _flag('ENABLE_REPRICING_TILT')
+        self.repricing_conv_bonus = _i2('REPRICING_CONV_BONUS', 1)
+        self.last_extension = None
+        self.last_repricing = None
         # Set by determine_option_strategy when it returns 'skip'; surfaced by
         # the scheduler and Telegram so the operator sees *why* nothing traded.
         self.last_skip_reason = None
@@ -394,6 +407,8 @@ class SmartOptionsTrader:
                 'USE_BID_TRIGGERED_STOPS': self.use_bid_triggered_stops,
                 'USE_LIMIT_EXITS': self.use_limit_exits,
                 'USE_NET_GROSS_CLAMP': self.use_net_gross_clamp,
+                'ENABLE_EXTENSION_GUARD': self.enable_extension_guard,
+                'ENABLE_REPRICING_TILT': self.enable_repricing_tilt,
             }
             print("[ORACLE] mode flags: " + " ".join(
                 f"{k}={'on' if v else 'off'}" for k, v in _mode_flags.items()))
@@ -1514,6 +1529,42 @@ class SmartOptionsTrader:
                 bullish_signals, bearish_signals, strategy)
         else:
             confidence = bearish_signals if strategy == 'put' else bullish_signals
+
+        # Phase C (Oracle 2.1): chase/extension guard + repricing tilt. The
+        # diagnostics are ALWAYS computed (cheap, from data already here) and
+        # recorded on self for observability; they only ADJUST conviction when
+        # their flag is on, so default behavior is byte-identical. Direction is
+        # NEVER flipped here — only the sizing conviction is nudged. Fail-open.
+        self.last_extension = None
+        self.last_repricing = None
+        if strategy in ('put', 'call'):
+            try:
+                # 3-trading-day 1-sigma expected move (matches the 3-bar
+                # short_trend lookback), in percent, from annualized vol.
+                em3 = volatility * math.sqrt(3.0 / 252.0) * 100.0
+                recent = short_trend * 100.0
+                from oracle.extension import detect_extension
+                from oracle.repricing import detect_repricing
+                ext = detect_extension(recent, em3, strategy,
+                                       chase_ratio=self.extension_chase_ratio)
+                rep = detect_repricing(recent, em3, strategy)
+                self.last_extension = ext
+                self.last_repricing = rep
+                if self.enable_extension_guard and ext.get('extended'):
+                    prev = confidence
+                    confidence = max(0, confidence - self.extension_conv_penalty)
+                    print(f"[EXTENSION] chase guard {symbol}: "
+                          f"ratio={ext.get('extension_ratio')} "
+                          f"conviction {prev}->{confidence}")
+                if self.enable_repricing_tilt and rep.get('opportunity'):
+                    prev = confidence
+                    confidence = confidence + self.repricing_conv_bonus
+                    print(f"[REPRICING] pullback tilt {symbol}: "
+                          f"ratio={rep.get('pullback_ratio')} "
+                          f"conviction {prev}->{confidence}")
+            except Exception as e:
+                print(f"[EXTENSION] diagnostic error (ignored): {e}")
+
         self.last_signal_strength = confidence
 
         # Phase 3 (5): structured logging of the decision inputs.

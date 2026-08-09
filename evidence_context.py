@@ -13,6 +13,8 @@ a flat ``evidence`` dict combining EVERY orphaned evidence producer:
   * ``oracle.thesis.build_thesis``        -> machine-readable trade thesis
   * ``oracle.catalyst.detect_catalyst``   -> news-shock / earnings catalyst
   * ``oracle.attention.compute_attention`` -> relative-volume attention slate
+  * ``oracle.extension.detect_extension`` -> chase / over-extension measure
+  * ``oracle.repricing.detect_repricing`` -> favorable-pullback opportunity
 
 The result is what the shadow recorder persists under ``features_json.evidence``
 so the learning engine can later build ``Feature | Trades | Avg Return | Win% |
@@ -273,6 +275,28 @@ def compute_evidence(ctx: Optional[dict]) -> dict:
     except Exception:
         evidence["attention"] = None
 
+    # 8) Oracle 2.1 shadow — chase/extension + repricing. Advisory only: they
+    #    measure whether the recent move (momentum) has already extended in the
+    #    trade's direction (a chase) or pulled back against it (a cheaper entry),
+    #    both relative to a short-horizon expected move derived from realized
+    #    vol. Direction is copied from ctx, never decided here. Fail open to None.
+    try:
+        from math import sqrt as _sqrt
+        from oracle.extension import detect_extension
+        from oracle.repricing import detect_repricing
+        _rv = _to_float(ctx.get("realized_vol"))
+        _mom = _to_float(ctx.get("momentum"))
+        _dir = ctx.get("direction")
+        # 3-trading-day 1-sigma expected move (matches the ~3-bar momentum
+        # lookback), in percent; None when realized vol is unavailable.
+        _em3 = (_rv * _sqrt(3.0 / 252.0) * 100.0) if (_rv and _rv > 0) else None
+        _recent = (_mom * 100.0) if _mom is not None else None
+        evidence["extension"] = detect_extension(_recent, _em3, _dir)
+        evidence["repricing"] = detect_repricing(_recent, _em3, _dir)
+    except Exception:
+        evidence["extension"] = None
+        evidence["repricing"] = None
+
     return evidence
 
 
@@ -366,6 +390,31 @@ def _self_test() -> int:
         print("FAIL: attention slice", att); ok = False
     elif att.get("velocity") is not None:  # no prior baseline in ctx
         print("FAIL: attention velocity should be None", att); ok = False
+
+    # Oracle 2.1 shadow: extension/repricing present; with no direction in ctx
+    # neither can fire (extension not extended; repricing fails open).
+    xt = ev.get("extension")
+    if not isinstance(xt, dict) or xt.get("extended") is not False:
+        print("FAIL: extension slice (no direction -> not extended)", xt); ok = False
+    rp = ev.get("repricing")
+    if not isinstance(rp, dict) or rp.get("opportunity") is not False:
+        print("FAIL: repricing slice (no direction -> no opportunity)", rp); ok = False
+
+    # Directional end-to-end: a call after a large aligned up-move (8% vs a ~1.6%
+    # 3-day expected move from realized_vol 0.15) is an extended chase.
+    evx = compute_evidence({"direction": "call", "momentum": 0.08,
+                            "realized_vol": 0.15})
+    if not (isinstance(evx.get("extension"), dict)
+            and evx["extension"].get("extended") is True):
+        print("FAIL: aligned chase should be extended", evx.get("extension"))
+        ok = False
+    # A modest dip against a call thesis is a repricing opportunity.
+    evr = compute_evidence({"direction": "call", "momentum": -0.016,
+                            "realized_vol": 0.15})
+    if not (isinstance(evr.get("repricing"), dict)
+            and evr["repricing"].get("opportunity") is True):
+        print("FAIL: dip should be a repricing opportunity", evr.get("repricing"))
+        ok = False
 
     # Determinism.
     if compute_evidence(ctx) != compute_evidence(ctx):
