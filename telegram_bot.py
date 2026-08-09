@@ -1558,7 +1558,9 @@ Monitoring started..."""
             if symbol in self.supported_tickers:
                 return f"✅ `{symbol}` is already supported"
 
-            # Validate symbol exists (basic check)
+            # Validate symbol exists (basic check). Keep the trader reference so
+            # the follow-on Oracle analysis can reuse it (avoids a 2nd build).
+            temp_trader = None
             try:
                 from smart_trader import SmartOptionsTrader
                 temp_trader = SmartOptionsTrader(ticker=symbol)
@@ -1570,14 +1572,27 @@ Monitoring started..."""
 
             # Add to list
             new_tickers = self.supported_tickers + [symbol]
-            if self.save_supported_tickers(new_tickers):
-                return f"""✅ *Symbol Added*
+            if not self.save_supported_tickers(new_tickers):
+                return "❌ Error saving symbol list"
+
+            msg = f"""✅ *Symbol Added*
 
 `{symbol}` added to supported symbols
 
 Total symbols: `{len(self.supported_tickers)}`"""
-            else:
-                return "❌ Error saving symbol list"
+
+            # Follow up with a LIVE Oracle analysis of the just-added symbol.
+            # Advisory / read-only and fully fail-open: a failure here must never
+            # undo or obscure the successful add.
+            try:
+                import oracle_ondemand
+                analysis = oracle_ondemand.analyze_symbol_text(
+                    symbol, trader=temp_trader)
+                if analysis:
+                    msg = msg + "\n\n" + analysis
+            except Exception:
+                pass
+            return msg
 
         except Exception as e:
             return f"❌ Error adding symbol: {str(e)}"
@@ -2130,18 +2145,20 @@ Total symbols: `{len(self.supported_tickers)}`"""
             return f"❌ Could not build oracle regime report: {e}"
 
     def oracle_explain(self, symbol, chat_id=None):
-        """Oracle 3.0: per-ticker evidence -> agent votes -> probability ->
-        attribution. SHADOW / ANALYTICS ONLY. Without a live evidence context it
-        returns INSUFFICIENT_DATA.
+        """Oracle: LIVE per-ticker evidence -> agent votes -> probability ->
+        attribution + the full Oracle 2.1 evidence slate. Builds a live,
+        read-only market context for the symbol on demand. STRICTLY ADVISORY:
+        it never places, sizes, blocks, or records a trade. Fails open to an
+        INSUFFICIENT_DATA report when no market context is available.
         """
         symbol = (symbol or '').strip().upper()
         if symbol and not re.fullmatch(r'[A-Z]{1,5}', symbol):
             return "❌ Invalid symbol. Usage: `ORACLE_EXPLAIN SPY`"
         try:
-            from oracle_intelligence_reports import generate_oracle_explain_text
-            return generate_oracle_explain_text(symbol or 'SPY')
+            import oracle_ondemand
+            return oracle_ondemand.analyze_symbol_text(symbol or 'SPY')
         except Exception as e:
-            return f"❌ Could not build oracle explain report: {e}"
+            return f"❌ Could not build oracle analysis: {e}"
 
     def oracle_agent_report(self, chat_id=None):
         """Oracle 3.0: per-agent hit-rate (win rate of trades where the agent had
