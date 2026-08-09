@@ -9,6 +9,8 @@ a flat ``evidence`` dict combining EVERY orphaned evidence producer:
   * ``candlestick_patterns.stamp_...``    -> the 6 frozen candlestick fields
   * ``feature_buckets.extract_features``  -> setup-key dims (regime/vol/dir/...)
   * IV bucket (iv_rank thresholds) + iv-vs-hv (``spread_builder``)
+  * ``oracle.expected_move.compute_expected_move`` -> 1-sigma expected move
+  * ``oracle.thesis.build_thesis``        -> machine-readable trade thesis
 
 The result is what the shadow recorder persists under ``features_json.evidence``
 so the learning engine can later build ``Feature | Trades | Avg Return | Win% |
@@ -232,6 +234,26 @@ def compute_evidence(ctx: Optional[dict]) -> dict:
     evidence["iv_bucket"] = iv_bucket(ctx.get("iv_rank"))
     evidence["iv_vs_hv"] = _iv_vs_hv(ctx)
 
+    # 6) Oracle 2.1 shadow — expected move + machine-readable thesis. Advisory
+    #    only: these enrich the logged slate, never a trade trigger. Direction
+    #    is copied from ctx (already an OUTPUT of the rule engine), never
+    #    decided here. Each slice fails open to None.
+    try:
+        from oracle.expected_move import compute_expected_move
+        evidence["expected_move"] = compute_expected_move(
+            iv=ctx.get("iv"),
+            dte=ctx.get("dte"),
+            price=(ctx.get("underlying_price") or ctx.get("price")),
+            straddle_price=ctx.get("straddle_price"),
+        )
+    except Exception:
+        evidence["expected_move"] = None
+    try:
+        from oracle.thesis import build_thesis
+        evidence["thesis"] = build_thesis(ctx, evidence.get("expected_move"))
+    except Exception:
+        evidence["thesis"] = None
+
     return evidence
 
 
@@ -297,6 +319,20 @@ def _self_test() -> int:
         print("FAIL: iv bucket", ev["iv_bucket"]); ok = False
     if ev["iv_vs_hv"] != "overpriced":
         print("FAIL: iv_vs_hv", ev["iv_vs_hv"]); ok = False
+
+    # Oracle 2.1 shadow: expected move (iv 0.35, dte 30, no price) + thesis.
+    em = ev.get("expected_move")
+    if not isinstance(em, dict) or em.get("method") != "iv":
+        print("FAIL: expected_move slice", em); ok = False
+    elif abs(em["sigma1_pct"] - (0.35 * (30 / 365.0) ** 0.5 * 100)) > 1e-3:
+        print("FAIL: expected_move sigma1_pct", em); ok = False
+    th = ev.get("thesis")
+    if not isinstance(th, dict) or th.get("mode") != "intraday":
+        print("FAIL: thesis slice", th); ok = False
+    elif abs((th.get("conviction") or 0) - 0.75) > 1e-9:  # strength 3 / 4
+        print("FAIL: thesis conviction", th); ok = False
+    elif th.get("direction") is not None:  # ctx has no direction -> None
+        print("FAIL: thesis must not invent direction", th); ok = False
 
     # Determinism.
     if compute_evidence(ctx) != compute_evidence(ctx):
