@@ -321,6 +321,73 @@ class SmartOptionsTrader:
         self.use_thesis_decay_exit = _flag('USE_THESIS_DECAY_EXIT')
         self.thesis_decay_grace_days = _f2('THESIS_DECAY_GRACE_DAYS', 0.0)
 
+        # --- Oracle 2.1 signal-engine enrichment (5 features) -------------- #
+        # Every flag below is OFF by default and fail-open: with all of them
+        # unset the Oracle ctx, agent slate, probabilities and trade path are
+        # byte-identical to today (regression-guarded by each module's
+        # _self_test). Each feature only adds an optional ctx key or a neutral-
+        # unless-populated agent; the trade gate is veto-only and additive.
+        #  * USE_MODE_AWARE_TREND: derive trend/momentum on the horizon matching
+        #    the resolved ORACLE_MODE (intraday -> short/intraday span) instead
+        #    of the fixed 3-5 daily-bar lookback, fixing the "up trend on a down
+        #    weekly tape" horizon mismatch.
+        #  * USE_INTRADAY_FEATURES: fold opening-range / gap / VWAP / 1-5m
+        #    momentum into the ctx (intraday mode only).
+        #  * USE_ORDERBOOK_IMBALANCE: add Robinhood price-book order-flow
+        #    imbalance to the ctx (intraday mode only; hard fail-open to absent).
+        #  * USE_LEVEL_RECLAIM: add the 10/20-SMA + prior-day H/L + VWAP
+        #    reclaim/loss directional signal.
+        #  * USE_OPTIONS_FLOW / USE_DEALER_GAMMA: add call/put skew, unusual
+        #    volume, IV term structure and dealer gamma (GEX) positioning.
+        #  * USE_ORACLE_PROB_RECORDER: append every head prediction (including
+        #    no-trades) to oracle_prob_predictions.jsonl for later calibration.
+        #  * USE_EXPECTED_MOVE_COHERENCE: link p_no_trade to the IV-implied
+        #    expected move so a big implied move can't sit next to ~99% no-trade.
+        #  * USE_ORACLE_TRADE_GATE: promote the (previously shadow-only) head to
+        #    a veto-only entry gate. ORACLE_GATE_DRYRUN logs would-block without
+        #    acting. Both OFF -> the head stays shadow, trade path unchanged.
+        self.use_mode_aware_trend = _flag('USE_MODE_AWARE_TREND')
+        self.use_intraday_features = _flag('USE_INTRADAY_FEATURES')
+        self.use_orderbook_imbalance = _flag('USE_ORDERBOOK_IMBALANCE')
+        self.use_level_reclaim = _flag('USE_LEVEL_RECLAIM')
+        self.use_options_flow = _flag('USE_OPTIONS_FLOW')
+        self.use_dealer_gamma = _flag('USE_DEALER_GAMMA')
+        self.use_oracle_prob_recorder = _flag('USE_ORACLE_PROB_RECORDER')
+        self.use_expected_move_coherence = _flag('USE_EXPECTED_MOVE_COHERENCE')
+        self.use_oracle_trade_gate = _flag('USE_ORACLE_TRADE_GATE')
+        self.oracle_gate_dryrun = _flag('ORACLE_GATE_DRYRUN')
+        # Tunables (only consulted when the matching feature is enabled).
+        self.oracle_em_ref_pct = _f2('ORACLE_EM_REF_PCT', 3.0)
+        self.oracle_max_no_trade = _f2('ORACLE_MAX_NO_TRADE', 0.85)
+        self.oracle_min_agreement = _f2('ORACLE_MIN_AGREEMENT', 0.0)
+        self.oracle_min_directional = _f2('ORACLE_MIN_DIRECTIONAL', 0.0)
+
+        # --- Oracle 3.0 Phase 1: adversarial thesis + executable EV -------- #
+        # All OFF by default (EXECUTABLE_EV_SHADOW_MODE ON) so the decision path
+        # is byte-identical when disabled. Every wire below is shadow-first and
+        # fail-open: on any error, or with the flag OFF, the trade path is
+        # unchanged.
+        #  * ENABLE_ADVERSARIAL_THESIS: build bull/bear/no-trade theses over the
+        #    same evidence and run a bounded skeptic that may only RAISE
+        #    p_no_trade (capped by THESIS_MAX_NO_TRADE_BOOST); never flips
+        #    direction, never bypasses risk. Shadow-stamped for now.
+        #  * ENABLE_SEMANTIC_TRADE_MEMORY: append a context-only postmortem on
+        #    close; retrieval never overrides a rule.
+        #  * ENABLE_EXECUTABLE_EV: compute executable (post-friction) EV after
+        #    the existing EV gate. EXECUTABLE_EV_SHADOW_MODE (default ON) only
+        #    logs 'would-reject'; OFF makes it a veto-only gate before the risk
+        #    engine (never overrides hard risk).
+        #  * ENABLE_FILL_MODEL: use the fill model for executable-EV frictions.
+        self.enable_adversarial_thesis = _flag('ENABLE_ADVERSARIAL_THESIS')
+        self.enable_semantic_trade_memory = _flag('ENABLE_SEMANTIC_TRADE_MEMORY')
+        self.thesis_max_no_trade_boost = _f2('THESIS_MAX_NO_TRADE_BOOST', 0.10)
+        self.enable_executable_ev = _flag('ENABLE_EXECUTABLE_EV')
+        self.enable_fill_model = _flag('ENABLE_FILL_MODEL')
+        # Shadow mode defaults ON (log-only) even when ENABLE_EXECUTABLE_EV is set.
+        self.executable_ev_shadow_mode = str(
+            env_vars.get('EXECUTABLE_EV_SHADOW_MODE', 'true')
+        ).strip().lower() in ('1', 'true', 'yes', 'on')
+
         # Set by determine_option_strategy when it returns 'skip'; surfaced by
         # the scheduler and Telegram so the operator sees *why* nothing traded.
         self.last_skip_reason = None
@@ -467,6 +534,16 @@ class SmartOptionsTrader:
                 'ENABLE_CONVICTION_SIZING': self.enable_conviction_sizing,
                 'USE_ORACLE_MODE_DTE': self.use_oracle_mode_dte,
                 'USE_THESIS_DECAY_EXIT': self.use_thesis_decay_exit,
+                'USE_MODE_AWARE_TREND': self.use_mode_aware_trend,
+                'USE_INTRADAY_FEATURES': self.use_intraday_features,
+                'USE_ORDERBOOK_IMBALANCE': self.use_orderbook_imbalance,
+                'USE_LEVEL_RECLAIM': self.use_level_reclaim,
+                'USE_OPTIONS_FLOW': self.use_options_flow,
+                'USE_DEALER_GAMMA': self.use_dealer_gamma,
+                'USE_ORACLE_PROB_RECORDER': self.use_oracle_prob_recorder,
+                'USE_EXPECTED_MOVE_COHERENCE': self.use_expected_move_coherence,
+                'USE_ORACLE_TRADE_GATE': self.use_oracle_trade_gate,
+                'ORACLE_GATE_DRYRUN': self.oracle_gate_dryrun,
             }
             print("[ORACLE] mode flags: " + " ".join(
                 f"{k}={'on' if v else 'off'}" for k, v in _mode_flags.items())
@@ -2230,6 +2307,91 @@ class SmartOptionsTrader:
             except Exception as e:
                 print(f"[LOW-IV] size throttle error (ignored): {e}")
 
+        # ---- Oracle trade gate (Phase F, opt-in, VETO-ONLY, fail-open) -------
+        # Turns the Oracle direction head from shadow into a live veto. Runs
+        # BEFORE the EV / greek / risk gates and can only ever turn allow->skip
+        # (never sizes, flips direction or overrides EV/risk, which still run).
+        # Default OFF -> no-op. ORACLE_GATE_DRYRUN logs "would-block" without
+        # acting so the block-rate can be observed before enforcement. Any
+        # error leaves the trade on its normal path.
+        if getattr(self, 'use_oracle_trade_gate', False):
+            try:
+                import oracle_intelligence_reports as oir
+                import oracle_trade_gate as otg
+                gate_ctx = self._build_evidence_ctx(
+                    underlying_symbol, option, dynamic_levels)
+                _coh = getattr(self, 'use_expected_move_coherence', False)
+                _emp = gate_ctx.get('expected_move_pct') if _coh else None
+                head = oir.compute_oracle_explain(
+                    underlying_symbol, ctx=gate_ctx,
+                    expected_move_pct=_emp,
+                    em_ref_pct=(getattr(self, 'oracle_em_ref_pct', None)
+                                if _coh else None))
+                prob = (head or {}).get('probability', {}) or {}
+                verdict = otg.evaluate_oracle_gate(
+                    {'probability': prob,
+                     'intended_side': option.get('type')},
+                    {'ORACLE_MAX_NO_TRADE':
+                        getattr(self, 'oracle_max_no_trade', 0.85),
+                     'ORACLE_MIN_AGREEMENT':
+                        getattr(self, 'oracle_min_agreement', 0.0),
+                     'ORACLE_MIN_DIRECTIONAL':
+                        getattr(self, 'oracle_min_directional', 0.0)})
+                print(f"[ORACLE GATE] P(call) {prob.get('p_call')} "
+                      f"P(put) {prob.get('p_put')} "
+                      f"P(no-trade) {prob.get('p_no_trade')} -> "
+                      f"{'ALLOW' if verdict.get('allow') else 'BLOCK'}: "
+                      f"{verdict.get('reason')}")
+                if not verdict.get('allow'):
+                    if getattr(self, 'oracle_gate_dryrun', False):
+                        print(f"[ORACLE GATE] would-block (dry-run): "
+                              f"{verdict.get('reason')}")
+                    else:
+                        self.last_block_reason = (
+                            f"Oracle gate: {verdict.get('reason')}")
+                        return None
+            except Exception as e:
+                print(f"[ORACLE GATE] error (ignored): {e}")
+
+        # ---- Oracle 3.0: adversarial thesis (shadow, opt-in, fail-open) -------
+        # Builds bull/bear/no-trade theses over the SAME evidence and runs a
+        # bounded skeptic that may only RAISE p_no_trade (capped by
+        # THESIS_MAX_NO_TRADE_BOOST); it never flips direction or bypasses risk.
+        # Shadow-only here: it stamps the theses + review onto the option and
+        # logs the adjusted p_no_trade, but does not block. Any error -> no
+        # effect (trade proceeds on its normal path).
+        if getattr(self, 'enable_adversarial_thesis', False):
+            try:
+                import oracle_intelligence_reports as oir
+                from oracle.thesis_debate import (
+                    adversarial_review, build_theses)
+                th_ctx = self._build_evidence_ctx(
+                    underlying_symbol, option, dynamic_levels)
+                th_head = oir.compute_oracle_explain(
+                    underlying_symbol, ctx=th_ctx)
+                th_tally = (th_head or {}).get('tally', {}) or {}
+                th_prob = (th_head or {}).get('probability', {}) or {}
+                theses = build_theses(th_ctx, th_tally, th_prob)
+                review = adversarial_review(
+                    theses, th_prob, tally=th_tally,
+                    max_no_trade_boost=getattr(
+                        self, 'thesis_max_no_trade_boost', 0.10))
+                adj = review.adjusted_probability or {}
+                print(f"[THESIS] BULL "
+                      f"{theses.get('bull', {}).get('confidence')} "
+                      f"BEAR {theses.get('bear', {}).get('confidence')} "
+                      f"NOTR {theses.get('no_trade', {}).get('confidence')} "
+                      f"flags={review.flags} "
+                      f"boost={review.no_trade_boost:+.3f} "
+                      f"p_no_trade {th_prob.get('p_no_trade')}"
+                      f"->{adj.get('p_no_trade')} (shadow)")
+                option['bull_thesis'] = theses.get('bull')
+                option['bear_thesis'] = theses.get('bear')
+                option['no_trade_thesis'] = theses.get('no_trade')
+                option['thesis_review'] = review.to_dict()
+            except Exception as e:
+                print(f"[THESIS] error (ignored): {e}")
+
         # ---- EV entry gate (opt-in, fail-open) --------------------------------
         # Runs AFTER sizing so the stamp's premium reflects the final size, and
         # BEFORE the order is sent. Computes the frozen entry-time belief on the
@@ -2258,6 +2420,57 @@ class SmartOptionsTrader:
                         return None
             except Exception as e:
                 print(f"[EV GATE] error (ignored): {e}")
+
+        # ---- Oracle 3.0: executable EV (opt-in; shadow-first, fail-open) ------
+        # Recomputes EV net of realistic execution frictions (crossing the
+        # spread + slippage + fill probability + broker/OCC fees) on the
+        # entry-time quote. In shadow mode (default ON) it only stamps + logs a
+        # 'would-reject'; with shadow OFF a non-positive executable EV that had a
+        # positive theoretical EV becomes a veto HERE -- after the EV gate and
+        # BEFORE the fail-closed risk engine, so it can only ADD doubt and never
+        # overrides hard risk. Any error -> no effect (trade proceeds).
+        if getattr(self, 'enable_executable_ev', False):
+            try:
+                from cost_model import CostModel
+                from entry_ev_stamp import compute_entry_stamp
+                from oracle.execution.client import Quote
+                from oracle.execution.executable_ev import (
+                    compute_executable_ev)
+                from oracle.execution.fill_model import FillModel
+                _xstamp = compute_entry_stamp(
+                    option, dynamic_levels, entry_price, order_quantity,
+                    bid=bid_price, ask=current_option_price['ask'])
+                _theo = (_xstamp or {}).get('expected_value')
+                _xquote = Quote(option['symbol'], bid=bid_price,
+                                ask=current_option_price['ask'])
+                xev = compute_executable_ev(
+                    option, fair_value=None, quote=_xquote,
+                    fill_model=FillModel(), cost_model=CostModel(),
+                    qty=order_quantity, theoretical_ev=_theo)
+                option['executable_ev'] = xev.to_dict()
+                print(f"[EXEC EV] theo={xev.theoretical_EV} "
+                      f"exec={xev.executable_EV} "
+                      f"spread=${xev.spread_cost} "
+                      f"fill_p={xev.fill_probability} "
+                      f"reasons={xev.reasons}")
+                _neg = (xev.executable_EV is not None
+                        and xev.executable_EV <= 0
+                        and (xev.theoretical_EV or 0) > 0)
+                if _neg:
+                    if getattr(self, 'executable_ev_shadow_mode', True):
+                        print(f"[EXEC EV] would-reject (shadow): executable "
+                              f"EV {xev.executable_EV} <= 0 with +theoretical "
+                              f"{xev.theoretical_EV}")
+                    else:
+                        self.last_block_reason = (
+                            f"executable EV gate: post-friction EV "
+                            f"({xev.executable_EV}) is non-positive despite a "
+                            f"positive theoretical EV ({xev.theoretical_EV})")
+                        print(f"[EXEC EV] BLOCKED: executable EV "
+                              f"{xev.executable_EV} <= 0")
+                        return None
+            except Exception as e:
+                print(f"[EXEC EV] error (ignored): {e}")
 
         # ---- Phase 4: portfolio-level greek gate (opt-in, fail-open) ----------
         # Runs AFTER sizing so the projection uses the final contract count, and
@@ -2427,6 +2640,31 @@ class SmartOptionsTrader:
             except Exception as e:
                 print(f"[ORACLE SHADOW] skipped: {e}")
 
+            # Phase E (Oracle 2.1): record the frozen Oracle direction head to
+            # the append-only probability ledger for later calibration. Analytics
+            # only — never blocks/sizes/alters the just-placed order. Default OFF.
+            if getattr(self, 'use_oracle_prob_recorder', False):
+                try:
+                    import oracle_prob_recorder as opr
+                    _pc = (shadow or {}).get('model_p_call')
+                    _pp = (shadow or {}).get('model_p_put')
+                    _pnt = None
+                    if _pc is not None and _pp is not None:
+                        _pnt = max(0.0, 1.0 - float(_pc) - float(_pp))
+                    _pid = opr.record_prediction({
+                        'symbol': underlying_symbol,
+                        'mode': getattr(self, 'oracle_mode', 'intraday'),
+                        'trend_horizon': getattr(self, 'oracle_mode', 'intraday'),
+                        'probability': {'p_call': _pc, 'p_put': _pp,
+                                        'p_no_trade': _pnt},
+                        'entry_underlying_price':
+                            trade_info.get('entry_underlying_price'),
+                    })
+                    if _pid:
+                        print(f"[ORACLE PROB] recorded {_pid}")
+                except Exception as e:
+                    print(f"[ORACLE PROB] record skipped: {e}")
+
             action = (option.get('type') or 'call').upper()  # CALL/PUT
             analysis_ctx = {
                 'direction': action,
@@ -2529,7 +2767,23 @@ class SmartOptionsTrader:
         ctx: Dict = {}
         try:
             import explain_context
-            ctx = explain_context.build_explain_context(underlying_symbol) or {}
+            # Oracle 2.1: pass the resolved strategy mode when any mode-dependent
+            # feature is on so agents can self-gate and intraday enrichment can
+            # resolve. mode_aware_trend (Feature 5) is the ONLY switch that
+            # changes the trend numbers; the per-feature booleans gate their own
+            # enrichment. All flags OFF -> mode=None -> byte-identical ctx.
+            _mat = getattr(self, 'use_mode_aware_trend', False)
+            _if = getattr(self, 'use_intraday_features', False)
+            _ob = getattr(self, 'use_orderbook_imbalance', False)
+            _lr = getattr(self, 'use_level_reclaim', False)
+            _of = getattr(self, 'use_options_flow', False)
+            _dg = getattr(self, 'use_dealer_gamma', False)
+            _mode = (getattr(self, 'oracle_mode', 'intraday')
+                     if (_mat or _if or _ob or _lr) else None)
+            ctx = explain_context.build_explain_context(
+                underlying_symbol, mode=_mode, mode_aware_trend=_mat,
+                intraday_features=_if, orderbook_imbalance=_ob,
+                level_reclaim=_lr, options_flow=_of, dealer_gamma=_dg) or {}
         except Exception:
             ctx = {}
         try:
@@ -2556,6 +2810,25 @@ class SmartOptionsTrader:
                     from datetime import date
                     d = datetime.fromisoformat(str(exp)[:10]).date()
                     ctx['dte'] = max(0, (d - date.today()).days)
+                except Exception:
+                    pass
+            # Phase E 4b (Oracle 2.1): stamp a horizon-scaled expected move so
+            # the head's coherence fix can erode P(no-trade) when a big move is
+            # implied. Closed-form IV*sqrt(dte/365). Only when the coherence flag
+            # is on; fail-open to absent -> compute_oracle_explain no-ops (the
+            # probabilities stay byte-identical to shadow behaviour).
+            if getattr(self, 'use_expected_move_coherence', False):
+                try:
+                    iv = ctx.get('iv')
+                    dte = ctx.get('dte')
+                    if iv is not None and dte is not None:
+                        iv = float(iv)
+                        if iv > 3.0:          # looks like a percent, not decimal
+                            iv /= 100.0
+                        import math
+                        em = iv * math.sqrt(max(int(dte), 1) / 365.0) * 100.0
+                        if em > 0.0:
+                            ctx['expected_move_pct'] = round(em, 4)
                 except Exception:
                     pass
             # Advisory-only news enrichment for the Oracle 2.1 catalyst engine.
@@ -3260,6 +3533,34 @@ class SmartOptionsTrader:
                 print(f"[RL] Outcome recorded: {pnl_percent:+.1f}%")
             except Exception as e:
                 print(f"[RL] record_outcome failed: {e}")
+
+        # Oracle 3.0: semantic trade memory (analytics-only, opt-in, fail-open).
+        # Append a context-only postmortem so a later decision can RETRIEVE
+        # lessons ("we've been burned fading this regime before"); it never
+        # overrides a rule, sizes, prices, or blocks a trade. Any error -> no
+        # effect (the close path is unchanged).
+        if getattr(self, 'enable_semantic_trade_memory', False):
+            try:
+                from oracle.trade_memory import record_reflection
+                stamp = trade.get('metrics') or {}
+                pop = (stamp.get('probability_of_profit')
+                       if isinstance(stamp, dict) else None)
+                won = float(pnl_percent) > 0
+                record_reflection({
+                    'symbol': trade.get('symbol'),
+                    'sector': trade.get('sector'),
+                    'regime': (trade_record.get('regime_label')
+                               or trade.get('regime')),
+                    'catalyst': trade.get('catalyst'),
+                    'strategy_mode': trade.get('strategy_mode'),
+                    'failure_mode': None if won else outcome,
+                    'expected': (f"POP {pop:.0%}"
+                                 if isinstance(pop, (int, float)) else None),
+                    'actual': f"{outcome} ({pnl_percent:+.1f}%)",
+                    'confidence': pop,
+                })
+            except Exception as e:
+                print(f"[TRADE MEMORY] reflection skipped: {e}")
 
     def update_model_weights(self, pnl_percent: float):
         """Update model weights based on trade performance"""

@@ -137,12 +137,22 @@ def generate_oracle_regime_report_text(market_view=None, *, regime_raw=None,
 # --------------------------------------------------------------------------- #
 def compute_oracle_explain(ticker: str, ctx: Optional[dict] = None,
                            weights: Optional[dict] = None, prior: float = 0.5,
-                           regime=None, agents_config=None) -> dict:
+                           regime=None, agents_config=None,
+                           expected_move_pct: Optional[float] = None,
+                           em_ref_pct: Optional[float] = None) -> dict:
     try:
         ctx = ctx if isinstance(ctx, dict) else {}
         votes = oag.run_agents(ctx, agents_config)
         tally = ovo.tally_votes(votes, weights)
-        prob = ovo.bayesian_probability(votes, prior, weights)
+        # Feature 4b coherence: an explicit expected_move_pct wins; else fall
+        # back to a ctx-supplied one. None (the default) keeps the probability
+        # byte-identical to the historical behaviour.
+        emp = expected_move_pct
+        if emp is None and isinstance(ctx, dict):
+            emp = ctx.get("expected_move_pct")
+        prob = ovo.bayesian_probability(votes, prior, weights,
+                                        expected_move_pct=emp,
+                                        em_ref_pct=em_ref_pct)
         expl = oex.explain(votes, weights=weights, probability=prob,
                            regime=regime)
         has_ctx = bool(ctx)
@@ -195,10 +205,13 @@ def format_oracle_explain(report: dict) -> str:
 def generate_oracle_explain_text(ticker: str, ctx: Optional[dict] = None,
                                  weights: Optional[dict] = None,
                                  prior: float = 0.5, regime=None,
-                                 agents_config=None) -> str:
+                                 agents_config=None,
+                                 expected_move_pct: Optional[float] = None,
+                                 em_ref_pct: Optional[float] = None) -> str:
     return format_oracle_explain(compute_oracle_explain(
         ticker, ctx=ctx, weights=weights, prior=prior, regime=regime,
-        agents_config=agents_config))
+        agents_config=agents_config, expected_move_pct=expected_move_pct,
+        em_ref_pct=em_ref_pct))
 
 
 # --------------------------------------------------------------------------- #
