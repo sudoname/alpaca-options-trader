@@ -32,6 +32,12 @@ WEIGHT_DEFAULT = 1.0
 EVIDENCE_SCALE = 1.5
 _EPS = 1e-6
 
+# Feature 4b — expected-move coherence. Reference "normal" implied move (in %)
+# at which half of the neutral (no-trade) mass is eroded. A larger implied move
+# erodes more of the no-trade mass, so a big expected move can no longer coexist
+# with a ~99% no-trade verdict. Only used when an expected move is supplied.
+EM_REF_PCT_DEFAULT = 3.0
+
 
 def _clamp01(x: float) -> float:
     return 0.0 if x < 0.0 else 1.0 if x > 1.0 else x
@@ -114,11 +120,21 @@ def tally_votes(votes: Optional[List], weights: Optional[Dict] = None) -> dict:
 
 
 def bayesian_probability(votes: Optional[List], prior: float = 0.5,
-                         weights: Optional[Dict] = None) -> dict:
+                         weights: Optional[Dict] = None,
+                         expected_move_pct: Optional[float] = None,
+                         em_ref_pct: Optional[float] = None) -> dict:
     """Posterior {p_call, p_put, p_no_trade}. Always sums to 1.0; never raises.
 
     ``prior`` is the directional base rate P(call works) in (0, 1) (default
     0.5 = uninformed). The actionable mass = 1 - aggregate neutral mass.
+
+    ``expected_move_pct`` (Feature 4b coherence): when supplied, a larger implied
+    move erodes the neutral/no-trade mass so a big expected move can no longer sit
+    next to a ~99% no-trade verdict. The erosion factor is ``em / (em + ref)``
+    where ``ref`` is ``em_ref_pct`` (else :data:`EM_REF_PCT_DEFAULT`): 0 at
+    ``em=0`` (mass untouched) rising toward 1 as the move dwarfs the reference.
+    ``None`` (the default) — and ``expected_move_pct == 0`` — leave the result
+    byte-identical to the historical behaviour (regression guard).
     """
     try:
         prior = _clamp01(_to_float(prior, 0.5))
@@ -142,9 +158,20 @@ def bayesian_probability(votes: Optional[List], prior: float = 0.5,
 
         # Actionable vs no-trade mass comes from the aggregate neutral share.
         tally = tally_votes(votes, weights)
-        actionable = _clamp01(1.0 - tally["p_neutral"])
         p_no_trade = _clamp01(tally["p_neutral"])
 
+        # Feature 4b: a large implied move erodes the no-trade mass so the two
+        # can't be incoherent. em=0 / None leaves p_no_trade untouched.
+        if expected_move_pct is not None:
+            ref = _to_float(em_ref_pct, EM_REF_PCT_DEFAULT)
+            if ref <= 0.0:
+                ref = EM_REF_PCT_DEFAULT
+            em = abs(_to_float(expected_move_pct, 0.0))
+            if em > 0.0:
+                move_factor = em / (em + ref)          # in (0, 1)
+                p_no_trade = _clamp01(p_no_trade * (1.0 - move_factor))
+
+        actionable = _clamp01(1.0 - p_no_trade)
         p_call = p_call_dir * actionable
         p_put = p_put_dir * actionable
         s = p_call + p_put + p_no_trade
@@ -244,6 +271,35 @@ def _self_test() -> int:
 
     if prior_from_records([]) != 0.5:
         print("FAIL: empty prior should be 0.5"); ok = False
+
+    # --- Feature 4b: expected-move coherence -------------------------------
+    # Regression: expected_move_pct=None is byte-identical to omitting it, and
+    # expected_move_pct=0 is byte-identical too (no move -> no erosion).
+    base_neu = bayesian_probability(neutral, prior=0.5)
+    if bayesian_probability(neutral, prior=0.5, expected_move_pct=None) != base_neu:
+        print("FAIL: expected_move_pct=None must be byte-identical", base_neu); ok = False
+    if bayesian_probability(neutral, prior=0.5, expected_move_pct=0.0) != base_neu:
+        print("FAIL: expected_move_pct=0 must be byte-identical", base_neu); ok = False
+
+    # A big implied move erodes the no-trade mass: the near-all-neutral slate
+    # can no longer sit at ~99% no-trade once a large expected move is supplied.
+    big = bayesian_probability(neutral, prior=0.5, expected_move_pct=10.0,
+                               em_ref_pct=3.0)
+    if not (big["p_no_trade"] < base_neu["p_no_trade"]):
+        print("FAIL: big expected move should lower no_trade", big, base_neu); ok = False
+    # (2e-6 tolerance: triple 6-decimal rounding can leave the sum a ulp shy of 1.)
+    if abs(sum(big[k] for k in ("p_call", "p_put", "p_no_trade")) - 1.0) >= 2e-6:
+        print("FAIL: coherence result not normalized", big); ok = False
+    # Monotonic: a bigger move erodes more no-trade than a smaller one.
+    small = bayesian_probability(neutral, prior=0.5, expected_move_pct=1.0,
+                                 em_ref_pct=3.0)
+    if not (big["p_no_trade"] < small["p_no_trade"] < base_neu["p_no_trade"]):
+        print("FAIL: no_trade should shrink monotonically with move", big, small,
+              base_neu); ok = False
+    # A non-positive reference falls back to the default (never divides by zero).
+    if bayesian_probability(neutral, prior=0.5, expected_move_pct=5.0,
+                            em_ref_pct=0.0).get("p_no_trade") is None:
+        print("FAIL: zero em_ref should fall back to default"); ok = False
 
     # Determinism.
     if bayesian_probability(bull, 0.5) != bayesian_probability(bull, 0.5):
