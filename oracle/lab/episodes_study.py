@@ -351,11 +351,95 @@ def dte_breakdown(trades: Sequence[dict], *,
     return {label: _metrics.compute_metrics(groups[label]) for label in order}
 
 
+_TIME_STOP_CAPS = (1, 2, 3, 5, 7, 10)
+
+
+def _to_float(x: Any) -> Optional[float]:
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def _time_stop_estimate(pnl: float, hold_days: float, cap: float) -> float:
+    """Estimate a trade's P&L had it been force-exited at ``cap`` days.
+
+    IMPORTANT — this is an ASSUMPTION, not a measurement. The roundtrip
+    backfill stores only entry and exit; there is no mid-hold mark, so the
+    day-``cap`` value cannot be observed. We use a linear-accrual proxy:
+    ``pnl * (cap / hold_days)`` for trades held longer than the cap. This
+    shrinks a cut loser's loss and a cut winner's gain toward zero in
+    proportion to how early the stop fires. Trades that already closed on or
+    before the cap are returned unchanged (exact).
+    """
+    h = _to_float(hold_days)
+    p = _to_float(pnl)
+    if p is None:
+        return 0.0
+    if h is None or h <= cap or h <= 0:
+        return p
+    return p * (float(cap) / h)
+
+
+def time_stop_sweep(trades: Sequence[dict], *,
+                    direction: Optional[str] = None,
+                    caps: Sequence[float] = _TIME_STOP_CAPS
+                    ) -> Dict[str, Any]:
+    """Model a max-holding-time stop across candidate caps (in days).
+
+    For each cap the trades partition into KEPT (hold_days <= cap; P&L is
+    exact and unchanged) and CUT (held longer; P&L would change to an
+    unobserved day-``cap`` value, estimated via ``_time_stop_estimate``).
+    ``kept_pnl`` and ``cut_pnl_realized`` are exact facts; ``cut_pnl_est``,
+    ``est_total`` and ``improvement`` carry the linear-accrual assumption.
+    Deterministic. Optionally restricted to one ``direction`` (call|put).
+    """
+    sub = [t for t in (trades or []) if isinstance(t, dict)
+           and (direction is None
+                or str(t.get("direction") or "").lower() == direction)]
+    actual_total = sum((_to_float(t.get("pnl")) or 0.0) for t in sub)
+    rows: List[Dict[str, Any]] = []
+    for cap in caps:
+        kept_pnl = 0.0
+        cut_pnl_real = 0.0
+        cut_pnl_est = 0.0
+        n_cut = 0
+        for t in sub:
+            p = _to_float(t.get("pnl"))
+            if p is None:
+                continue
+            h = _to_float(t.get("hold_days"))
+            if h is None or h <= cap:
+                kept_pnl += p
+            else:
+                n_cut += 1
+                cut_pnl_real += p
+                cut_pnl_est += _time_stop_estimate(p, h, cap)
+        est_total = kept_pnl + cut_pnl_est
+        rows.append({
+            "cap_days": cap,
+            "n_cut": n_cut,
+            "kept_pnl": kept_pnl,
+            "cut_pnl_realized": cut_pnl_real,
+            "cut_pnl_est": cut_pnl_est,
+            "est_total": est_total,
+            "improvement": est_total - actual_total,
+        })
+    return {
+        "direction": direction or "all",
+        "n_trades": len(sub),
+        "actual_total": actual_total,
+        "model": "linear_accrual",
+        "caps": rows,
+    }
+
+
 def build_report(trades: Sequence[dict], *,
                  window_minutes: Optional[float] = None,
                  cohort_period: Optional[str] = None,
                  hold_split: Optional[str] = None,
-                 dte_split: Optional[str] = None) -> Dict[str, Any]:
+                 dte_split: Optional[str] = None,
+                 time_stop: Optional[str] = None) -> Dict[str, Any]:
     """Compute the overall metrics + categorical breakdowns for realized
     trades. Pure, deterministic, JSON-safe.
 
@@ -388,6 +472,9 @@ def build_report(trades: Sequence[dict], *,
             "direction": dte_split,
             "buckets": dte_breakdown(trades, direction=direction),
         }
+    if time_stop:
+        direction = None if time_stop == "all" else time_stop
+        report["time_stop"] = time_stop_sweep(trades, direction=direction)
     return report
 
 
@@ -485,6 +572,25 @@ def format_report(report: Dict[str, Any]) -> str:
         lines.append(f"BY DTE-AT-ENTRY ({ds.get('direction', 'all')})")
         for label, m in ds["buckets"].items():
             lines.append(_fmt_metrics_line(label, m))
+
+    ts = report.get("time_stop")
+    if ts and ts.get("caps"):
+        lines.append("")
+        lines.append(f"TIME-STOP SWEEP ({ts.get('direction', 'all')})  "
+                     f"model={ts.get('model', 'linear_accrual')}")
+        lines.append("  [kept_pnl & cut_realized are EXACT; est cols assume "
+                     "linear accrual -- no mid-hold mark in data]")
+        lines.append(f"  actual total: ${_fmt_num(ts.get('actual_total'))} "
+                     f"over n={ts.get('n_trades', 0)}")
+        for r in ts["caps"]:
+            lines.append(
+                f"  cap={str(r.get('cap_days')) + 'd':<5} "
+                f"n_cut={r.get('n_cut', 0):<4} "
+                f"kept=${_fmt_num(r.get('kept_pnl')):>10} "
+                f"cut_real=${_fmt_num(r.get('cut_pnl_realized')):>9} "
+                f"cut_est=${_fmt_num(r.get('cut_pnl_est')):>9} "
+                f"est_total=${_fmt_num(r.get('est_total')):>10} "
+                f"d=${_fmt_num(r.get('improvement')):>9}")
     return "\n".join(lines)
 
 
@@ -516,6 +622,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--dte-split", choices=("call", "put", "all"), default=None,
                    help="bucket by days-to-expiry at entry (optionally one "
                         "direction)")
+    p.add_argument("--time-stop", choices=("call", "put", "all"), default=None,
+                   help="model a max-holding-time stop sweep (optionally one "
+                        "direction)")
     p.add_argument("--json", action="store_true",
                    help="emit the JSON report instead of text")
     args = p.parse_args(argv)
@@ -524,7 +633,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                          until=args.until)
     report = build_report(trades, cohort_period=args.cohort,
                           hold_split=args.hold_split,
-                          dte_split=args.dte_split)
+                          dte_split=args.dte_split,
+                          time_stop=args.time_stop)
     if args.json:
         _safe_print(json.dumps(report, indent=2, sort_keys=True, default=str))
     else:
@@ -667,6 +777,35 @@ def _self_test() -> int:
     udrep = build_report([{"pnl": 1.0, "direction": "call"}], dte_split="all")
     if "unknown" not in udrep["dte_split"]["buckets"]:
         print("FAIL: missing dte_entry -> unknown"); ok = False
+
+    # --- Time-stop sweep ---------------------------------------------------- #
+    # Estimate: kept trade unchanged; cut loser shrinks toward zero linearly.
+    if _time_stop_estimate(-100.0, 2.0, 5.0) != -100.0:  # h<=cap -> exact
+        print("FAIL: time-stop kept exact"); ok = False
+    if abs(_time_stop_estimate(-100.0, 10.0, 5.0) - (-50.0)) > 1e-9:  # 5/10
+        print("FAIL: time-stop linear estimate"); ok = False
+    if _time_stop_estimate(-100.0, 0.0, 5.0) != -100.0:  # h<=0 guard
+        print("FAIL: time-stop zero-hold guard"); ok = False
+    ts_trades = [
+        {"pnl": 30.0, "direction": "put", "hold_days": 1},     # kept at cap>=1
+        {"pnl": -200.0, "direction": "put", "hold_days": 10},  # cut at cap<10
+        {"pnl": 50.0, "direction": "call", "hold_days": 10},   # excluded (call)
+    ]
+    trep = build_report(ts_trades, time_stop="put")
+    ts = trep.get("time_stop", {})
+    if ts.get("n_trades") != 2 or abs(ts.get("actual_total") - (-170.0)) > 1e-9:
+        print("FAIL: time-stop baseline", ts); ok = False
+    caps = {r["cap_days"]: r for r in ts.get("caps", [])}
+    c5 = caps.get(5)  # cap=5: put#2 (h=10) is cut, est = -200*5/10 = -100
+    if c5 is None or c5["n_cut"] != 1 or \
+            abs(c5["kept_pnl"] - 30.0) > 1e-9 or \
+            abs(c5["cut_pnl_realized"] - (-200.0)) > 1e-9 or \
+            abs(c5["cut_pnl_est"] - (-100.0)) > 1e-9 or \
+            abs(c5["est_total"] - (-70.0)) > 1e-9 or \
+            abs(c5["improvement"] - 100.0) > 1e-9:  # cutting the loser helps
+        print("FAIL: time-stop cap=5 math", c5); ok = False
+    if "TIME-STOP SWEEP (put)" not in format_report(trep):
+        print("FAIL: time-stop not rendered"); ok = False
 
     # Empty report never raises.
     empty = build_report([])
