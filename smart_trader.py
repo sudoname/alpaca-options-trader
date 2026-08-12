@@ -240,6 +240,24 @@ class SmartOptionsTrader:
         self.use_ev_entry_gate = _flag('USE_EV_ENTRY_GATE')
         self.min_ev_per_dollar_risk = _f2('MIN_EV_PER_DOLLAR_RISK', 0.0)
 
+        # Profitability gate: hard filter for entry quality. This codifies the
+        # realized edge from the trade ledger: weak signal + weak POP + low EV or
+        # no Oracle agreement is rejected before submission. Default ON so the
+        # rule set is enforced in the live path unless explicitly disabled.
+        self.use_profitability_gate = str(
+            env_vars.get('USE_PROFITABILITY_GATE', 'true')
+        ).strip().lower() in ('1', 'true', 'yes', 'on')
+        self.profitability_gate_dryrun = _flag('PROFITABILITY_GATE_DRYRUN')
+        self.profitability_gate_rules = {
+            'min_signal_strength': _i2('PROFITABILITY_MIN_SIGNAL_STRENGTH', 4),
+            'min_pop': _f2('PROFITABILITY_MIN_POP', 0.58),
+            'require_positive_ev': True,
+            'min_ev_per_dollar_risk': _f2('PROFITABILITY_MIN_EV_PER_DOLLAR_RISK', 0.008),
+            'max_p_no_trade': _f2('PROFITABILITY_MAX_P_NO_TRADE', 0.25),
+            'min_directional_agreement': _f2('PROFITABILITY_MIN_DIRECTIONAL_AGREEMENT', 0.55),
+            'require_oracle_agreement': True,
+        }
+
         # --- Phase 3: direction quality + sizing safety -------------------- #
         # All OFF by default so default behavior is byte-for-byte unchanged.
         #  * USE_SKIP_ON_WEAK_SIGNAL: when on, determine_option_strategy may
@@ -2556,6 +2574,79 @@ class SmartOptionsTrader:
                         return None
             except Exception as e:
                 print(f"[EV GATE] error (ignored): {e}")
+
+        # ---- Profitability gate (hard entry-quality veto) --------------------
+        # This is the realized-edge rule set: signal strength, POP, EV, EV/$risk,
+        # Oracle no-trade mass and agreement are all checked before the order is
+        # submitted. The dry-run mode logs would-block without vetoing.
+        if getattr(self, 'use_profitability_gate', False):
+            try:
+                from profitability_validator import validate_trade
+                try:
+                    from rh_price_book import get_order_book_imbalance
+                    book = get_order_book_imbalance(underlying_symbol) or {}
+                    ob_imb = (book.get('orderbook_imbalance')
+                              if isinstance(book, dict) else None)
+                except Exception:
+                    ob_imb = None
+
+                gate_stamp = {}
+                try:
+                    from entry_ev_stamp import compute_entry_stamp
+                    gate_stamp = compute_entry_stamp(
+                        option, dynamic_levels, entry_price, order_quantity,
+                        bid=bid_price, ask=current_option_price['ask']) or {}
+                except Exception:
+                    gate_stamp = {}
+
+                oracle_probability = {}
+                if isinstance(option.get('oracle_probability'), dict):
+                    oracle_probability = option['oracle_probability']
+                elif getattr(self, 'use_oracle_trade_gate', False):
+                    try:
+                        import oracle_intelligence_reports as oir
+                        gate_ctx = self._build_evidence_ctx(
+                            underlying_symbol, option, dynamic_levels)
+                        head = oir.compute_oracle_explain(
+                            underlying_symbol, ctx=gate_ctx)
+                        oracle_probability = ((head or {}).get('probability') or {})
+                    except Exception:
+                        oracle_probability = {}
+
+                candidate = {
+                    'symbol': option['symbol'],
+                    'direction': option.get('type'),
+                    'side': option.get('type'),
+                    'intended_side': option.get('type'),
+                    'option': {
+                        'type': option.get('type'),
+                        'confidence': option.get('confidence', self.last_signal_strength),
+                    },
+                    'entry_stamp': {
+                        'probability_of_profit': gate_stamp.get('probability_of_profit'),
+                        'expected_value': gate_stamp.get('expected_value'),
+                        'ev_per_dollar_risk': gate_stamp.get('ev_per_dollar_risk'),
+                    },
+                    'oracle_probability': oracle_probability,
+                    'robinhood_book': {'orderbook_imbalance': ob_imb},
+                }
+                verdict = validate_trade(candidate, self.profitability_gate_rules)
+                print(f"[PROFIT GATE] signal={candidate['option'].get('confidence')} "
+                      f"POP={verdict['summary'].get('probability_of_profit')} "
+                      f"EV={verdict['summary'].get('expected_value')} "
+                      f"EV/$risk={verdict['summary'].get('ev_per_dollar_risk')} "
+                      f"P(no-trade)={verdict['summary'].get('p_no_trade')} "
+                      f"agree={verdict['summary'].get('oracle_agreement')} "
+                      f"-> {'ALLOW' if verdict['pass'] else 'BLOCK'}")
+                if not verdict['pass']:
+                    reason = '; '.join(verdict['reasons']) or 'profitability rule set failed'
+                    if getattr(self, 'profitability_gate_dryrun', False):
+                        print(f"[PROFIT GATE] would-block: {reason}")
+                    else:
+                        self.last_block_reason = f"profitability gate: {reason}"
+                        return None
+            except Exception as e:
+                print(f"[PROFIT GATE] error (ignored): {e}")
 
         # ---- Oracle 3.0: executable EV (opt-in; shadow-first, fail-open) ------
         # Recomputes EV net of realistic execution frictions (crossing the
