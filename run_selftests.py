@@ -67,6 +67,8 @@ _MODULES = [
     "run_promotion_check",
     # Phase-2 Upgrade H — promotion audit ledger (offline audit).
     "oracle.promotion_audit",
+    # Phase-2 Upgrade I — promotion regression monitor (offline audit).
+    "oracle.promotion_monitor",
 ]
 
 # Live entry points to byte-compile (flag-gated wiring must still parse).

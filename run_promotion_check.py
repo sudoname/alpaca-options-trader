@@ -27,10 +27,17 @@ The write is fail-open (a broken ledger never breaks the report) and can be
 skipped with ``--no-audit``. ``--daily-summary`` reads that history back and
 prints (optionally Telegrams) a per-layer digest instead of running a check.
 
+Upgrade I — promotion regression monitor: after recording, the run scans the
+audit history via ``oracle.promotion_monitor`` and surfaces a REGRESSION ALERT
+if a layer that previously cleared all gates is back to HOLD, or a holding layer
+developed a new failing gate. ``--check-regressions`` runs that scan standalone.
+Advisory only — it never edits ``.env`` or blocks anything.
+
 Usage:
     python run_promotion_check.py --lab-json oracle/lab/results/<id>__phase2_study.json
     python run_promotion_check.py --layer executable_ev --calibration-jsonl execution_calibration.jsonl
     python run_promotion_check.py --daily-summary --telegram
+    python run_promotion_check.py --check-regressions --telegram
     python run_promotion_check.py --self-test
 """
 
@@ -191,15 +198,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--daily-summary", action="store_true",
                    help="print a per-layer digest of the audit ledger and exit "
                         "(does not run a fresh check)")
+    p.add_argument("--check-regressions", action="store_true",
+                   help="scan the audit ledger for promotion regressions and exit "
+                        "(does not run a fresh check)")
     p.add_argument("--self-test", action="store_true", help="run offline self-test and exit")
     args = p.parse_args(argv)
 
     if args.self_test:
         return _self_test()
 
-    # --daily-summary: read the audit history back instead of running a check.
+    # --daily-summary / --check-regressions: read the audit history back instead
+    # of running a fresh check.
     if args.daily_summary:
         return _run_daily_summary(args.audit_jsonl, args.telegram)
+    if args.check_regressions:
+        return _run_regression_check(args.audit_jsonl, args.telegram)
 
     thresholds = resolve_thresholds(args.env)
     calibration_stats = load_calibration_stats(args.calibration_jsonl)
@@ -218,11 +231,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     _maybe_telegram(rep["text"], args.telegram)
 
     # Upgrade H: append this verdict to the append-only audit ledger (fail-open).
+    # Upgrade I: with the new verdict recorded, scan the history for regressions.
     if not args.no_audit:
         _record_audit(rep["decisions"], thresholds,
                       {"calibration_jsonl": args.calibration_jsonl,
                        "lab_json": args.lab_json, "env": args.env},
                       args.audit_jsonl)
+        _warn_regressions(args.audit_jsonl)
 
     promoted = [ly for ly, d in rep["decisions"].items() if d.get("promote")]
     _safe_print(f"\nsummary: {len(promoted)}/{len(rep['decisions'])} layer(s) "
@@ -258,6 +273,36 @@ def _run_daily_summary(audit_path: Optional[str], telegram: bool) -> int:
     _safe_print(text)
     _maybe_telegram(text, telegram)
     return 0
+
+
+def _run_regression_check(audit_path: Optional[str], telegram: bool) -> int:
+    """Scan the audit ledger for promotion regressions and print/telegram."""
+    try:
+        from oracle.promotion_audit import load_promotion_history
+        from oracle.promotion_monitor import (
+            detect_regressions, format_regression_alert)
+        rows = load_promotion_history(path=audit_path)
+        text = format_regression_alert(detect_regressions(rows))
+    except Exception as exc:
+        print(f"[promotion_check] regression scan skipped: {exc}")
+        return 0
+    _safe_print(text)
+    _maybe_telegram(text, telegram)
+    return 0
+
+
+def _warn_regressions(audit_path: Optional[str]) -> None:
+    """After recording a verdict, surface a one-off regression alert if the
+    freshly-updated history shows any. Quiet when clean. Fail-open."""
+    try:
+        from oracle.promotion_audit import load_promotion_history
+        from oracle.promotion_monitor import (
+            detect_regressions, format_regression_alert)
+        report = detect_regressions(load_promotion_history(path=audit_path))
+        if report.get("regressions"):
+            _safe_print("\n" + format_regression_alert(report))
+    except Exception as exc:
+        print(f"[promotion_check] regression warn skipped: {exc}")
 
 
 def _safe_print(text: str) -> None:
@@ -367,6 +412,35 @@ def _self_test() -> int:
                 print("FAIL: --daily-summary exit"); ok = False
         except Exception as exc:  # pragma: no cover
             print("FAIL: audit wiring raised", exc); ok = False
+
+    # --- Upgrade I wiring: seed a PROMOTE, then a real HOLD run into the same
+    #     ledger; --check-regressions must detect a PROMOTION LOST. ---------- #
+    with tempfile.TemporaryDirectory() as d:
+        audit = os.path.join(d, "audit.jsonl")
+        try:
+            from datetime import datetime, timezone
+
+            from oracle.promotion_audit import record_promotion_check
+            from oracle.promotion_monitor import detect_regressions
+            record_promotion_check(
+                {"executable_ev": {"promote": True, "reasons": [], "metrics": {}}},
+                path=audit,
+                now=datetime(2024, 1, 1, tzinfo=timezone.utc))
+            # A real no-evidence run appends a HOLD for executable_ev.
+            if main(["--layer", "executable_ev", "--audit-jsonl", audit]) != 0:
+                print("FAIL: regression-seed run exit"); ok = False
+            report = detect_regressions(
+                __import__("oracle.promotion_audit", fromlist=["x"])
+                .load_promotion_history(path=audit))
+            lost = [e for e in report["regressions"]
+                    if e["kind"] == "promotion_lost"]
+            if len(lost) != 1 or lost[0]["layer"] != "executable_ev":
+                print("FAIL: promotion_lost not detected via runner",
+                      report["regressions"]); ok = False
+            if main(["--check-regressions", "--audit-jsonl", audit]) != 0:
+                print("FAIL: --check-regressions exit"); ok = False
+        except Exception as exc:  # pragma: no cover
+            print("FAIL: regression wiring raised", exc); ok = False
 
     print("run_promotion_check self-test:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
