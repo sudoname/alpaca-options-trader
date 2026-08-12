@@ -394,6 +394,15 @@ class SmartOptionsTrader:
             env_vars.get('EXECUTABLE_EV_SHADOW_MODE', 'true')
         ).strip().lower() in ('1', 'true', 'yes', 'on')
 
+        # --- 5-day put max-hold stop: live SHADOW observer ----------------- #
+        # Forward-test of the ~5-day put time-stop the realized-episode study
+        # flagged. Pure observer: when ON it records the ACTUAL option mark at
+        # the N-day boundary for open PUTs (the mid-hold datum episodes.db never
+        # had) so the counterfactual becomes measured, not assumed. It NEVER
+        # exits/sizes/alters a trade; OFF -> the monitor is byte-identical.
+        self.enable_put_time_stop_shadow = _flag('ENABLE_PUT_TIME_STOP_SHADOW')
+        self.put_time_stop_days = _i2('PUT_TIME_STOP_DAYS', 5)
+
         # Set by determine_option_strategy when it returns 'skip'; surfaced by
         # the scheduler and Telegram so the operator sees *why* nothing traded.
         self.last_skip_reason = None
@@ -550,6 +559,7 @@ class SmartOptionsTrader:
                 'USE_EXPECTED_MOVE_COHERENCE': self.use_expected_move_coherence,
                 'USE_ORACLE_TRADE_GATE': self.use_oracle_trade_gate,
                 'ORACLE_GATE_DRYRUN': self.oracle_gate_dryrun,
+                'ENABLE_PUT_TIME_STOP_SHADOW': self.enable_put_time_stop_shadow,
             }
             print("[ORACLE] mode flags: " + " ".join(
                 f"{k}={'on' if v else 'off'}" for k, v in _mode_flags.items())
@@ -3006,6 +3016,22 @@ class SmartOptionsTrader:
                 continue
 
             pnl_percent = ((current_price - entry_price) / entry_price) * 100
+
+            # 5-day put max-hold stop: SHADOW observer (flag-gated, fail-open).
+            # Records the ACTUAL option mark once an open PUT crosses the N-day
+            # boundary -- the mid-hold datum the backfill lacked -- so the
+            # counterfactual becomes measured. Pure side-effect (append-only
+            # JSONL): no exit, no mutation of `trade`, no `continue`. OFF or on
+            # error -> the exit path below is byte-identical.
+            if self.enable_put_time_stop_shadow:
+                try:
+                    from oracle import put_time_stop_observer as _ptss
+                    _ptss.observe_position(
+                        trade, pnl_percent, current_price,
+                        cap_days=self.put_time_stop_days,
+                        now=datetime.now())
+                except Exception:
+                    pass
 
             # Update highest price for trailing stop. Arming is gated by
             # TRAILING_ARM_PROFIT_PCT so the trade must earn protection first

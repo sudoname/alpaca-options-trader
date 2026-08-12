@@ -64,6 +64,8 @@ _MODULES = [
     "oracle.lab.run_phase2_study",
     # Realized-episode study — point the Lab metric engine at episodes.db.
     "oracle.lab.episodes_study",
+    # 5-day put max-hold stop — live shadow observer (forward-test).
+    "oracle.put_time_stop_observer",
     # Phase-2 Upgrade G — automated promotion gates (offline advisory).
     "oracle.promotion",
     "run_promotion_check",
