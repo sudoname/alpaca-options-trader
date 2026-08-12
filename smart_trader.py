@@ -371,6 +371,11 @@ class SmartOptionsTrader:
         #    same evidence and run a bounded skeptic that may only RAISE
         #    p_no_trade (capped by THESIS_MAX_NO_TRADE_BOOST); never flips
         #    direction, never bypasses risk. Shadow-stamped for now.
+        #  * ADVERSARIAL_THESIS_GATING (Phase 2 Upgrade E): promote the skeptic
+        #    from shadow to gate-feeding. When ON (and ENABLE_ADVERSARIAL_THESIS
+        #    ON) the review's adjusted probability replaces the raw head prob fed
+        #    to the Oracle trade gate, so a raised p_no_trade can VETO an entry.
+        #    Still veto-only (gate never sizes/flips). OFF -> byte-identical.
         #  * ENABLE_SEMANTIC_TRADE_MEMORY: append a context-only postmortem on
         #    close; retrieval never overrides a rule.
         #  * ENABLE_EXECUTABLE_EV: compute executable (post-friction) EV after
@@ -379,6 +384,7 @@ class SmartOptionsTrader:
         #    engine (never overrides hard risk).
         #  * ENABLE_FILL_MODEL: use the fill model for executable-EV frictions.
         self.enable_adversarial_thesis = _flag('ENABLE_ADVERSARIAL_THESIS')
+        self.adversarial_thesis_gating = _flag('ADVERSARIAL_THESIS_GATING')
         self.enable_semantic_trade_memory = _flag('ENABLE_SEMANTIC_TRADE_MEMORY')
         self.thesis_max_no_trade_boost = _f2('THESIS_MAX_NO_TRADE_BOOST', 0.10)
         self.enable_executable_ev = _flag('ENABLE_EXECUTABLE_EV')
@@ -2328,6 +2334,36 @@ class SmartOptionsTrader:
                     em_ref_pct=(getattr(self, 'oracle_em_ref_pct', None)
                                 if _coh else None))
                 prob = (head or {}).get('probability', {}) or {}
+                # ---- Oracle 3.0 Upgrade E: adversarial-thesis gating ----------
+                # Promote the bounded skeptic from shadow to gate-feeding. When
+                # ADVERSARIAL_THESIS_GATING is ON (and the thesis layer enabled),
+                # feed the review's adjusted probability into the gate instead of
+                # the raw head. The review may only RAISE p_no_trade (capped by
+                # THESIS_MAX_NO_TRADE_BOOST) and never flips the leading side, so
+                # this stays strictly veto-only. Flag OFF -> raw prob (byte-
+                # identical). Any error -> raw prob (fail-open).
+                if (getattr(self, 'adversarial_thesis_gating', False) and
+                        getattr(self, 'enable_adversarial_thesis', False)):
+                    try:
+                        from oracle.thesis_debate import (
+                            adversarial_review, build_theses)
+                        _g_tally = (head or {}).get('tally', {}) or {}
+                        _g_theses = build_theses(gate_ctx, _g_tally, prob)
+                        _g_review = adversarial_review(
+                            _g_theses, prob, tally=_g_tally,
+                            max_no_trade_boost=getattr(
+                                self, 'thesis_max_no_trade_boost', 0.10))
+                        _g_adj = _g_review.adjusted_probability or {}
+                        if _g_adj:
+                            print(f"[ORACLE GATE] thesis-gated p_no_trade "
+                                  f"{prob.get('p_no_trade')}->"
+                                  f"{_g_adj.get('p_no_trade')} "
+                                  f"boost={_g_review.no_trade_boost:+.3f} "
+                                  f"flags={_g_review.flags}")
+                            prob = _g_adj
+                    except Exception as _ge:
+                        print(f"[ORACLE GATE] thesis-gating error "
+                              f"(ignored, raw prob): {_ge}")
                 verdict = otg.evaluate_oracle_gate(
                     {'probability': prob,
                      'intended_side': option.get('type')},
