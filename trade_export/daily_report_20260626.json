@@ -1,0 +1,332 @@
+{
+  "date": "2026-06-26",
+  "generated_at": "2026-06-26T19:45:37",
+  "trading": {
+    "trades": 729,
+    "win_rate": 0.31824417009602196,
+    "total_realized": -14654.280000000143,
+    "ev_per_trade": -20.10189300411542,
+    "ev_per_trade_pct": -5.433387379972562,
+    "avg_gain": 239.96379310344776,
+    "avg_loss": -141.50076458752523,
+    "largest_winner": 7484.96,
+    "largest_loser": -3375.04,
+    "profit_factor": 0.7916232260442365
+  },
+  "portfolio": {
+    "greeks": {
+      "net_delta": 713.33,
+      "net_gamma": 1109.72,
+      "positions": 95,
+      "greeks_live": 94,
+      "greeks_fallback": 1,
+      "delta_by_underlying": {
+        "AAPL": -48.17,
+        "ABT": 46.17,
+        "ADBE": -40.29,
+        "AMZN": -55.95,
+        "BA": -15.02,
+        "BAC": 183.3,
+        "C": 34.07,
+        "CARR": 80.57,
+        "COP": -54.0,
+        "CRM": -48.83,
+        "CSCO": -109.09,
+        "CVS": 48.95,
+        "CVX": -90.98,
+        "DIA": 75.15,
+        "DIS": -53.72,
+        "ENB": 50.0,
+        "ESTC": -41.0,
+        "F": 195.14,
+        "GM": -15.72,
+        "GSK": 215.74,
+        "HD": 38.27,
+        "IONQ": -105.9,
+        "IWM": 91.17,
+        "JNJ": 40.01,
+        "LYFT": 13.96,
+        "MDT": 162.94,
+        "MMM": 32.96,
+        "MO": 274.23,
+        "MRK": 41.53,
+        "NFLX": -81.69,
+        "NKE": -141.84,
+        "NVDA": -81.44,
+        "OKTA": 45.35,
+        "ORCL": -87.21,
+        "PFE": -194.46,
+        "PG": -52.5,
+        "PLTR": -64.86,
+        "RIVN": 95.17,
+        "RTX": 91.64,
+        "SAP": -56.59,
+        "SCHW": -55.68,
+        "SNY": 74.24,
+        "SO": 229.18,
+        "SOFI": -204.04,
+        "SPG": 42.4,
+        "TGT": 89.96,
+        "TLT": 192.68,
+        "UBER": 146.45,
+        "V": 76.07,
+        "WFC": 108.85,
+        "WMT": -158.85,
+        "XLE": -48.67,
+        "XOM": -88.83,
+        "ZM": -69.67,
+        "ZS": -37.82
+      }
+    },
+    "sectors": {
+      "total_notional": 563372.94,
+      "by_sector": {
+        "Information Technology": 110907.18,
+        "Health Care": 60976.41,
+        "Consumer Discretionary": 46425.43,
+        "Industrials": 56577.7,
+        "Financials": 58841.09,
+        "Energy": 44278.58,
+        "Index ETF": 66244.41,
+        "Communication Services": 11336.54,
+        "Consumer Staples": 59065.82,
+        "Utilities": 22267.13,
+        "Real Estate": 9620.14,
+        "Fixed Income ETF": 16832.52
+      },
+      "weights": {
+        "Information Technology": 0.1969,
+        "Index ETF": 0.1176,
+        "Health Care": 0.1082,
+        "Consumer Staples": 0.1048,
+        "Financials": 0.1044,
+        "Industrials": 0.1004,
+        "Consumer Discretionary": 0.0824,
+        "Energy": 0.0786,
+        "Utilities": 0.0395,
+        "Fixed Income ETF": 0.0299,
+        "Communication Services": 0.0201,
+        "Real Estate": 0.0171
+      }
+    },
+    "beta": {
+      "portfolio_beta": -0.121,
+      "betas": {
+        "AAPL": 0.882,
+        "ABT": 0.164,
+        "ADBE": 0.446,
+        "AMZN": 1.422,
+        "BA": 1.157,
+        "BAC": 0.797,
+        "C": 1.355,
+        "CARR": 1.298,
+        "COP": -0.262,
+        "CRM": 0.526,
+        "CSCO": 1.029,
+        "CVS": 0.157,
+        "CVX": -0.3,
+        "DIA": 0.831,
+        "DIS": 0.808,
+        "ENB": -0.053,
+        "ESTC": 0.963,
+        "F": 1.312,
+        "GM": 1.178,
+        "GSK": 0.285,
+        "HD": 0.703,
+        "IONQ": 3.308,
+        "IWM": 1.296,
+        "JNJ": -0.103,
+        "LYFT": 1.313,
+        "MDT": 0.296,
+        "MMM": 0.815,
+        "MO": -0.381,
+        "MRK": 0.193,
+        "NFLX": 0.92,
+        "NKE": 0.901,
+        "NVDA": 1.866,
+        "OKTA": 1.177,
+        "ORCL": 1.85,
+        "PFE": 0.314,
+        "PG": -0.053,
+        "PLTR": 1.756,
+        "RIVN": 1.84,
+        "RTX": 0.486,
+        "SAP": 0.746,
+        "SCHW": 0.518,
+        "SNY": 0.402,
+        "SO": -0.172,
+        "SOFI": 2.554,
+        "SPG": 0.388,
+        "TGT": 0.605,
+        "TLT": 0.142,
+        "UBER": 0.993,
+        "V": 0.433,
+        "WFC": 0.79,
+        "WMT": -0.011,
+        "XLE": -0.185,
+        "XOM": -0.373,
+        "ZM": 0.998,
+        "ZS": 0.92
+      },
+      "n_underlyings": 55
+    },
+    "correlation": {
+      "correlation_score": 0.0954,
+      "pairs": 1485,
+      "n_underlyings": 55
+    }
+  },
+  "execution": {
+    "episodes": 729,
+    "entry": {
+      "samples": 0,
+      "avg_spread_pct": null,
+      "avg_slippage_bps": null,
+      "fill_quality_pct": null,
+      "avg_dist_to_mid_bps": null
+    },
+    "holding": {
+      "samples": 729,
+      "avg_hold_days": 1.7489711934156378,
+      "median_hold_days": 0.0,
+      "same_day_pct": 56.51577503429356,
+      "avg_intraday_hours": null,
+      "intraday_samples": 0,
+      "avg_roundtrip_hours": null,
+      "roundtrip_samples": 0
+    }
+  },
+  "learning": {
+    "leaderboards": {
+      "agent": [],
+      "pattern": [],
+      "regime": [],
+      "iv_bucket": [
+        {
+          "feature": "high",
+          "trades": 27,
+          "avg_return_pct": 0.0,
+          "win_rate": 0.0,
+          "ev": -2.3121,
+          "verdict": "Negative"
+        },
+        {
+          "feature": "medium",
+          "trades": 27,
+          "avg_return_pct": 0.0,
+          "win_rate": 0.0,
+          "ev": -2.3121,
+          "verdict": "Negative"
+        }
+      ],
+      "dte_bucket": [
+        {
+          "feature": "45+",
+          "trades": 15,
+          "avg_return_pct": 5.6739,
+          "win_rate": 0.2667,
+          "ev": -0.6731,
+          "verdict": "Negative"
+        },
+        {
+          "feature": "22-45",
+          "trades": 471,
+          "avg_return_pct": -6.3552,
+          "win_rate": 0.3376,
+          "ev": -6.3177,
+          "verdict": "Negative"
+        },
+        {
+          "feature": "8-21",
+          "trades": 132,
+          "avg_return_pct": -9.2226,
+          "win_rate": 0.3106,
+          "ev": -8.724,
+          "verdict": "Negative"
+        }
+      ],
+      "delta_bucket": [],
+      "direction": [
+        {
+          "feature": "down",
+          "trades": 251,
+          "avg_return_pct": -1.7725,
+          "win_rate": 0.4263,
+          "ev": -2.0427,
+          "verdict": "Negative"
+        },
+        {
+          "feature": "up",
+          "trades": 478,
+          "avg_return_pct": -7.3557,
+          "win_rate": 0.2615,
+          "ev": -7.2785,
+          "verdict": "Negative"
+        }
+      ],
+      "strength": [],
+      "strategy": [
+        {
+          "feature": "bullish_put_credit_spread",
+          "trades": 165,
+          "avg_return_pct": 0.9978,
+          "win_rate": 0.1697,
+          "ev": 0.3025,
+          "verdict": "Low"
+        },
+        {
+          "feature": "long_put",
+          "trades": 251,
+          "avg_return_pct": -1.7725,
+          "win_rate": 0.4263,
+          "ev": -2.0427,
+          "verdict": "Negative"
+        },
+        {
+          "feature": "long_call",
+          "trades": 313,
+          "avg_return_pct": -11.7594,
+          "win_rate": 0.3099,
+          "ev": -11.3795,
+          "verdict": "Negative"
+        }
+      ]
+    },
+    "rl_stats": {
+      "total": 729,
+      "completed": 729,
+      "completion_rate": 1.0,
+      "n_with_pnl": 729,
+      "win_rate": 0.31824417009602196,
+      "mean_net_pnl_pct": -5.433387379972558,
+      "effective_sample_size": 729.0
+    }
+  },
+  "confidence": {
+    "calibration": {
+      "verdict": "INSUFFICIENT_DATA",
+      "sample_size": 0,
+      "calibration_error": null
+    },
+    "evidence": {
+      "lean_into": {
+        "dimension": "strategy",
+        "feature": "bullish_put_credit_spread",
+        "ev": 0.3025,
+        "trades": 165,
+        "verdict": "Low",
+        "avg_return_pct": 0.9978,
+        "win_rate": 0.1697
+      },
+      "avoid": {
+        "dimension": "strategy",
+        "feature": "long_call",
+        "ev": -11.3795,
+        "trades": 313,
+        "verdict": "Negative",
+        "avg_return_pct": -11.7594,
+        "win_rate": 0.3099
+      }
+    }
+  }
+}

@@ -443,6 +443,12 @@ class SmartOptionsTrader:
             print(f"[PORTFOLIO] limits unavailable: {e}")
         self.use_portfolio_greek_limits = bool(
             self.portfolio_limits and self.portfolio_limits.enabled)
+        # When the greek gate is enabled, PORTFOLIO_GREEK_STRICT decides what a
+        # *computation error* (missing greeks, snapshot/network hiccup) does:
+        #   OFF (default): fail OPEN — log loudly, allow the trade (legacy).
+        #   ON           : fail CLOSED — block the trade, because a safety gate
+        #                  that can't evaluate is no safety at all.
+        self.portfolio_greek_strict = _flag('PORTFOLIO_GREEK_STRICT')
         self.use_realized_pnl_killswitch = _flag('USE_REALIZED_PNL_KILLSWITCH')
 
         # Low-IV regime filter (opt-in, fail-open, advisory): on a calm/low
@@ -623,9 +629,43 @@ class SmartOptionsTrader:
         return response.json() if response.status_code == 200 else None
 
     def get_positions(self):
-        """Get current positions"""
+        """Get current positions.
+
+        Best-effort: returns [] on any non-200. Used by display / iteration
+        callers that tolerate a stale/empty read. Safety-critical count paths
+        (risk check, portfolio-greek gate) MUST use ``_get_positions_checked``
+        instead, so a transient API error is never read as an empty book.
+        """
         response = requests.get(f"{self.base_url}/v2/positions", headers=self.headers)
         return response.json() if response.status_code == 200 else []
+
+    def _get_positions_checked(self, retries: int = 2):
+        """Fetch open positions, distinguishing a REAL empty book from an API
+        error.
+
+        Returns the parsed list on HTTP 200 (which may legitimately be []).
+        RAISES RuntimeError after exhausting retries on any non-200 status or
+        transport error. Safety-critical callers rely on this: a rate-limit
+        (HTTP 429) during a scan burst must never be silently read as "zero
+        open positions", which would wave a trade straight through the
+        max-concurrent / per-underlying / portfolio-greek caps.
+        """
+        import time
+        last = None
+        for attempt in range(int(retries) + 1):
+            try:
+                resp = requests.get(f"{self.base_url}/v2/positions",
+                                    headers=self.headers, timeout=10)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return data if isinstance(data, list) else []
+                last = f"HTTP {resp.status_code}"
+            except Exception as e:
+                last = f"{type(e).__name__}: {e}"
+            if attempt < int(retries):
+                time.sleep(0.5 * (attempt + 1))
+        raise RuntimeError(
+            f"positions fetch failed after {int(retries) + 1} tries: {last}")
 
     def get_orders(self):
         """Get current orders"""
@@ -827,17 +867,26 @@ class SmartOptionsTrader:
         projected_*}). Logs the requested current/projected greeks plus the
         decision.
 
-        Fail policy: a real cap *breach* blocks (allowed=False). Any computation
-        error (missing greeks, snapshot/network hiccup) FAILS OPEN — consistent
-        with greeks being advisory/fallback data — so the authoritative
-        capital-protection block remains the fail-closed risk engine that runs
-        immediately after. A no-op (allowed=True) is returned when disabled.
+        Fail policy: a real cap *breach* always blocks (allowed=False). What a
+        computation error (missing greeks, snapshot/network hiccup) does is
+        controlled by PORTFOLIO_GREEK_STRICT:
+          * OFF (default): FAIL OPEN — log loudly and allow, treating greeks as
+            advisory/fallback data; the fail-closed risk engine that runs
+            immediately after remains the authoritative capital-protection block.
+          * ON: FAIL CLOSED — block the entry, because a safety gate that cannot
+            evaluate the book provides no protection (this is the mode that would
+            have stopped the same-direction pile-ups seen in the blow-up review).
+        A no-op (allowed=True) is returned when the gate is disabled.
         """
         if not getattr(self, "use_portfolio_greek_limits", False) or not self.portfolio_limits:
             return {"allowed": True, "reason": "disabled", "breaches": []}
         try:
             from portfolio_risk import check_portfolio_limits, summarize_for_log
-            positions = self.get_positions()
+            # Strict fetch: a transient API error RAISES here, routing to this
+            # gate's except handler (which fails closed when
+            # PORTFOLIO_GREEK_STRICT is on) rather than silently checking an
+            # empty book.
+            positions = self._get_positions_checked()
             current = self._position_greeks(positions if isinstance(positions, list) else [])
             new_trade = {
                 "underlying": self._occ_underlying(option.get("symbol", ""))
@@ -860,8 +909,18 @@ class SmartOptionsTrader:
                 print(f"[PORTFOLIO] decision: BLOCKED reason={verdict['reason']}")
             return verdict
         except Exception as e:
-            # Fail-open on computation error (the fail-closed risk engine still runs).
-            print(f"[PORTFOLIO] check error (ignored, failing open): {e}")
+            if getattr(self, "portfolio_greek_strict", False):
+                # Strict mode: a gate that cannot evaluate the book must not wave
+                # the trade through. Block; the caller treats allowed=False as a
+                # veto and the fail-closed risk engine never even runs.
+                print(f"[PORTFOLIO] check error, FAILING CLOSED (strict): {e}")
+                return {"allowed": False,
+                        "reason": f"greek_check_error:{type(e).__name__}",
+                        "breaches": ["greek_computation_error"]}
+            # Legacy default: fail open, but say so loudly (the fail-closed risk
+            # engine still runs immediately after this gate).
+            print(f"[PORTFOLIO] check error, FAILING OPEN (set "
+                  f"PORTFOLIO_GREEK_STRICT=true to block instead): {e}")
             return {"allowed": True, "reason": f"error:{type(e).__name__}", "breaches": []}
 
     def _risk_check(self, trade_cost, qty: int = 1, may_day_trade: bool = True):
@@ -881,7 +940,10 @@ class SmartOptionsTrader:
             return {"allowed": False, "reason": "risk_engine_unavailable",
                     "breaches": ["risk_engine_unavailable"]}
         try:
-            positions = self.get_positions()
+            # Strict fetch: a transient API error RAISES here and is caught by
+            # the fail-closed handler below (open_positions can never be a
+            # falsely-zero count that bypasses the max-concurrent cap).
+            positions = self._get_positions_checked()
             open_positions = len(positions) if isinstance(positions, list) else None
 
             # Per-underlying concentration cap input (opt-in via

@@ -1,0 +1,15 @@
+{
+  "exported_at": "2026-06-26T18:29:21.952874",
+  "mode": "paper",
+  "account_number": "PA3NJU1Y90R3",
+  "equity": "835040.55",
+  "cash": "809543.55",
+  "buying_power": "3238174.2",
+  "counts": {
+    "open_positions": 95,
+    "orders": 1173,
+    "activities": 2374,
+    "fills": 1217,
+    "portfolio_history_points": 207
+  }
+}

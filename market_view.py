@@ -50,6 +50,50 @@ def make_bar(date: str, o, h, l, c, v=0.0, close_time: time = time(16, 0)) -> Ba
     return Bar(date[:10], float(o), float(h), float(l), float(c), float(v), close_dt)
 
 
+def _tf_minutes(timeframe: str) -> int:
+    """Minutes per bar for an Alpaca-style timeframe string ('1Min', '5Min')."""
+    tf = (timeframe or "1Min").strip().lower()
+    if tf.endswith("min"):
+        try:
+            return max(1, int(tf[:-3] or "1"))
+        except ValueError:
+            return 1
+    if tf in ("1hour", "hour", "60min"):
+        return 60
+    return 1
+
+
+def _parse_ts_full(t_iso: str) -> Optional[datetime]:
+    """Parse an ISO timestamp (with optional 'Z'/offset) down to the second."""
+    if not t_iso:
+        return None
+    try:
+        s = str(t_iso).replace("Z", "")
+        # Drop any timezone offset; treat the wall-clock components as-is so the
+        # point-in-time comparison stays in one naive frame (same as make_bar).
+        for sep in ("+", ):
+            if sep in s[11:]:
+                s = s[:11] + s[11:].split(sep)[0]
+        return datetime.fromisoformat(s[:19])
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def make_intraday_bar(t_iso: str, o, h, l, c, v=0.0, interval_minutes: int = 1) -> Optional[Bar]:
+    """Build an intraday Bar known at (bar-start + interval).
+
+    The bar for the window starting at ``t_iso`` only becomes known once that
+    window has fully elapsed, so ``close_dt = start + interval_minutes`` — this
+    keeps the point-in-time filter honest for minute data. Returns ``None`` on an
+    unparseable timestamp so a bad row is dropped rather than raising.
+    """
+    start = _parse_ts_full(t_iso)
+    if start is None:
+        return None
+    close_dt = start + timedelta(minutes=max(1, int(interval_minutes)))
+    return Bar(str(t_iso)[:10], float(o), float(h), float(l), float(c), float(v), close_dt)
+
+
 # --------------------------------------------------------------------------- #
 # Quote
 # --------------------------------------------------------------------------- #
@@ -99,6 +143,9 @@ class MarketView:
     def _candidate_intraday_bar(self, symbol: str, minutes: int) -> Optional[Bar]:
         return None
 
+    def _candidate_intraday_bars(self, symbol: str, timeframe: str) -> List[Bar]:
+        return []
+
     def _candidate_option_quote(self, occ_symbol: str) -> Optional[Quote]:
         return None
 
@@ -135,6 +182,25 @@ class MarketView:
         if bar is not None:
             self._record("intraday_bar", bar.close_dt, f"{symbol}:{bar.date}:{minutes}m")
         return bar
+
+    def intraday_bars(self, symbol: str, timeframe: str = "1Min",
+                      lookback_minutes: int = 390) -> List[Bar]:
+        """Intraday bars for `symbol` whose bar-close <= as_of, sorted ascending.
+
+        Point-in-time filtered and audited exactly like ``daily_bars``, then
+        bounded to the trailing ``lookback_minutes`` window (defaults to one
+        regular session). Returns ``[]`` when the subclass has no intraday
+        series (e.g. offline HistoricalMarketView without ``intraday_series``).
+        """
+        cands = self._candidate_intraday_bars(symbol, timeframe) or []
+        known = [b for b in cands if b.close_dt <= self._as_of]
+        known.sort(key=lambda b: b.close_dt)
+        if lookback_minutes:
+            cutoff = self._as_of - timedelta(minutes=lookback_minutes)
+            known = [b for b in known if b.close_dt >= cutoff]
+        for b in known:
+            self._record("intraday_bars", b.close_dt, f"{symbol}:{b.date}:{timeframe}")
+        return known
 
     def option_quote(self, occ_symbol: str) -> Optional[Dict]:
         q = self._candidate_option_quote(occ_symbol)
@@ -178,6 +244,7 @@ class HistoricalMarketView(MarketView):
         daily: Optional[Dict[str, List[Bar]]] = None,
         vix_series: Optional[Dict[str, List[Bar]]] = None,
         intraday: Optional[Dict[str, Bar]] = None,
+        intraday_series: Optional[Dict[str, List[Bar]]] = None,
         quotes: Optional[Dict[str, Quote]] = None,
         **kwargs,
     ):
@@ -185,6 +252,7 @@ class HistoricalMarketView(MarketView):
         self._daily = daily or {}
         self._vix = vix_series or {}
         self._intraday = intraday or {}
+        self._intraday_series = intraday_series or {}
         self._quotes = quotes or {}
 
     def _candidate_daily_bars(self, symbol):
@@ -192,6 +260,9 @@ class HistoricalMarketView(MarketView):
 
     def _candidate_intraday_bar(self, symbol, minutes):
         return self._intraday.get(symbol)
+
+    def _candidate_intraday_bars(self, symbol, timeframe):
+        return list(self._intraday_series.get(symbol, []))
 
     def _candidate_option_quote(self, occ_symbol):
         return self._quotes.get(occ_symbol)
@@ -224,6 +295,10 @@ class LiveMarketView(MarketView):
         self.headers = headers
         self.data_url = data_url
         self.feed = feed
+        # Per-instance cache of fetched intraday series keyed by (symbol,
+        # timeframe) so repeated ctx builds within one decision reuse one GET
+        # (minute-bar rate-limit control). Cleared when the instance is dropped.
+        self._intraday_cache: Dict = {}
 
     def _candidate_daily_bars(self, symbol):
         import requests
@@ -253,6 +328,47 @@ class LiveMarketView(MarketView):
             out.append(
                 make_bar(b["t"], b["o"], b["h"], b["l"], b["c"], b.get("v", 0), self.close_time)
             )
+        return out
+
+    def _candidate_intraday_bars(self, symbol, timeframe="1Min"):
+        import requests
+
+        key = (symbol, timeframe)
+        if key in self._intraday_cache:
+            return self._intraday_cache[key]
+
+        interval = _tf_minutes(timeframe)
+        end = self._as_of
+        # Fetch a 2-day window so today's session is always covered even early
+        # in the morning; the base intraday_bars() trims to lookback_minutes.
+        start = end - timedelta(days=2)
+        out: List[Bar] = []
+        try:
+            resp = requests.get(
+                f"{self.data_url}/v2/stocks/{symbol}/bars",
+                headers=self.headers,
+                params={
+                    "timeframe": timeframe,
+                    "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "end": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "limit": 10000,
+                    "feed": self.feed,
+                    "adjustment": "raw",
+                },
+                timeout=30,
+            )
+        except Exception:
+            self._intraday_cache[key] = out
+            return out
+        if resp.status_code != 200:
+            self._intraday_cache[key] = out
+            return out
+        for b in resp.json().get("bars", []) or []:
+            bar = make_intraday_bar(
+                b["t"], b["o"], b["h"], b["l"], b["c"], b.get("v", 0), interval)
+            if bar is not None:
+                out.append(bar)
+        self._intraday_cache[key] = out
         return out
 
     def _candidate_option_quote(self, occ_symbol):
@@ -333,6 +449,41 @@ def _self_test() -> int:
     # audit: nothing returned should be stamped after as_of.
     if any(rec["ts"] > mv_close.as_of for rec in mv_close.audit):
         print("FAIL: audit found a datum stamped after as_of"); ok = False
+
+    # --- intraday_bars: point-in-time filter + lookback window ------------- #
+    series = [make_intraday_bar(f"2026-01-06T{9 + (30 + i) // 60:02d}:"
+                                f"{(30 + i) % 60:02d}:00Z",
+                                473 + i * 0.01, 473.2 + i * 0.01,
+                                472.8 + i * 0.01, 473.1 + i * 0.01, 1000 + i)
+              for i in range(60)]  # 09:30 -> 10:29, one 1-min bar each
+    if any(b is None for b in series):
+        print("FAIL: make_intraday_bar returned None on a valid ts"); ok = False
+
+    # as_of 10:00 -> only bars whose close (start+1m) <= 10:00 are visible.
+    mv_i = HistoricalMarketView(datetime(2026, 1, 6, 10, 0),
+                                intraday_series={"SPY": series})
+    got = mv_i.intraday_bars("SPY", "1Min", lookback_minutes=390)
+    if not got:
+        print("FAIL: intraday_bars should return the morning bars"); ok = False
+    if any(b.close_dt > mv_i.as_of for b in got):
+        print("FAIL: intraday_bars leaked a future bar"); ok = False
+    # 09:30 bar closes 09:31 ... 09:59 bar closes 10:00 -> 30 bars <= 10:00.
+    if len(got) != 30:
+        print("FAIL: intraday_bars count wrong", len(got)); ok = False
+
+    # lookback_minutes trims the trailing window (inclusive both ends: a 10-min
+    # window over 1-min bars keeps closes 09:50..10:00 -> 11 bars).
+    recent = mv_i.intraday_bars("SPY", "1Min", lookback_minutes=10)
+    if len(recent) != 11:
+        print("FAIL: lookback_minutes should trim to 11 bars", len(recent)); ok = False
+
+    # A view without an intraday series returns [] (offline fail-open).
+    if mv_close.intraday_bars("SPY") != []:
+        print("FAIL: missing intraday series should yield []"); ok = False
+
+    # make_intraday_bar drops an unparseable timestamp.
+    if make_intraday_bar("not-a-ts", 1, 1, 1, 1) is not None:
+        print("FAIL: bad ts should yield None"); ok = False
 
     print("market_view self-test:", "PASS" if ok else "FAIL")
     return 0 if ok else 1

@@ -42,28 +42,79 @@ def _realized_vol(closes: List[float]) -> float:
     return min(max(vol, VOL_FLOOR), VOL_CAP)
 
 
-def _momentum(closes: List[float]) -> float:
-    """Smoothed short-window momentum — matches calculate_momentum."""
-    if len(closes) < 3:
+def _momentum(closes: List[float], span: int = 2) -> float:
+    """Smoothed short-window momentum — matches calculate_momentum.
+
+    ``span`` is the step (in bars) between the two points compared and the
+    offset between the smoothing windows. The historical default ``span=2``
+    (recent = last vs 2-bars-back, 3-bar smoothing windows) is byte-identical
+    to the original fixed-window implementation. A larger ``span`` widens the
+    lookback for a longer horizon; a smaller one tightens it for intraday use.
+    """
+    span = max(1, int(span))
+    window = span + 1
+    if len(closes) < window:
         return 0.0
-    recent = (closes[-1] - closes[-3]) / closes[-3] if closes[-3] else 0.0
-    if len(closes) >= 5:
-        recent_avg = sum(closes[-3:]) / 3
-        older_avg = sum(closes[-5:-2]) / 3
+    denom = closes[-1 - span]
+    recent = (closes[-1] - denom) / denom if denom else 0.0
+    if len(closes) >= window + span:
+        recent_avg = sum(closes[-window:]) / window
+        older_avg = sum(closes[-(window + span):-span]) / window
         trend = (recent_avg - older_avg) / older_avg if older_avg else 0.0
         return (recent + trend) / 2
     return recent
 
 
+def bars_for_mode(mode) -> Dict:
+    """Pure map from a strategy mode to its regime feature source + span.
+
+    ``source`` selects the bar series the trend/momentum is derived from
+    (``"intraday"`` for the intraday profile, ``"daily"`` for swing). ``span``
+    is the ``_momentum`` step; ``momentum_bars`` is ``None`` for swing so
+    ``detect_regime`` uses its historical default. Fail-open to the swing/daily
+    descriptor on any unknown input (``resolve_mode`` already fails open to
+    intraday, so this only guards against import failure).
+    """
+    try:
+        from oracle.mode import resolve_mode, MODE_INTRADAY
+        resolved = resolve_mode(mode)
+        if resolved == MODE_INTRADAY:
+            return {"mode": resolved, "source": "intraday",
+                    "momentum_bars": 5, "vol_lookback": DEFAULT_VOL_LOOKBACK}
+        return {"mode": resolved, "source": "daily",
+                "momentum_bars": None, "vol_lookback": DEFAULT_VOL_LOOKBACK}
+    except Exception:  # pragma: no cover - fail-open
+        return {"mode": "swing", "source": "daily",
+                "momentum_bars": None, "vol_lookback": DEFAULT_VOL_LOOKBACK}
+
+
 def detect_regime(market_view, symbol: str = "SPY",
-                  vol_lookback: int = DEFAULT_VOL_LOOKBACK) -> Dict:
+                  vol_lookback: int = DEFAULT_VOL_LOOKBACK,
+                  momentum_bars: Optional[int] = None,
+                  source: str = "daily") -> Dict:
     """Classify the regime knowable at `market_view.as_of`.
 
     Returns {regime, trend, realized_vol, momentum, as_of, n_bars}. Falls back
     to a neutral "ranging"/"flat" label when there is too little known data,
     rather than guessing.
+
+    ``momentum_bars`` overrides the ``_momentum`` step (``None`` keeps the
+    historical default so the output is byte-identical). ``source`` selects the
+    bar series: ``"daily"`` (default) reads ``daily_bars``; ``"intraday"`` reads
+    ``intraday_bars`` when the market view exposes it, else silently falls back
+    to daily. With the defaults (``momentum_bars=None, source="daily"``) this is
+    byte-identical to the original implementation.
     """
-    bars = market_view.daily_bars(symbol, vol_lookback)
+    bars = None
+    if source == "intraday" and hasattr(market_view, "intraday_bars"):
+        try:
+            ib = market_view.intraday_bars(symbol)
+            if ib:
+                bars = ib
+        except Exception:
+            bars = None
+    if bars is None:
+        bars = market_view.daily_bars(symbol, vol_lookback)
     closes = [b.c for b in bars]
     as_of = market_view.as_of.isoformat()
 
@@ -78,7 +129,8 @@ def detect_regime(market_view, symbol: str = "SPY",
         }
 
     vol = _realized_vol(closes)
-    mom = _momentum(closes)
+    span = 2 if momentum_bars is None else max(1, int(momentum_bars))
+    mom = _momentum(closes, span)
 
     if vol > VOLATILE_VOL:
         regime = "volatile"
@@ -160,6 +212,39 @@ def _self_test() -> int:
     r_empty = detect_regime(mv_empty, "SPY")
     if r_empty["regime"] != "ranging" or r_empty["n_bars"] != 0:
         print("FAIL: empty data should fall back to ranging", r_empty); ok = False
+
+    # _momentum default span is byte-identical to the original fixed windows.
+    closes = [100 + i for i in range(12)]
+    recent = (closes[-1] - closes[-3]) / closes[-3]
+    recent_avg = sum(closes[-3:]) / 3
+    older_avg = sum(closes[-5:-2]) / 3
+    expected = (recent + (recent_avg - older_avg) / older_avg) / 2
+    if abs(_momentum(closes) - expected) > 1e-12:
+        print("FAIL: _momentum default span not byte-identical", _momentum(closes), expected)
+        ok = False
+
+    # bars_for_mode maps modes to the right feature source.
+    bi = bars_for_mode("intraday")
+    bs = bars_for_mode("swing")
+    if bi["source"] != "intraday" or bi["momentum_bars"] is None:
+        print("FAIL: intraday mode should use intraday source w/ a span", bi); ok = False
+    if bs["source"] != "daily" or bs["momentum_bars"] is not None:
+        print("FAIL: swing mode should use daily source, default span", bs); ok = False
+    if bars_for_mode("garbage")["source"] != "intraday":
+        # resolve_mode fails open to intraday, so garbage -> intraday descriptor.
+        print("FAIL: junk mode should fail open via resolve_mode", bars_for_mode("garbage"))
+        ok = False
+
+    # detect_regime with an explicit span stays deterministic and defaults match.
+    if detect_regime(mv_up, "SPY", momentum_bars=None) != r_up:
+        print("FAIL: momentum_bars=None must be byte-identical"); ok = False
+    r_span = detect_regime(mv_up, "SPY", momentum_bars=1)
+    if detect_regime(mv_up, "SPY", momentum_bars=1) != r_span:
+        print("FAIL: non-deterministic with explicit span"); ok = False
+
+    # source="intraday" on a view without intraday_bars falls back to daily.
+    if detect_regime(mv_up, "SPY", source="intraday")["n_bars"] != r_up["n_bars"]:
+        print("FAIL: intraday source should fall back to daily bars"); ok = False
 
     print("regime self-test:", "PASS" if ok else "FAIL")
     return 0 if ok else 1

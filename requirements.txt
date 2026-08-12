@@ -8,3 +8,6 @@ tabulate>=0.9.0
 schedule>=1.2.0
 flask>=3.0.0
 waitress>=3.0.0
+# Oracle 2.1 Phase B2 — optional Robinhood order-book imbalance signal. Only
+# imported when USE_ORDERBOOK_IMBALANCE=true; the bot runs without it.
+robin_stocks>=3.0.0

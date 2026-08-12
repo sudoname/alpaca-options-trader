@@ -1,0 +1,66 @@
+{
+  "cash": 99595.0,
+  "starting_cash": 100000.0,
+  "positions": {},
+  "orders": [
+    {
+      "id": "166a0f84-5743-41f2-a71d-25cc68a15428",
+      "symbol": "AAPL260918P00280000",
+      "side": "buy",
+      "qty": 1,
+      "type": "market",
+      "status": "filled",
+      "filled_qty": 1,
+      "filled_avg_price": 13.9,
+      "submitted_at": "2026-06-26T18:27:15.863333+00:00",
+      "filled_at": null,
+      "reject_reason": null,
+      "fill_price": 13.9
+    },
+    {
+      "id": "25239d3f-bc9b-4d32-8e40-6d49bc1f66b9",
+      "symbol": "NVDA260821P00200000",
+      "side": "buy",
+      "qty": 1,
+      "type": "market",
+      "status": "filled",
+      "filled_qty": 1,
+      "filled_avg_price": 14.0,
+      "submitted_at": "2026-06-26T18:27:16.310449+00:00",
+      "filled_at": null,
+      "reject_reason": null,
+      "fill_price": 14.0
+    },
+    {
+      "id": "4eaeff16-9a0f-445c-ac05-abb5561e0545",
+      "symbol": "AAPL260918P00280000",
+      "side": "sell",
+      "qty": 1,
+      "type": "market",
+      "status": "filled",
+      "filled_qty": 1,
+      "filled_avg_price": 11.05,
+      "submitted_at": "2026-06-29T13:32:16.821132+00:00",
+      "filled_at": null,
+      "reject_reason": null,
+      "fill_price": 11.05,
+      "realized_pnl": -285.0
+    },
+    {
+      "id": "177c9dbb-b230-424c-907c-088038c25e0c",
+      "symbol": "NVDA260821P00200000",
+      "side": "sell",
+      "qty": 1,
+      "type": "market",
+      "status": "filled",
+      "filled_qty": 1,
+      "filled_avg_price": 12.8,
+      "submitted_at": "2026-06-29T13:47:17.907670+00:00",
+      "filled_at": null,
+      "reject_reason": null,
+      "fill_price": 12.8,
+      "realized_pnl": -120.0
+    }
+  ],
+  "realized_pnl_total": -405.0
+}

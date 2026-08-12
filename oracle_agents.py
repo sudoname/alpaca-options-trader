@@ -35,6 +35,10 @@ import regime as rg
 TREND_MOM = rg.TRENDING_MOMENTUM          # 0.05
 HIGH_VOL = rg.VOLATILE_VOL                 # 0.30
 
+# Oracle 2.1 — reference scales for the intraday / order-flow agents.
+INTRADAY_MOM_REF = 0.01                     # 1% over 5 bars == a strong intraday move
+ORDERFLOW_IMB_REF = 0.5                     # book imbalance magnitude for full conviction
+
 
 # --------------------------------------------------------------------------- #
 # Vote container + helpers
@@ -350,11 +354,174 @@ class RLPreferenceAgent:
                             {"rl_preference": p})
 
 
+class IntradayAgent:
+    """Oracle 2.1 — same-session structure (opening range, VWAP, gap, prior day).
+
+    SELF-GATES: only votes when ``ctx["trend_horizon"] == "intraday"`` so it is
+    inert for the swing profile and byte-identical when USE_INTRADAY_FEATURES is
+    off (the ctx simply never carries these keys). Combines the discrete
+    intraday tells (opening-range break, VWAP reclaim, prior-day break) with the
+    5-bar intraday momentum into a bounded directional vote.
+    """
+    name = "intraday"
+
+    def evaluate(self, ctx, config) -> AgentVote:
+        horizon = str(_get(ctx, "trend_horizon", "mode") or "").strip().lower()
+        if horizon != "intraday":
+            return _neutral(self.name, "not intraday horizon")
+
+        components: List[float] = []
+        reasons: List[str] = []
+        data: Dict = {}
+
+        for key, label in (("opening_range_break", "ORB"),
+                           ("vwap_reclaim", "VWAP"),
+                           ("prior_day_break", "PDH/PDL")):
+            v = _gf(ctx, key)
+            if v is not None and v != 0.0:
+                s = 1.0 if v > 0 else -1.0
+                components.append(s)
+                data[key] = v
+                reasons.append(f"{label} {'+' if s > 0 else '-'}")
+
+        m5 = _gf(ctx, "intraday_momentum_5m")
+        if m5 is not None and m5 != 0.0:
+            sig = max(-1.0, min(1.0, m5 / INTRADAY_MOM_REF))
+            components.append(sig)
+            data["intraday_momentum_5m"] = m5
+            reasons.append(f"5m mom {m5:+.4f}")
+
+        # A filled gap is a mild mean-reversion tell against the gap direction.
+        gap = _gf(ctx, "gap_pct")
+        if gap is not None and gap != 0.0 and ctx.get("gap_filled") is True:
+            fade = -0.5 * (1.0 if gap > 0 else -1.0)
+            components.append(fade)
+            data["gap_pct"] = gap
+            data["gap_filled"] = True
+            reasons.append(f"gap {gap:+.4f} filled (fade)")
+
+        if not components:
+            return _neutral(self.name, "no intraday signal")
+
+        signal = max(-1.0, min(1.0, sum(components) / len(components)))
+        # Confidence grows with agreement and the number of aligned tells.
+        agree = sum(1 for c in components if (c > 0) == (signal > 0))
+        conf = _clamp01(abs(signal) * (0.4 + 0.6 * (agree / len(components))))
+        return _directional(self.name, signal, conf, reasons or ["intraday"], data)
+
+
+class OrderFlowAgent:
+    """Oracle 2.1 — resting order-book imbalance (Robinhood price book).
+
+    Reads the single ``orderbook_imbalance`` number in [-1, 1] (positive = more
+    resting bid depth than ask depth near the touch). Inert / neutral when
+    USE_ORDERBOOK_IMBALANCE is off, since the ctx then lacks the key.
+    """
+    name = "order_flow"
+
+    def evaluate(self, ctx, config) -> AgentVote:
+        imb = _gf(ctx, "orderbook_imbalance")
+        if imb is None or imb == 0.0:
+            return _neutral(self.name, "no order-book imbalance")
+        sig = max(-1.0, min(1.0, imb / ORDERFLOW_IMB_REF))
+        conf = _clamp01(abs(sig)) * 0.7        # short-horizon tell -> de-weighted
+        return _directional(self.name, sig, conf,
+                            [f"book imbalance {imb:+.3f}"],
+                            {"orderbook_imbalance": imb,
+                             "orderbook_depth_ratio": _get(
+                                 ctx, "orderbook_depth_ratio")})
+
+
+class LevelReclaimAgent:
+    """Oracle 2.1 — reclaim / loss of key levels (SMA, prior-day H/L, VWAP).
+
+    Reads the pre-computed ``reclaim_signal`` in [-1, 1] (positive = reclaiming
+    levels, negative = losing them) and the ``reclaim_levels`` detail. Inert /
+    neutral when USE_LEVEL_RECLAIM is off, since the ctx then lacks the key.
+    """
+    name = "level_reclaim"
+
+    def evaluate(self, ctx, config) -> AgentVote:
+        sig = _gf(ctx, "reclaim_signal")
+        if sig is None or sig == 0.0:
+            return _neutral(self.name, "no level-reclaim signal")
+        s = max(-1.0, min(1.0, sig))
+        levels = _get(ctx, "reclaim_levels") or {}
+        # A fresh cross ("reclaimed"/"lost") carries more conviction than merely
+        # holding above/below; count them to scale confidence.
+        fresh = 0
+        if isinstance(levels, dict):
+            fresh = sum(1 for v in levels.values()
+                        if isinstance(v, dict)
+                        and v.get("status") in ("reclaimed", "lost"))
+        conf = _clamp01(abs(s) * (0.5 + 0.15 * min(fresh, 3)))
+        return _directional(self.name, s, conf,
+                            [f"level reclaim {s:+.2f} ({fresh} fresh cross"
+                             f"{'es' if fresh != 1 else ''})"],
+                            {"reclaim_signal": s, "reclaim_levels": levels})
+
+
+class OptionsFlowAgent:
+    """Oracle 2.1 — options-flow positioning + dealer gamma (GEX).
+
+    Directional read comes from call/put skew (``cp_volume_skew``,
+    ``cp_oi_skew``): call-side flow is bullish, put-side bearish. ``unusual_volume``
+    (today's volume vs standing OI) lifts conviction. Dealer gamma modulates
+    confidence, not direction: a negative-GEX regime (dealers short gamma) tends
+    to amplify moves, so the flow read carries more weight; a positive-GEX regime
+    is mean-reverting, so it carries less. Distinct from ``OptionsStructureAgent``
+    (which reads the existing ``skew``/``iv_rank``). Inert / neutral when
+    USE_OPTIONS_FLOW and USE_DEALER_GAMMA are both off (ctx lacks these keys).
+    """
+    name = "options_flow_positioning"
+
+    def evaluate(self, ctx, config) -> AgentVote:
+        comps = []
+        vskew = _gf(ctx, "cp_volume_skew")
+        oskew = _gf(ctx, "cp_oi_skew")
+        if vskew is not None:
+            comps.append(vskew)
+        if oskew is not None:
+            comps.append(oskew)
+        gex_regime = str(_get(ctx, "gex_regime") or "").strip().lower()
+        uv = _gf(ctx, "unusual_volume")
+        its = _gf(ctx, "iv_term_structure")
+
+        if not comps:
+            return _neutral(self.name, "no options-flow skew")
+        signal = max(-1.0, min(1.0, sum(comps) / len(comps)))
+        if abs(signal) < 1e-9:
+            return _neutral(self.name, "balanced options flow",
+                            {"gex_regime": gex_regime or None})
+
+        conf = abs(signal) * 0.6
+        if uv is not None:                       # today's volume rivals standing OI
+            conf *= 1.0 + min(max(uv - 1.0, 0.0), 1.0) * 0.3
+        if gex_regime == "negative":             # short gamma -> amplifies moves
+            conf *= 1.15
+        elif gex_regime == "positive":           # long gamma -> mean-reverting
+            conf *= 0.85
+        conf = _clamp01(conf)
+
+        reasons = [f"cp skew {signal:+.2f}"]
+        if uv is not None:
+            reasons.append(f"unusual vol {uv:.2f}x")
+        if gex_regime in ("positive", "negative"):
+            reasons.append(f"GEX {gex_regime}")
+        return _directional(self.name, signal, conf, reasons,
+                            {"cp_volume_skew": vskew, "cp_oi_skew": oskew,
+                             "unusual_volume": uv, "iv_term_structure": its,
+                             "gex_regime": gex_regime or None,
+                             "spot_vs_gex_flip": _get(ctx, "spot_vs_gex_flip")})
+
+
 # Registry — order is stable for deterministic reports.
 AGENTS = [
     TrendAgent(), VolatilityAgent(), VolumeAgent(), LiquidityAgent(),
     NewsAgent(), BreadthAgent(), CandlestickAgent(), OptionsStructureAgent(),
     RelativeStrengthAgent(), RLPreferenceAgent(),
+    IntradayAgent(), OrderFlowAgent(), LevelReclaimAgent(),
+    OptionsFlowAgent(),
 ]
 
 AGENT_NAMES = tuple(a.name for a in AGENTS)
@@ -447,6 +614,108 @@ def _self_test() -> int:
             run_agents(junk, cfg)  # type: ignore[arg-type]
         except Exception as exc:  # pragma: no cover
             print("FAIL: raised on junk", junk, exc); ok = False
+
+    # --- Oracle 2.1 new agents ---------------------------------------------
+    # Regression: with no intraday / order-flow keys the two new agents are
+    # fully neutral (zero directional mass, zero confidence) so the slate's
+    # probabilities are unchanged when the feature flags are OFF.
+    for nm in ("intraday", "order_flow", "level_reclaim", "options_flow_positioning"):
+        if nm not in by:
+            print("FAIL: missing new agent", nm); ok = False
+            continue
+        v = by[nm]
+        if v.bullish_score != 0.0 or v.bearish_score != 0.0 or v.confidence != 0.0:
+            print("FAIL: new agent should be neutral w/o its ctx keys", v); ok = False
+
+    # IntradayAgent self-gates: intraday keys present but a non-intraday horizon
+    # must still yield a neutral vote.
+    gated = {v.name: v for v in run_agents(
+        {"trend_horizon": "swing", "opening_range_break": 1,
+         "vwap_reclaim": 1, "intraday_momentum_5m": 0.02}, cfg)}
+    if gated["intraday"].bullish_score != 0.0 or gated["intraday"].confidence != 0.0:
+        print("FAIL: intraday agent must self-gate off swing horizon",
+              gated["intraday"]); ok = False
+
+    # Bullish intraday structure -> bullish intraday vote.
+    intra_bull = {v.name: v for v in run_agents(
+        {"trend_horizon": "intraday", "opening_range_break": 1,
+         "vwap_reclaim": 1, "prior_day_break": 1,
+         "intraday_momentum_5m": 0.02}, cfg)}
+    if not (intra_bull["intraday"].bullish_score >
+            intra_bull["intraday"].bearish_score):
+        print("FAIL: bullish intraday should vote bullish",
+              intra_bull["intraday"]); ok = False
+
+    # Bearish intraday structure -> bearish intraday vote.
+    intra_bear = {v.name: v for v in run_agents(
+        {"trend_horizon": "intraday", "opening_range_break": -1,
+         "vwap_reclaim": -1, "intraday_momentum_5m": -0.02}, cfg)}
+    if not (intra_bear["intraday"].bearish_score >
+            intra_bear["intraday"].bullish_score):
+        print("FAIL: bearish intraday should vote bearish",
+              intra_bear["intraday"]); ok = False
+
+    # OrderFlowAgent: positive imbalance bullish, negative bearish.
+    of_bull = {v.name: v for v in run_agents(
+        {"orderbook_imbalance": 0.6}, cfg)}
+    if not (of_bull["order_flow"].bullish_score >
+            of_bull["order_flow"].bearish_score):
+        print("FAIL: positive imbalance should vote bullish",
+              of_bull["order_flow"]); ok = False
+    of_bear = {v.name: v for v in run_agents(
+        {"orderbook_imbalance": -0.6}, cfg)}
+    if not (of_bear["order_flow"].bearish_score >
+            of_bear["order_flow"].bullish_score):
+        print("FAIL: negative imbalance should vote bearish",
+              of_bear["order_flow"]); ok = False
+
+    # LevelReclaimAgent: positive reclaim bullish, negative bearish; a fresh
+    # cross lifts confidence above a bare holding at the same signal.
+    lr_bull = {v.name: v for v in run_agents(
+        {"reclaim_signal": 0.6,
+         "reclaim_levels": {"vwap": {"level": 50.0, "status": "reclaimed"}}}, cfg)}
+    if not (lr_bull["level_reclaim"].bullish_score >
+            lr_bull["level_reclaim"].bearish_score):
+        print("FAIL: positive reclaim should vote bullish",
+              lr_bull["level_reclaim"]); ok = False
+    lr_bear = {v.name: v for v in run_agents(
+        {"reclaim_signal": -0.6,
+         "reclaim_levels": {"sma20": {"level": 50.0, "status": "lost"}}}, cfg)}
+    if not (lr_bear["level_reclaim"].bearish_score >
+            lr_bear["level_reclaim"].bullish_score):
+        print("FAIL: negative reclaim should vote bearish",
+              lr_bear["level_reclaim"]); ok = False
+
+    # OptionsFlowAgent: call-side skew bullish, put-side bearish.
+    of_flow_bull = {v.name: v for v in run_agents(
+        {"cp_volume_skew": 0.5, "cp_oi_skew": 0.3, "unusual_volume": 1.5}, cfg)}
+    if not (of_flow_bull["options_flow_positioning"].bullish_score >
+            of_flow_bull["options_flow_positioning"].bearish_score):
+        print("FAIL: call-side flow should vote bullish",
+              of_flow_bull["options_flow_positioning"]); ok = False
+    of_flow_bear = {v.name: v for v in run_agents(
+        {"cp_volume_skew": -0.5, "cp_oi_skew": -0.3}, cfg)}
+    if not (of_flow_bear["options_flow_positioning"].bearish_score >
+            of_flow_bear["options_flow_positioning"].bullish_score):
+        print("FAIL: put-side flow should vote bearish",
+              of_flow_bear["options_flow_positioning"]); ok = False
+    # Balanced flow with only a GEX regime -> neutral (gamma isn't directional).
+    of_flow_gamma = {v.name: v for v in run_agents(
+        {"gex_regime": "negative", "spot_vs_gex_flip": -1}, cfg)}
+    if of_flow_gamma["options_flow_positioning"].confidence != 0.0:
+        print("FAIL: gamma alone must not produce a directional vote",
+              of_flow_gamma["options_flow_positioning"]); ok = False
+    # Dealer gamma modulates confidence: negative (amplifying) > positive
+    # (mean-reverting) at the same directional skew.
+    neg_g = {v.name: v for v in run_agents(
+        {"cp_volume_skew": 0.5, "cp_oi_skew": 0.5, "gex_regime": "negative"}, cfg)}
+    pos_g = {v.name: v for v in run_agents(
+        {"cp_volume_skew": 0.5, "cp_oi_skew": 0.5, "gex_regime": "positive"}, cfg)}
+    if not (neg_g["options_flow_positioning"].confidence >
+            pos_g["options_flow_positioning"].confidence):
+        print("FAIL: negative-GEX regime should carry more confidence",
+              neg_g["options_flow_positioning"],
+              pos_g["options_flow_positioning"]); ok = False
 
     print("oracle_agents self-test:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
