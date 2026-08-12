@@ -2413,6 +2413,34 @@ class SmartOptionsTrader:
                     max_no_trade_boost=getattr(
                         self, 'thesis_max_no_trade_boost', 0.10))
                 adj = review.adjusted_probability or {}
+                # Upgrade F: semantic trade memory — retrieve prior lessons and
+                # attach them to the thesis notes as CONTEXT ONLY. This never
+                # touches probabilities, the gate, sizing, or risk; it only
+                # enriches the human-readable narrative for observability.
+                if getattr(self, 'enable_semantic_trade_memory', False):
+                    try:
+                        from oracle.trade_memory import retrieve_lessons
+                        _tm_filters = {
+                            'symbol': underlying_symbol,
+                            'sector': (th_ctx or {}).get('sector'),
+                            'regime': (th_ctx or {}).get('regime'),
+                            'catalyst': (th_ctx or {}).get('catalyst'),
+                            'strategy_mode': (th_ctx or {}).get('strategy_mode'),
+                        }
+                        _tm_filters = {k: v for k, v in _tm_filters.items() if v}
+                        _lessons = retrieve_lessons(_tm_filters, limit=3)
+                        if _lessons:
+                            option['thesis_lessons'] = _lessons
+                            _notes = [str(l.get('lesson')) for l in _lessons
+                                      if l.get('lesson')]
+                            if _notes:
+                                review.notes = (
+                                    (review.notes + ' | ' if review.notes else '')
+                                    + 'lessons: ' + ' | '.join(_notes))
+                            print(f"[THESIS] {len(_lessons)} prior lesson(s) "
+                                  f"attached (context-only)")
+                    except Exception as _tme:
+                        print(f"[THESIS] lesson retrieval skipped: {_tme}")
                 print(f"[THESIS] BULL "
                       f"{theses.get('bull', {}).get('confidence')} "
                       f"BEAR {theses.get('bear', {}).get('confidence')} "
