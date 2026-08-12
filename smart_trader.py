@@ -2435,7 +2435,7 @@ class SmartOptionsTrader:
                 from entry_ev_stamp import compute_entry_stamp
                 from oracle.execution.client import Quote
                 from oracle.execution.executable_ev import (
-                    compute_executable_ev)
+                    compute_executable_ev, should_veto_entry)
                 from oracle.execution.fill_model import FillModel
                 _xstamp = compute_entry_stamp(
                     option, dynamic_levels, entry_price, order_quantity,
@@ -2447,18 +2447,28 @@ class SmartOptionsTrader:
                     option, fair_value=None, quote=_xquote,
                     fill_model=FillModel(), cost_model=CostModel(),
                     qty=order_quantity, theoretical_ev=_theo)
-                option['executable_ev'] = xev.to_dict()
+                _xev_dict = xev.to_dict()
+                # Promotion mechanics live in one pure, tested helper: a veto is
+                # only ARMED (shadow OFF) on a paper account. On a live account
+                # the executable-EV layer stays log-only regardless of the flag
+                # -- promotion is paper-first, never live-money.
+                _shadow = getattr(self, 'executable_ev_shadow_mode', True)
+                _dec = should_veto_entry(
+                    xev.theoretical_EV, xev.executable_EV,
+                    shadow_mode=_shadow, is_paper=bool(getattr(self, 'paper', True)))
+                _xev_dict['shadow_would_reject'] = _dec['would_reject']
+                _xev_dict['veto_armed'] = _dec['veto_armed']
+                option['executable_ev'] = _xev_dict
                 print(f"[EXEC EV] theo={xev.theoretical_EV} "
                       f"exec={xev.executable_EV} "
                       f"spread=${xev.spread_cost} "
                       f"fill_p={xev.fill_probability} "
                       f"reasons={xev.reasons}")
-                _neg = (xev.executable_EV is not None
-                        and xev.executable_EV <= 0
-                        and (xev.theoretical_EV or 0) > 0)
-                if _neg:
-                    if getattr(self, 'executable_ev_shadow_mode', True):
-                        print(f"[EXEC EV] would-reject (shadow): executable "
+                if _dec['would_reject']:
+                    if not _dec['veto']:
+                        _why = ("shadow" if _shadow
+                                else "live account -> log-only")
+                        print(f"[EXEC EV] would-reject ({_why}): executable "
                               f"EV {xev.executable_EV} <= 0 with +theoretical "
                               f"{xev.theoretical_EV}")
                     else:
@@ -2466,7 +2476,7 @@ class SmartOptionsTrader:
                             f"executable EV gate: post-friction EV "
                             f"({xev.executable_EV}) is non-positive despite a "
                             f"positive theoretical EV ({xev.theoretical_EV})")
-                        print(f"[EXEC EV] BLOCKED: executable EV "
+                        print(f"[EXEC EV] BLOCKED (paper veto): executable EV "
                               f"{xev.executable_EV} <= 0")
                         return None
             except Exception as e:
@@ -2624,6 +2634,26 @@ class SmartOptionsTrader:
                           f"max loss ${stamp['max_loss']:.0f}")
             except Exception as e:
                 print(f"[EV STAMP] skipped: {e}")
+
+            # Upgrade C: persist the entry-time executable-EV estimate to the
+            # calibration ledger, keyed by order_id, so the realized fill can be
+            # scored against it at close (execution-capture ratio). Analytics
+            # only — recorded, never used to alter the just-placed order. Only
+            # fires when the shadow stamp was produced above; OFF -> no-op.
+            if getattr(self, 'enable_executable_ev', False) \
+                    and isinstance(option.get('executable_ev'), dict):
+                try:
+                    from oracle.execution import calibration as _calib
+                    _xev = dict(option['executable_ev'])
+                    _xev.update({
+                        'trade_id': str(order_id),
+                        'symbol': option['symbol'],
+                        'qty': order_quantity,
+                    })
+                    _calib.record_execution_estimate(_xev)
+                    print(f"[EXEC EV] estimate recorded (trade_id={order_id})")
+                except Exception as e:
+                    print(f"[EXEC EV] estimate record skipped: {e}")
 
             # Shadow-Oracle stamp: freeze an advisory Oracle opinion (regime,
             # model probabilities, agent votes/contributions) for the dashboard
@@ -3561,6 +3591,32 @@ class SmartOptionsTrader:
                 })
             except Exception as e:
                 print(f"[TRADE MEMORY] reflection skipped: {e}")
+
+        # Upgrade C: close the executable-EV loop. Record what execution REALLY
+        # did (actual entry/exit fill, realized EV) against the entry-time
+        # estimate stamped at open, keyed by the same order_id, so the fill /
+        # slippage / EV models can be calibrated from real fills. Analytics
+        # only — never blocks, sizes, or alters the close. OFF -> no-op.
+        if getattr(self, 'enable_executable_ev', False) and trade.get('order_id'):
+            try:
+                from oracle.execution import calibration as _calib
+                _entry = trade.get('entry_price')
+                _exit = None
+                _realized_ev = None
+                if _entry:
+                    _exit = float(_entry) * (1.0 + float(pnl_percent) / 100.0)
+                    _qty = trade.get('quantity', 1) or 1
+                    _realized_ev = ((_exit - float(_entry)) * 100.0
+                                    * float(_qty))
+                _calib.record_execution_realization(
+                    str(trade['order_id']), {
+                        'filled': True,
+                        'actual_entry_price': _entry,
+                        'actual_exit_price': _exit,
+                        'realized_EV': _realized_ev,
+                    })
+            except Exception as e:
+                print(f"[EXEC EV] realization record skipped: {e}")
 
     def update_model_weights(self, pnl_percent: float):
         """Update model weights based on trade performance"""

@@ -269,6 +269,29 @@ def capture_ratios(theoretical_ev: Optional[float],
 
 
 # --------------------------------------------------------------------------- #
+# Promotion mechanics (pure) — shadow -> paper veto
+# --------------------------------------------------------------------------- #
+def should_veto_entry(theoretical_ev: Optional[float],
+                      executable_ev: Optional[float], *,
+                      shadow_mode: bool, is_paper: bool) -> dict:
+    """Decide whether a candidate is VETOED by the executable-EV layer.
+
+    The veto condition is a +theoretical / −executable flip: execution frictions
+    turn a positive theoretical edge non-positive. That flip is only ARMED (an
+    actual reject) when the layer is OUT of shadow mode AND running on a paper
+    account — promotion is paper-first, never live-money. On a live account, or
+    in shadow mode, the flip is recorded ``would_reject`` but never acts.
+
+    Pure + fail-open: returns a dict, never raises, never sizes/flips/opens.
+    """
+    neg = bool(executable_ev is not None
+               and executable_ev <= 0
+               and (theoretical_ev or 0) > 0)
+    armed = bool((not shadow_mode) and is_paper)
+    return {"would_reject": neg, "veto_armed": armed, "veto": bool(neg and armed)}
+
+
+# --------------------------------------------------------------------------- #
 # Self-test (no network, no creds, no file writes)
 # --------------------------------------------------------------------------- #
 def _self_test() -> int:
@@ -359,6 +382,18 @@ def _self_test() -> int:
     # None-safe when a leg is missing.
     if capture_ratios(None, None, None)["execution_capture_ratio"] is not None:
         print("FAIL: None inputs should yield None ratio"); ok = False
+
+    # Promotion mechanics: a +theoretical/−executable flip only VETOES when out
+    # of shadow AND on a paper account; live or shadow -> record-only.
+    if should_veto_entry(3.0, -1.0, shadow_mode=False, is_paper=True) != \
+            {"would_reject": True, "veto_armed": True, "veto": True}:
+        print("FAIL: paper + shadow-off should veto"); ok = False
+    if should_veto_entry(3.0, -1.0, shadow_mode=True, is_paper=True)["veto"]:
+        print("FAIL: shadow-on must never veto"); ok = False
+    if should_veto_entry(3.0, -1.0, shadow_mode=False, is_paper=False)["veto"]:
+        print("FAIL: live account must never veto"); ok = False
+    if should_veto_entry(3.0, 5.0, shadow_mode=False, is_paper=True)["would_reject"]:
+        print("FAIL: positive executable must not flag would_reject"); ok = False
 
     print("execution.executable_ev self-test:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
