@@ -60,7 +60,7 @@ class TestHealthAndFailOpen(unittest.TestCase):
         "/api/calibration/ev", "/api/calibration/triple-gap",
         "/api/explain/SPY", "/api/positions",
         "/api/single-leg/kpis", "/api/single-leg/positions",
-        "/api/single-leg/episodes",
+        "/api/single-leg/episodes", "/api/put-time-stop",
     )
 
     def test_every_endpoint_200_with_verdict(self):
@@ -79,6 +79,62 @@ class TestHealthAndFailOpen(unittest.TestCase):
     def test_non_dict_provider_is_error(self):
         out = _safe_provider(lambda: ["not", "a", "dict"])
         self.assertEqual(out["verdict"], "ERROR")
+
+
+class TestPutTimeStop(unittest.TestCase):
+    """/api/put-time-stop joins boundaries to resolutions over the shadow ledger.
+
+    Offline: the observer's load_records/summarize are monkeypatched with canned
+    ledger data so no JSONL file / .env / disk read is needed.
+    """
+
+    def setUp(self):
+        from oracle import put_time_stop_observer as ptss
+        self.ptss = ptss
+        self._orig = (ptss.load_records, ptss.summarize)
+
+    def tearDown(self):
+        self.ptss.load_records, self.ptss.summarize = self._orig
+
+    def test_empty_ledger_is_insufficient(self):
+        self.ptss.load_records = lambda path=None: []
+        self.ptss.summarize = lambda path=None: {
+            "n_boundaries": 0, "n_resolved": 0, "mean_shadow_delta_pct": None,
+            "median_shadow_delta_pct": None, "count_helped": 0, "count_hurt": 0}
+        body = _app().test_client().get("/api/put-time-stop").get_json()
+        self.assertEqual(body.get("verdict"), "INSUFFICIENT_DATA")
+        self.assertEqual(body.get("boundaries"), [])
+
+    def test_boundary_join_surfaces_resolution(self):
+        recs = [
+            {"type": "boundary", "key": "k1", "symbol": "SOFI...P", "underlying":
+             "SOFI", "entry_time": "2026-08-07T15:39:33", "entry_price": 1.0,
+             "cap_days": 5, "hold_days_at_boundary": 5, "boundary_mark": 1.06,
+             "boundary_pnl_pct": 6.0},
+            {"type": "boundary", "key": "k2", "symbol": "QQQ...P", "underlying":
+             "QQQ", "entry_time": "2026-08-09T10:00:00", "entry_price": 2.0,
+             "cap_days": 5, "hold_days_at_boundary": 6, "boundary_mark": 1.6,
+             "boundary_pnl_pct": -20.0},
+            {"type": "resolution", "key": "k2", "boundary_pnl_pct": -20.0,
+             "actual_exit_pnl_pct": -35.0, "held_extra_days": 4,
+             "shadow_delta_pct": 15.0},
+        ]
+        self.ptss.load_records = lambda path=None: recs
+        self.ptss.summarize = lambda path=None: {
+            "n_boundaries": 2, "n_resolved": 1, "mean_shadow_delta_pct": 15.0,
+            "median_shadow_delta_pct": 15.0, "count_helped": 1, "count_hurt": 0}
+        body = _app().test_client().get("/api/put-time-stop").get_json()
+        self.assertEqual(body.get("verdict"), "OK")
+        self.assertEqual(body.get("n_boundaries"), 2)
+        self.assertEqual(body.get("count_helped"), 1)
+        self.assertEqual(body.get("cap_days"), 5)
+        by_key = {b["symbol"]: b for b in body["boundaries"]}
+        # newest entry_time first
+        self.assertEqual(body["boundaries"][0]["symbol"], "QQQ...P")
+        self.assertTrue(by_key["QQQ...P"]["resolved"])
+        self.assertEqual(by_key["QQQ...P"]["shadow_delta_pct"], 15.0)
+        self.assertFalse(by_key["SOFI...P"]["resolved"])
+        self.assertIsNone(by_key["SOFI...P"]["shadow_delta_pct"])
 
 
 class TestExplainSanitization(unittest.TestCase):

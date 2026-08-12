@@ -11,6 +11,7 @@ import { Hypotheses } from './components/hypotheses'
 import { KpiRow } from './components/kpi-row'
 import { OpenPositions } from './components/open-positions'
 import { ProbabilityCalibration } from './components/probability-calibration'
+import { PutTimeStop } from './components/put-time-stop'
 import { RegimeCard } from './components/regime-card'
 import { RegimePerformance } from './components/regime-performance'
 import { RlEpisodes } from './components/rl-episodes'
@@ -45,6 +46,10 @@ export function Dashboard() {
 
         <div className='mt-4'>
           <OpenPositions />
+        </div>
+
+        <div className='mt-4'>
+          <PutTimeStop />
         </div>
 
         <div className='mt-4'>

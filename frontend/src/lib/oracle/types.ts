@@ -183,3 +183,29 @@ export type Explain = ApiEnvelope & {
   explanation?: { summary_str?: string; top_reasons?: string[] } | string
   summary_str?: string
 }
+
+export type PutTimeStopBoundary = {
+  symbol?: string
+  underlying?: string
+  entry_time?: string
+  entry_price?: number | null
+  cap_days?: number | null
+  hold_days_at_boundary?: number | null
+  boundary_mark?: number | null
+  boundary_pnl_pct?: number | null
+  resolved?: boolean
+  actual_exit_pnl_pct?: number | null
+  shadow_delta_pct?: number | null
+  held_extra_days?: number | null
+}
+
+export type PutTimeStop = ApiEnvelope & {
+  cap_days?: number | null
+  n_boundaries?: number | null
+  n_resolved?: number | null
+  mean_shadow_delta_pct?: number | null
+  median_shadow_delta_pct?: number | null
+  count_helped?: number | null
+  count_hurt?: number | null
+  boundaries?: PutTimeStopBoundary[]
+}

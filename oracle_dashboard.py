@@ -359,6 +359,52 @@ def create_app(config: "DashboardConfig" = None) -> Flask:
             return slr.compute_single_leg_episodes()
         return _cached_json("single-leg-episodes", provider)
 
+    # -- 5-day put max-hold stop: shadow-observer forward-test ----------- #
+    # Read-only view over put_time_stop_shadow.jsonl (written live by the
+    # scheduler's flag-gated shadow observer). Summarizes the MEASURED day-N
+    # marks and, once trades close, the shadow_delta (would the cap have
+    # helped?). Pure/fail-open: a missing ledger yields INSUFFICIENT_DATA.
+    @app.route("/api/put-time-stop")
+    def put_time_stop():
+        def provider():
+            from oracle import put_time_stop_observer as ptss
+            recs = ptss.load_records()
+            summary = ptss.summarize()
+            # Index resolutions by key so each boundary can carry its outcome.
+            res_by_key = {
+                r.get("key"): r for r in recs
+                if isinstance(r, dict) and r.get("type") == ptss.RECORD_RESOLUTION
+            }
+            boundaries = []
+            for r in recs:
+                if not (isinstance(r, dict)
+                        and r.get("type") == ptss.RECORD_BOUNDARY):
+                    continue
+                res = res_by_key.get(r.get("key"))
+                boundaries.append({
+                    "symbol": r.get("symbol"),
+                    "underlying": r.get("underlying"),
+                    "entry_time": r.get("entry_time"),
+                    "entry_price": r.get("entry_price"),
+                    "cap_days": r.get("cap_days"),
+                    "hold_days_at_boundary": r.get("hold_days_at_boundary"),
+                    "boundary_mark": r.get("boundary_mark"),
+                    "boundary_pnl_pct": r.get("boundary_pnl_pct"),
+                    "resolved": res is not None,
+                    "actual_exit_pnl_pct": (res or {}).get("actual_exit_pnl_pct"),
+                    "shadow_delta_pct": (res or {}).get("shadow_delta_pct"),
+                    "held_extra_days": (res or {}).get("held_extra_days"),
+                })
+            # Newest first; cap the table so the payload stays small.
+            boundaries.sort(key=lambda b: str(b.get("entry_time") or ""),
+                            reverse=True)
+            verdict = "OK" if summary.get("n_boundaries") else VERDICT_INSUFFICIENT
+            cap = next((b.get("cap_days") for b in boundaries
+                        if b.get("cap_days")), ptss.DEFAULT_CAP_DAYS)
+            return {"verdict": verdict, "cap_days": cap,
+                    "boundaries": boundaries[:50], **summary}
+        return _cached_json("put-time-stop", provider)
+
     # -- evidence-EV leaderboard + consolidated daily report v2 ---------- #
     @app.route("/api/evidence-leaderboard")
     def evidence_leaderboard():
@@ -430,7 +476,7 @@ def _self_test() -> int:
         "/api/calibration/ev", "/api/calibration/triple-gap",
         "/api/explain/SPY", "/api/positions",
         "/api/single-leg/kpis", "/api/single-leg/positions",
-        "/api/single-leg/episodes",
+        "/api/single-leg/episodes", "/api/put-time-stop",
     )
     for path in endpoints:
         r = client.get(path)

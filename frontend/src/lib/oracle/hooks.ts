@@ -19,6 +19,7 @@ import {
   type Kpis,
   type Positions,
   type Probability,
+  type PutTimeStop,
   type Regime,
   type RegimePerformance,
   type Sentiment,
@@ -62,6 +63,8 @@ export const useRegimePerformance = () =>
   useOracleQuery<RegimePerformance>('regime-performance', 'regime-performance')
 export const useHypotheses = () =>
   useOracleQuery<Hypotheses>('hypotheses', 'hypotheses')
+export const usePutTimeStop = () =>
+  useOracleQuery<PutTimeStop>('put-time-stop', 'put-time-stop')
 
 // Explain-a-Ticker: lazy, enabled only when a validated ticker is provided.
 export function useExplain(ticker: string | null) {
