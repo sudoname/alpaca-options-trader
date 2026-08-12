@@ -30,6 +30,7 @@ from typing import Dict, List, Optional
 LOG_TAG = "[PUT_TIME_STOP_SHADOW]"
 
 JSONL_FILE_DEFAULT = "put_time_stop_shadow.jsonl"
+TRADE_HISTORY_FILE_DEFAULT = "trading_history.json"
 RECORD_BOUNDARY = "boundary"
 RECORD_RESOLUTION = "resolution"
 DEFAULT_CAP_DAYS = 5
@@ -154,6 +155,27 @@ def _keys_of_type(path: str, rec_type: str) -> set:
     return keys
 
 
+def _load_history_trades(history_path: Optional[str] = None) -> List[dict]:
+    """Read closed trades from trading_history.json. Fail-open -> [].
+
+    Mirrors single_leg_reports._load_history_trades: the file wraps the closed
+    trades under a ``"trades"`` key. ``pnl_percent`` is already in percent units
+    (e.g. 15.0 == +15%), matching the observer's ``boundary_pnl_pct``.
+    """
+    p = history_path or TRADE_HISTORY_FILE_DEFAULT
+    try:
+        if not os.path.exists(p):
+            return []
+        with open(p, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            trades = data.get("trades")
+            return trades if isinstance(trades, list) else []
+    except Exception:
+        pass
+    return []
+
+
 # --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
@@ -253,6 +275,45 @@ def resolve_boundaries(closed_lookup: Dict[str, dict], *,
         return []
 
 
+def resolve_from_history(history_path: Optional[str] = None,
+                         path: Optional[str] = None,
+                         now: Optional[datetime] = None) -> List[dict]:
+    """Auto-resolve boundaries against the bot's own closed-trade ledger.
+
+    Convenience wrapper so a caller (the live monitor, once per cycle) needs no
+    knowledge of the closed-trade schema: reads ``trading_history.json``, builds
+    the ``closed_lookup`` keyed by the SAME ``_stable_key`` used at boundary
+    time (``did:<id>`` else ``symbol|entry_time``), and hands it to
+    ``resolve_boundaries``. ``hold_days`` is the entry->exit date-only diff.
+
+    The lookup is restricted to keys that actually have an UNRESOLVED boundary,
+    so it stays tiny regardless of history size. Analytics-only, fail-open ->
+    []. NEVER raises, NEVER touches a trade.
+    """
+    p = _jsonl_path(path)
+    try:
+        want = _keys_of_type(p, RECORD_BOUNDARY) - _keys_of_type(p, RECORD_RESOLUTION)
+        if not want:
+            return []
+        closed_lookup: Dict[str, dict] = {}
+        for t in _load_history_trades(history_path):
+            if not isinstance(t, dict):
+                continue
+            key = _stable_key(t)
+            if key not in want or key in closed_lookup:
+                continue
+            actual = _to_float(t.get("pnl_percent"))
+            if actual is None:
+                continue
+            hold = _hold_days(t.get("entry_time"), _parse_ts(t.get("exit_time")))
+            closed_lookup[key] = {"actual_exit_pnl_pct": actual, "hold_days": hold}
+        if not closed_lookup:
+            return []
+        return resolve_boundaries(closed_lookup, path=p, now=now)
+    except Exception:
+        return []
+
+
 def summarize(path: Optional[str] = None) -> dict:
     """Aggregate the ledger. Pure; fail-open."""
     recs = load_records(path)
@@ -335,10 +396,30 @@ def _self_test() -> int:
             ok &= s["n_boundaries"] == 1 and s["n_resolved"] == 1
             ok &= s["count_helped"] == 1 and s["count_hurt"] == 0
 
-        # 5) junk never raises
+        # 5) resolve_from_history: read the bot's own closed ledger and join.
+        with tempfile.TemporaryDirectory() as d:
+            p2 = os.path.join(d, "shadow.jsonl")
+            hist = os.path.join(d, "trading_history.json")
+            observe_position(put6, -20.0, 1.6, cap_days=5, now=now, path=p2)
+            with open(hist, "w", encoding="utf-8") as fh:
+                json.dump({"trades": [{
+                    "symbol": put6["symbol"], "entry_time": put6["entry_time"],
+                    "exit_time": now.isoformat(), "pnl_percent": -35.0,
+                }]}, fh)
+            new = resolve_from_history(history_path=hist, path=p2, now=now)
+            ok &= len(new) == 1
+            ok &= abs(new[0]["shadow_delta_pct"] - 15.0) < 1e-9
+            ok &= new[0]["held_extra_days"] == 1  # entry 6d ago, exit today -> 6-5
+            # idempotent: a second pass resolves nothing more
+            ok &= resolve_from_history(history_path=hist, path=p2, now=now) == []
+
+        # 6) junk never raises
         ok &= observe_position(None, 0, 0) is None
         ok &= observe_position({}, None, None) is None
         ok &= resolve_boundaries(None) == []
+        ok &= resolve_from_history(history_path="nope.json",
+                                   path=os.path.join(tempfile.gettempdir(),
+                                                     "nope.jsonl")) == []
         ok &= isinstance(summarize(os.path.join(tempfile.gettempdir(), "nope.jsonl")), dict)
     except Exception as exc:  # any raise is a hard fail
         print(f"put_time_stop_observer self-test: FAIL ({exc!r})")

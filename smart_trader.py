@@ -3214,6 +3214,20 @@ class SmartOptionsTrader:
         json_store.merge_list(active_file, updates=survivors,
                               removals=closed_syms, key='symbol')
 
+        # 5-day put stop SHADOW: resolve any newly-closed boundaries once per
+        # cycle (flag-gated, fail-open). Runs after the close branches above have
+        # written this pass's exits to trading_history.json, so resolve_from_history
+        # can join each boundary to its realized close -> shadow_delta becomes
+        # MEASURED, not assumed. Analytics-only: appends resolution lines to the
+        # shadow ledger, never opens/closes/sizes/alters a trade. OFF -> skipped
+        # entirely, so the live path is byte-identical.
+        if self.enable_put_time_stop_shadow:
+            try:
+                from oracle import put_time_stop_observer as _ptss
+                _ptss.resolve_from_history()
+            except Exception:
+                pass
+
     def close_partial_position(self, trade: Dict, position: Dict, percentage: float):
         """Close partial position"""
         qty_to_close = math.floor(float(position['qty']) * percentage)
