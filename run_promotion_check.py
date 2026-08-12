@@ -20,9 +20,17 @@ CRITICAL SAFETY POSTURE — this runner is OFFLINE ADVISORY ONLY:
     run the analysis. Exit code is always 0 on a successful report — a HOLD is a
     normal, expected outcome, not an error.
 
+Upgrade H — promotion audit ledger: every check appends its verdict (per-layer
+promote/reasons/metrics + provenance) to an append-only JSONL history via
+``oracle.promotion_audit``, so the human promotion decision is tracked over time.
+The write is fail-open (a broken ledger never breaks the report) and can be
+skipped with ``--no-audit``. ``--daily-summary`` reads that history back and
+prints (optionally Telegrams) a per-layer digest instead of running a check.
+
 Usage:
     python run_promotion_check.py --lab-json oracle/lab/results/<id>__phase2_study.json
     python run_promotion_check.py --layer executable_ev --calibration-jsonl execution_calibration.jsonl
+    python run_promotion_check.py --daily-summary --telegram
     python run_promotion_check.py --self-test
 """
 
@@ -175,11 +183,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--env", default=".env", help="path to the .env for PROMO_* thresholds")
     p.add_argument("--telegram", action="store_true",
                    help="also send the report to Telegram (opt-in, best-effort)")
+    p.add_argument("--audit-jsonl", default=None,
+                   help="promotion-audit ledger path (default: PROMOTION_AUDIT_"
+                        "JSONL from .env, else promotion_audit.jsonl)")
+    p.add_argument("--no-audit", action="store_true",
+                   help="do not append this verdict to the promotion-audit ledger")
+    p.add_argument("--daily-summary", action="store_true",
+                   help="print a per-layer digest of the audit ledger and exit "
+                        "(does not run a fresh check)")
     p.add_argument("--self-test", action="store_true", help="run offline self-test and exit")
     args = p.parse_args(argv)
 
     if args.self_test:
         return _self_test()
+
+    # --daily-summary: read the audit history back instead of running a check.
+    if args.daily_summary:
+        return _run_daily_summary(args.audit_jsonl, args.telegram)
 
     thresholds = resolve_thresholds(args.env)
     calibration_stats = load_calibration_stats(args.calibration_jsonl)
@@ -197,11 +217,46 @@ def main(argv: Optional[List[str]] = None) -> int:
     _safe_print(rep["text"])
     _maybe_telegram(rep["text"], args.telegram)
 
+    # Upgrade H: append this verdict to the append-only audit ledger (fail-open).
+    if not args.no_audit:
+        _record_audit(rep["decisions"], thresholds,
+                      {"calibration_jsonl": args.calibration_jsonl,
+                       "lab_json": args.lab_json, "env": args.env},
+                      args.audit_jsonl)
+
     promoted = [ly for ly, d in rep["decisions"].items() if d.get("promote")]
     _safe_print(f"\nsummary: {len(promoted)}/{len(rep['decisions'])} layer(s) "
                 f"clear ALL gates: {promoted or 'none'}")
     # Advisory: a HOLD is a normal outcome, not a failure. Always exit 0 on a
     # report that was produced without an internal error.
+    return 0
+
+
+def _record_audit(decisions: Dict[str, dict], thresholds: Dict[str, float],
+                  sources: Dict[str, Any], audit_path: Optional[str]) -> None:
+    """Best-effort append of the verdict to the promotion-audit ledger."""
+    try:
+        from oracle.promotion_audit import record_promotion_check
+        rec = record_promotion_check(decisions, thresholds=thresholds,
+                                     sources=sources, path=audit_path)
+        if rec is not None:
+            print(f"[promotion_check] audit row recorded ({rec.get('id')})")
+    except Exception as exc:
+        print(f"[promotion_check] audit write skipped: {exc}")
+
+
+def _run_daily_summary(audit_path: Optional[str], telegram: bool) -> int:
+    """Read the audit ledger back and print/telegram a per-layer digest."""
+    try:
+        from oracle.promotion_audit import (
+            format_daily_summary, load_promotion_history)
+        rows = load_promotion_history(path=audit_path)
+        text = format_daily_summary(rows)
+    except Exception as exc:
+        print(f"[promotion_check] daily summary skipped: {exc}")
+        return 0
+    _safe_print(text)
+    _maybe_telegram(text, telegram)
     return 0
 
 
@@ -286,6 +341,32 @@ def _self_test() -> int:
         rep3 = build_report(cal, lab, th, layers=("executable_ev",))
         if rep3["decisions"]["executable_ev"]["promote"]:
             print("FAIL: tightened threshold still promoted"); ok = False
+
+    # --- Upgrade H wiring: a full run appends exactly one audit row that a
+    #     --daily-summary read-back reflects (tmp ledger only; no network). --- #
+    with tempfile.TemporaryDirectory() as d:
+        audit = os.path.join(d, "audit.jsonl")
+        rc = main(["--layer", "executable_ev", "--no-audit", "--audit-jsonl", audit])
+        if rc != 0 or os.path.exists(audit):
+            print("FAIL: --no-audit wrote a ledger row"); ok = False
+        # A recorded run (no evidence -> HOLD) must land exactly one row.
+        rc = main(["--layer", "executable_ev", "--audit-jsonl", audit])
+        try:
+            from oracle.promotion_audit import (
+                format_daily_summary, load_promotion_history)
+            rows = load_promotion_history(path=audit)
+            if rc != 0 or len(rows) != 1:
+                print("FAIL: expected exactly one audit row", len(rows)); ok = False
+            if rows and rows[0].get("layers", {}).get("executable_ev", {}).get("promote"):
+                print("FAIL: no-evidence run should HOLD in ledger"); ok = False
+            summ_txt = format_daily_summary(rows)
+            if "executable_ev" not in summ_txt or "HOLD" not in summ_txt:
+                print("FAIL: daily summary text", summ_txt); ok = False
+            # --daily-summary read-back path returns 0.
+            if main(["--daily-summary", "--audit-jsonl", audit]) != 0:
+                print("FAIL: --daily-summary exit"); ok = False
+        except Exception as exc:  # pragma: no cover
+            print("FAIL: audit wiring raised", exc); ok = False
 
     print("run_promotion_check self-test:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
