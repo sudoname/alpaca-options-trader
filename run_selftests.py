@@ -59,6 +59,9 @@ _MODULES = [
     "oracle.engine.strategy",
     "oracle.engine.sim_broker",
     "oracle.engine.backtest_driver",
+    # Phase-2 Upgrade B — run the Lab for out-of-sample evidence.
+    "oracle.lab.reports",
+    "oracle.lab.run_phase2_study",
 ]
 
 # Live entry points to byte-compile (flag-gated wiring must still parse).
