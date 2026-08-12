@@ -33,8 +33,8 @@ these same fields.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Mapping, Optional, Tuple
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from oracle.execution.client import (
     STATUS_FILLED,
@@ -85,6 +85,12 @@ class FillModelConfig:
     delay_passive: float = 30.0
     # a spread wider than this fraction of mid is treated as a "wide" market
     wide_spread_frac: float = 0.15
+    # provenance (additive, behaviourally inert): stamped by the calibrator so a
+    # caller / report can tell a learned config from the conservative default.
+    # ``estimate_fill`` never reads these, so a calibrated config with the same
+    # numeric constants produces byte-identical estimates to the default.
+    calibrated: bool = False
+    n_samples: int = 0
 
     def get(self, name: str, default: Any = None) -> Any:  # convenience
         return getattr(self, name, default)
@@ -275,6 +281,89 @@ class FillModel:
         return _fn
 
 
+# --------------------------------------------------------------------------- #
+# Calibration — learn conservative constants from realized fills (Upgrade 2 / D)
+# --------------------------------------------------------------------------- #
+# Below this many resolved+filled trades the ledger is too thin to trust, so we
+# keep the conservative defaults and stay byte-identical to today (fail-open).
+MIN_CALIBRATION_SAMPLES = 20
+
+
+def calibrated_params_from(records: Optional[List[dict]] = None, *,
+                           base: Optional[FillModelConfig] = None,
+                           min_samples: int = MIN_CALIBRATION_SAMPLES
+                           ) -> FillModelConfig:
+    """Return a ``FillModelConfig`` tuned from the execution-calibration ledger.
+
+    Reads the folded calibration records (``oracle.execution.calibration``) and
+    nudges the conservative defaults toward what really happened:
+
+      * ``base_slippage`` is raised by the mean *signed* slippage error
+        (actual entry - expected entry) so the model stops under-charging the
+        entry. Only ever RAISED — calibration never flatters a fill.
+      * the fill-probability base rates are scaled DOWN toward the realized
+        fill rate when the model was over-optimistic (``fill_rate_bias`` > 0).
+        Only ever LOWERED.
+      * ``illiquidity_penalty_frac`` is raised when executable_EV over-stated
+        realized_EV (``model_capture_ratio`` < 1), capped so it stays sane.
+
+    Contract (the Upgrade-D invariants the tests pin):
+      * Fail-open + conservative: junk / ``None`` / fewer than ``min_samples``
+        filled trades -> the ``base`` config UNCHANGED, so the model is
+        byte-identical to today. Any error is swallowed the same way.
+      * Deterministic: identical ``records`` -> identical config.
+      * Monotone-pessimistic: every adjustment can only make a fill WORSE.
+
+    ``records`` may be passed directly (already folded) or omitted to load the
+    live ledger. ``base`` defaults to the conservative :class:`FillModelConfig`.
+    """
+    cfg = base or FillModelConfig()
+    try:
+        from oracle.execution import calibration as _calib
+        recs = records if records is not None else _calib.load_records()
+        if not isinstance(recs, list) or not recs:
+            return cfg
+        stats = _calib.compute_calibration(recs)
+        n = int(stats.get("n_filled") or 0)
+        if n < int(min_samples):
+            return cfg  # too thin to trust -> conservative defaults, unchanged
+
+        # ---- slippage: raise base by the mean signed error (increase only) ---
+        base_slip = cfg.base_slippage
+        slip_err = stats.get("mean_slippage_error")
+        if isinstance(slip_err, (int, float)) and slip_err > 0:
+            base_slip = round(cfg.base_slippage + float(slip_err), 6)
+
+        # ---- fill probability: scale toward the realized fill rate (down only)
+        p_scale = 1.0
+        pred = stats.get("predicted_fill_rate")
+        act = stats.get("actual_fill_rate")
+        if (isinstance(pred, (int, float)) and pred > 0
+                and isinstance(act, (int, float))):
+            p_scale = _clamp(float(act) / float(pred), 0.0, 1.0)
+
+        # ---- liquidity penalty: raise when the model over-stated realized EV -
+        illiq = cfg.illiquidity_penalty_frac
+        cap = stats.get("model_capture_ratio")
+        if isinstance(cap, (int, float)) and cap < 1.0:
+            shortfall = _clamp(1.0 - float(cap), 0.0, 1.0)
+            illiq = round(_clamp(cfg.illiquidity_penalty_frac * (1.0 + shortfall),
+                                 cfg.illiquidity_penalty_frac, 1.0), 6)
+
+        return replace(
+            cfg,
+            base_slippage=base_slip,
+            illiquidity_penalty_frac=illiq,
+            p_market=round(cfg.p_market * p_scale, 6),
+            p_marketable_limit=round(cfg.p_marketable_limit * p_scale, 6),
+            p_passive_limit=round(cfg.p_passive_limit * p_scale, 6),
+            calibrated=True,
+            n_samples=n,
+        )
+    except Exception:  # fail-open: any hiccup -> conservative defaults unchanged
+        return base or FillModelConfig()
+
+
 def _pending(order: OrderRequest, side: str, qty: int, mid, touch, spread,
              slippage, liq_penalty, cfg: FillModelConfig,
              *, reason: str) -> FillEstimate:
@@ -380,6 +469,38 @@ def _self_test() -> int:
     if not r.is_filled or r.filled_avg_price is None or \
             r.filled_avg_price < tight.mid:
         print("FAIL: sim hook fill", r); ok = False
+
+    # ---- calibration (Upgrade D): fail-open + conservative + captures reality
+    default_cfg = FillModelConfig()
+    # Insufficient / junk -> conservative default UNCHANGED (byte-identical).
+    for junk in (None, [], [{"bad": 1}], "x", 42):
+        if calibrated_params_from(junk, base=default_cfg) != default_cfg:
+            print("FAIL: thin/junk calibration should be default", junk); ok = False
+
+    # A reference buy at the tight market and the price the DEFAULT model paid.
+    order = OrderRequest("OPT", "buy", 1, order_type="market")
+    ref = fm.estimate_fill(order, tight).expected_fill_price   # 1.032
+    delta = 0.05                                                # under-charged 5c
+    recs = [{
+        "trade_id": f"c{i}", "resolution_status": "resolved", "filled": True,
+        "fill_probability": 1.0, "expected_entry_price": ref,
+        "actual_entry_price": round(ref + delta, 6),
+        "theoretical_EV": 15.0, "executable_EV": 11.0, "realized_EV": 11.0,
+    } for i in range(MIN_CALIBRATION_SAMPLES)]
+
+    cal = calibrated_params_from(recs, base=default_cfg)
+    if not cal.calibrated or cal.n_samples != MIN_CALIBRATION_SAMPLES:
+        print("FAIL: calibrated flag/n_samples", cal); ok = False
+    # Slippage only ever RISES.
+    if cal.base_slippage < default_cfg.base_slippage:
+        print("FAIL: calibration lowered slippage", cal); ok = False
+    # After calibration the model PREDICTS the realized entry (capture -> 1.0).
+    got = FillModel(cal).estimate_fill(order, tight).expected_fill_price
+    if got is None or abs(got - (ref + delta)) > 1e-6:
+        print("FAIL: calibrated model should predict realized entry", got); ok = False
+    # Determinism.
+    if calibrated_params_from(recs, base=default_cfg) != cal:
+        print("FAIL: non-deterministic calibration"); ok = False
 
     print("execution.fill_model self-test:", "PASS" if ok else "FAIL")
     return 0 if ok else 1

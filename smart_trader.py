@@ -2443,9 +2443,19 @@ class SmartOptionsTrader:
                 _theo = (_xstamp or {}).get('expected_value')
                 _xquote = Quote(option['symbol'], bid=bid_price,
                                 ask=current_option_price['ask'])
+                # ENABLE_FILL_MODEL OFF -> the conservative default fill model
+                # (byte-identical to before). ON -> a fill model calibrated from
+                # realized fills; calibration is fail-open + conservative, so a
+                # thin ledger degrades to the same default constants.
+                if getattr(self, 'enable_fill_model', False):
+                    from oracle.execution.fill_model import (
+                        calibrated_params_from)
+                    _fm = FillModel(calibrated_params_from())
+                else:
+                    _fm = FillModel()
                 xev = compute_executable_ev(
                     option, fair_value=None, quote=_xquote,
-                    fill_model=FillModel(), cost_model=CostModel(),
+                    fill_model=_fm, cost_model=CostModel(),
                     qty=order_quantity, theoretical_ev=_theo)
                 _xev_dict = xev.to_dict()
                 # Promotion mechanics live in one pure, tested helper: a veto is
