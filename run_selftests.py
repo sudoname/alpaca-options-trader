@@ -62,6 +62,8 @@ _MODULES = [
     # Phase-2 Upgrade B — run the Lab for out-of-sample evidence.
     "oracle.lab.reports",
     "oracle.lab.run_phase2_study",
+    # Realized-episode study — point the Lab metric engine at episodes.db.
+    "oracle.lab.episodes_study",
     # Phase-2 Upgrade G — automated promotion gates (offline advisory).
     "oracle.promotion",
     "run_promotion_check",
