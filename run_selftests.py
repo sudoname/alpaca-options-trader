@@ -52,6 +52,13 @@ _MODULES = [
     # Upgrade 5 — adversarial thesis + semantic trade memory.
     "oracle.thesis_debate",
     "oracle.trade_memory",
+    # Phase-2 Upgrade A — unified event-driven simulation engine.
+    "oracle.engine.events",
+    "oracle.engine.clock",
+    "oracle.engine.bus",
+    "oracle.engine.strategy",
+    "oracle.engine.sim_broker",
+    "oracle.engine.backtest_driver",
 ]
 
 # Live entry points to byte-compile (flag-gated wiring must still parse).
