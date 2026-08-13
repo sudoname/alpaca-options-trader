@@ -180,6 +180,22 @@ class TelegramTradingBot:
         return chunks or [""]
 
     @staticmethod
+    def _to_legacy_markdown(text):
+        """Collapse CommonMark ``**bold**`` to Telegram legacy ``*bold*``.
+
+        Telegram ``parse_mode="Markdown"`` (legacy) only understands a SINGLE
+        ``*`` for bold; a doubled marker like ``**Stock Data:**`` makes it 400
+        with "can't parse entities". The rich analysis/report templates were
+        written with CommonMark ``**``, so a run of 2+ ``*`` is normalised to
+        one before the text is balance-checked and sent. Without this the
+        message still went out, but only via the plain-text retry — so users
+        saw raw ``**`` markup instead of bold. Pure; never raises."""
+        if not text or "**" not in text:
+            return text
+        import re
+        return re.sub(r"\*{2,}", "*", text)
+
+    @staticmethod
     def _markdown_balanced(text):
         """Conservative check that legacy-Markdown entities are well-formed.
 
@@ -212,6 +228,7 @@ class TelegramTradingBot:
         common case never triggers a 400. Should a balanced chunk still be
         rejected (e.g. a malformed link), retry once without parse_mode so the
         user always sees *something*."""
+        text = self._to_legacy_markdown(text)
         url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
         data = {"chat_id": chat_id, "text": text}
         if self._markdown_balanced(text):
