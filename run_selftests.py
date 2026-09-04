@@ -66,6 +66,9 @@ _MODULES = [
     "oracle.lab.episodes_study",
     # 5-day put max-hold stop — live shadow observer (forward-test).
     "oracle.put_time_stop_observer",
+    # Entry-remediation shadow observers — friction gate + PoP recalibration.
+    "oracle.friction_gate_observer",
+    "oracle.pop_recal_observer",
     # Phase-2 Upgrade G — automated promotion gates (offline advisory).
     "oracle.promotion",
     "run_promotion_check",

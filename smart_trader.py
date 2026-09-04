@@ -421,6 +421,23 @@ class SmartOptionsTrader:
         self.enable_put_time_stop_shadow = _flag('ENABLE_PUT_TIME_STOP_SHADOW')
         self.put_time_stop_days = _i2('PUT_TIME_STOP_DAYS', 5)
 
+        # --- Entry-remediation SHADOW observers ---------------------------- #
+        # Two record-only observers targeting the two entry-side leaks the daily
+        # report exposed. Both are pure: when ON they append a JSONL line per
+        # decision; they NEVER block, size or alter a trade. OFF -> the entry
+        # path is byte-identical.
+        #   friction gate — compares a candidate's expected edge to the MEASURED
+        #     per-name round-trip friction floor (spread + 2x slippage from
+        #     closed episodes) and records would_block / would_pass.
+        #   PoP recal     — maps the raw stamped PoP through pop_calibration's
+        #     measured bucket curve and records the corrected_pop the scorer
+        #     WOULD have used (the model runs ~26pp overconfident).
+        self.enable_friction_gate_shadow = _flag('ENABLE_FRICTION_GATE_SHADOW')
+        self.enable_pop_recal_shadow = _flag('ENABLE_POP_RECAL_SHADOW')
+        # Lazily-built, cached-per-cycle measured inputs (None until first use).
+        self._friction_name_lookup = None
+        self._pop_correction_map = None
+
         # Set by determine_option_strategy when it returns 'skip'; surfaced by
         # the scheduler and Telegram so the operator sees *why* nothing traded.
         self.last_skip_reason = None
@@ -584,6 +601,8 @@ class SmartOptionsTrader:
                 'USE_ORACLE_TRADE_GATE': self.use_oracle_trade_gate,
                 'ORACLE_GATE_DRYRUN': self.oracle_gate_dryrun,
                 'ENABLE_PUT_TIME_STOP_SHADOW': self.enable_put_time_stop_shadow,
+                'ENABLE_FRICTION_GATE_SHADOW': self.enable_friction_gate_shadow,
+                'ENABLE_POP_RECAL_SHADOW': self.enable_pop_recal_shadow,
             }
             print("[ORACLE] mode flags: " + " ".join(
                 f"{k}={'on' if v else 'off'}" for k, v in _mode_flags.items())
@@ -2718,6 +2737,59 @@ class SmartOptionsTrader:
                         return None
             except Exception as e:
                 print(f"[EXEC EV] error (ignored): {e}")
+
+        # ---- Entry-remediation SHADOW observers (opt-in; record-only) ---------
+        # Two pure observers for the entry-side leaks the daily report exposed.
+        # Both are analytics-only: they append a JSONL line and NEVER block, size
+        # or alter this trade (no return, no mutation of ``option``). Flags OFF ->
+        # this whole block is skipped and the entry path is byte-identical.
+        if self.enable_friction_gate_shadow or self.enable_pop_recal_shadow:
+            _sc = None
+            _sstamp = {}
+            _live_spread_pct = None
+            try:
+                _b = bid_price
+                _a = current_option_price.get('ask')
+                _mid = ((_b + _a) / 2.0) if (_b is not None and _a is not None) else None
+                _live_spread_pct = (((_a - _b) / _mid) * 100.0
+                                    if (_mid and _mid > 0) else None)
+                _sc = {'symbol': option.get('symbol'),
+                       'underlying_symbol': underlying_symbol}
+                try:
+                    from entry_ev_stamp import compute_entry_stamp
+                    _sstamp = compute_entry_stamp(
+                        option, dynamic_levels, entry_price, order_quantity,
+                        bid=bid_price, ask=_a) or {}
+                except Exception:
+                    _sstamp = {}
+            except Exception:
+                _sc = None
+
+            if self.enable_friction_gate_shadow and _sc:
+                try:
+                    from oracle import friction_gate_observer as _fgo
+                    if self._friction_name_lookup is None:
+                        self._friction_name_lookup = _fgo.load_name_friction()
+                    _ev = _sstamp.get('expected_value')
+                    _prem = (entry_price * 100.0 * order_quantity
+                             if (entry_price and order_quantity) else None)
+                    _edge_pct = (((_ev / _prem) * 100.0)
+                                 if (_ev is not None and _prem) else None)
+                    _fgo.observe_entry(_sc, _live_spread_pct, _edge_pct,
+                                       self._friction_name_lookup)
+                except Exception as e:
+                    print(f"[FRICTION SHADOW] error (ignored): {e}")
+
+            if self.enable_pop_recal_shadow and _sc:
+                try:
+                    from oracle import pop_recal_observer as _pro
+                    if self._pop_correction_map is None:
+                        self._pop_correction_map = _pro.load_correction_map()
+                    _pro.observe_scoring(
+                        _sc, _sstamp.get('probability_of_profit'),
+                        self._pop_correction_map)
+                except Exception as e:
+                    print(f"[POP RECAL SHADOW] error (ignored): {e}")
 
         # ---- Phase 4: portfolio-level greek gate (opt-in, fail-open) ----------
         # Runs AFTER sizing so the projection uses the final contract count, and
