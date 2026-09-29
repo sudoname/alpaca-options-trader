@@ -257,6 +257,23 @@ class SmartOptionsTrader:
             'min_directional_agreement': _f2('PROFITABILITY_MIN_DIRECTIONAL_AGREEMENT', 0.55),
             'require_oracle_agreement': True,
         }
+        # PoP recalibration into the gate (default OFF -> stamped PoP used
+        # verbatim, legacy behavior). The realized ledger shows the model
+        # overstates PoP by ~28pp. When USE_POP_RECAL_IN_GATE is on we correct
+        # the stamped PoP DOWN before the min_pop bar, preferring a measured
+        # bucket curve from pop_recal_shadow.jsonl and falling back to a flat
+        # offset. Fail-open: any error leaves the gate at legacy behavior.
+        self.use_pop_recal_in_gate = _flag('USE_POP_RECAL_IN_GATE')
+        if self.use_pop_recal_in_gate:
+            cal = self._load_pop_calibration(
+                path=env_vars.get('POP_RECAL_SHADOW_JSONL',
+                                  'pop_recal_shadow.jsonl'),
+                min_bucket_trades=_i2('POP_RECAL_MIN_BUCKET_TRADES', 20),
+                fallback_offset_pp=_f2('POP_CALIBRATION_OFFSET_PP', 28.0),
+            )
+            if cal:
+                self.profitability_gate_rules['pop_calibration'] = cal
+                print(f"[POP RECAL] gate calibration active: {cal}")
 
         # --- Phase 3: direction quality + sizing safety -------------------- #
         # All OFF by default so default behavior is byte-for-byte unchanged.
@@ -1385,6 +1402,54 @@ class SmartOptionsTrader:
             return "trending"
         else:
             return "ranging"
+
+    @staticmethod
+    def _load_pop_calibration(path: str, min_bucket_trades: int = 20,
+                              fallback_offset_pp: float = 28.0):
+        """Build a PoP calibration curve for the profitability gate.
+
+        Prefers a measured floor-bucket curve (raw-PoP 0.1 bucket -> mean
+        corrected_pop) read from the PoP-recal shadow ledger, keeping only
+        buckets with at least ``min_bucket_trades`` samples. Falls back to a flat
+        ``{"offset_pp": fallback_offset_pp}`` when the ledger is missing, empty,
+        or unparseable. Never raises -> the gate degrades to a safe offset or
+        (if that too is invalid) legacy behavior.
+        """
+        try:
+            import json as _json
+            import os as _os
+            from collections import defaultdict as _dd
+            buckets = _dd(list)
+            if path and _os.path.exists(path):
+                with open(path) as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = _json.loads(line)
+                        except Exception:
+                            continue
+                        raw = rec.get('raw_pop')
+                        corr = rec.get('corrected_pop')
+                        if raw is None or corr is None:
+                            continue
+                        b = int(float(raw) * 10) / 10.0
+                        buckets[f"{b:.1f}"].append(float(corr))
+            curve = {k: sum(v) / len(v)
+                     for k, v in buckets.items()
+                     if len(v) >= max(1, int(min_bucket_trades))}
+            if curve:
+                return curve
+        except Exception as exc:  # pragma: no cover - defensive
+            print(f"[POP RECAL] curve load failed ({exc}); using flat offset")
+        try:
+            off = float(fallback_offset_pp)
+            if off > 0:
+                return {"offset_pp": off}
+        except (TypeError, ValueError):
+            pass
+        return None
 
     def calculate_dynamic_levels(self, ticker: str = None, current_price: float = None) -> Dict:
         """Calculate dynamic stop loss and take profit levels"""
