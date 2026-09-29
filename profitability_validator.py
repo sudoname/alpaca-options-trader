@@ -19,7 +19,45 @@ DEFAULT_RULES = {
     "max_p_no_trade": 0.25,
     "min_directional_agreement": 0.55,
     "require_oracle_agreement": True,
+    # PoP calibration (default OFF -> stamped PoP used verbatim, legacy behavior).
+    # The realized ledger shows the model overstates PoP by ~28pp (stamped 66.5%
+    # -> actual 38.1%). When enabled, the stamped PoP is corrected DOWN before the
+    # min_pop bar so the gate compares against a measured win-rate estimate.
+    # Accepted forms:
+    #   None                         -> no correction
+    #   {"offset_pp": 28}            -> corrected = pop - 0.28
+    #   {"0.6": 0.35, "0.7": 0.42}   -> piecewise floor-bucket lookup (keys=raw 0.1 buckets)
+    #   callable(pop) -> corrected   -> arbitrary curve
+    "pop_calibration": None,
 }
+
+
+def _apply_pop_calibration(pop: Optional[float], cal: Any) -> Optional[float]:
+    """Map a stamped PoP through an optional calibration curve.
+
+    Pure and fail-open: any missing/invalid calibration returns ``pop`` unchanged
+    so the gate degrades to legacy behavior rather than blocking on a bad config.
+    """
+    if pop is None or cal is None:
+        return pop
+    try:
+        if callable(cal):
+            out = _num(cal(pop), pop)
+        elif isinstance(cal, dict) and "offset_pp" in cal:
+            off = _num(cal.get("offset_pp"), 0.0) or 0.0
+            out = pop - (off / 100.0)
+        elif isinstance(cal, dict):
+            # Floor-bucket lookup on 0.1-wide raw-PoP buckets.
+            bucket = int(float(pop) * 10) / 10.0
+            hit = cal.get(f"{bucket:.1f}", cal.get(bucket))
+            out = _num(hit, pop)
+        else:
+            out = pop
+    except Exception:
+        return pop
+    if out is None:
+        return pop
+    return max(0.0, min(1.0, out))
 
 
 def _num(value: Any, default: Optional[float] = None) -> Optional[float]:
@@ -119,9 +157,16 @@ def validate_trade(candidate: Dict[str, Any], rules: Optional[Dict[str, Any]] = 
             f"signal_strength {signal_strength} < {cfg['min_signal_strength']}"
         )
 
-    pop = _num(entry_stamp.get("probability_of_profit"), None)
+    pop_raw = _num(entry_stamp.get("probability_of_profit"), None)
+    pop = _apply_pop_calibration(pop_raw, cfg.get("pop_calibration"))
     if pop is not None and pop < cfg["min_pop"]:
-        reasons.append(f"probability_of_profit {pop:.3f} < {cfg['min_pop']:.3f}")
+        if pop_raw is not None and pop != pop_raw:
+            reasons.append(
+                f"probability_of_profit {pop:.3f} (calibrated from {pop_raw:.3f}) "
+                f"< {cfg['min_pop']:.3f}"
+            )
+        else:
+            reasons.append(f"probability_of_profit {pop:.3f} < {cfg['min_pop']:.3f}")
 
     ev = _num(entry_stamp.get("expected_value"), None)
     if cfg.get("require_positive_ev") and ev is not None and ev <= 0:
@@ -160,6 +205,7 @@ def validate_trade(candidate: Dict[str, Any], rules: Optional[Dict[str, Any]] = 
     summary = {
         "signal_strength": signal_strength,
         "probability_of_profit": pop,
+        "probability_of_profit_raw": pop_raw,
         "expected_value": ev,
         "ev_per_dollar_risk": ev_per_dollar_risk,
         "p_no_trade": p_no_trade,
@@ -223,4 +269,30 @@ if __name__ == "__main__":
     print("BAD:", bad)
     assert ok["pass"] is True
     assert bad["pass"] is False
+
+    # PoP calibration: default OFF must not change the legacy verdict.
+    assert validate_trade(sample_ok)["summary"]["probability_of_profit"] == 0.68
+
+    # With the measured ~28pp offset, sample_ok's stamped 0.68 -> 0.40 which now
+    # fails the 0.58 bar. This is the whole point: the model overstates edge.
+    cal_off = validate_trade(sample_ok, {"pop_calibration": {"offset_pp": 28}})
+    assert abs(cal_off["summary"]["probability_of_profit"] - 0.40) < 1e-9
+    assert cal_off["summary"]["probability_of_profit_raw"] == 0.68
+    assert cal_off["pass"] is False
+    assert any("calibrated from 0.680" in r for r in cal_off["reasons"])
+
+    # Bucket-curve form (floor buckets) and callable form both supported.
+    cal_curve = validate_trade(
+        sample_ok, {"pop_calibration": {"0.6": 0.35, "0.7": 0.42}})
+    assert abs(cal_curve["summary"]["probability_of_profit"] - 0.35) < 1e-9
+    cal_call = validate_trade(
+        sample_ok, {"pop_calibration": lambda p: p - 0.30})
+    assert abs(cal_call["summary"]["probability_of_profit"] - 0.38) < 1e-9
+
+    # Fail-open: a broken calibration leaves the stamped PoP untouched.
+    def _boom(_):
+        raise RuntimeError("bad curve")
+    cal_bad = validate_trade(sample_ok, {"pop_calibration": _boom})
+    assert cal_bad["summary"]["probability_of_profit"] == 0.68
+
     print("profitability validator self-test: PASS")
