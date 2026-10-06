@@ -64,13 +64,27 @@ def _candlestick_summary() -> dict:
         return {}
 
 
+def _session_summary() -> dict:
+    """Fail-open overnight/intraday session summary (analytics only).
+
+    Gated by ENABLE_SESSION_REPORT (default OFF -> ``{}``), so the report is
+    byte-identical to prior behavior unless explicitly enabled. Never alters
+    any decision; it only reads research artifacts from disk."""
+    try:
+        import session_report as sr
+        return sr.compute_session_summary() or {}
+    except Exception:
+        return {}
+
+
 def build_daily_report(config: Optional[AnalyticsConfig] = None,
                        now: Optional[datetime] = None,
                        trades: Optional[List[dict]] = None,
                        positions: Optional[List[dict]] = None,
                        em_rows: Optional[List[dict]] = None,
                        dataset_rows: Optional[List[dict]] = None,
-                       candlestick: Optional[dict] = None) -> dict:
+                       candlestick: Optional[dict] = None,
+                       session: Optional[dict] = None) -> dict:
     """Assemble the daily report dict from the analytics + threshold layers.
 
     Pure read-only aggregation; never raises on missing/empty data. The
@@ -119,6 +133,9 @@ def build_daily_report(config: Optional[AnalyticsConfig] = None,
         "n_trades": recs["n_trades"],
         "candlestick": (candlestick if candlestick is not None
                         else _candlestick_summary()),
+        # {} unless ENABLE_SESSION_REPORT is set (default OFF) — see
+        # session_report.py; analytics only, never decision-changing.
+        "session": (session if session is not None else _session_summary()),
     }
 
 
@@ -246,6 +263,18 @@ def format_daily_report(report: dict) -> str:
         lines.append(f"  Did patterns help? `{verdict}` "
                      f"({cs.get('sample_size', 0)} resolved)")
         lines.append("")
+
+    # 9) Session analysis (flag-gated, default OFF -> absent; analytics only).
+    sess = report.get("session") or {}
+    if sess:
+        try:
+            import session_report as sr
+            section = sr.format_session_section(sess)
+        except Exception:
+            section = ""
+        if section:
+            lines.append(section)
+            lines.append("")
 
     lines.append(f"_({ANALYTICS_FOOTER})_")
     return "\n".join(lines)

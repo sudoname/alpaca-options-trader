@@ -1,0 +1,93 @@
+{
+  "meta": {
+    "db": "episodes_server.db",
+    "mode": "live-paper",
+    "decisions": 2775,
+    "underlyings": 80,
+    "date_range": [
+      "2026-06-10",
+      "2026-10-12"
+    ],
+    "cost_bps_per_side": 1.0,
+    "note": "intraday/overnight legs are UNDERLYING proxies with stated executable-entry assumptions; realized_options is real episode P&L (options, net)",
+    "generated_at": "2026-10-06T11:49:46.260807+00:00"
+  },
+  "realized_options_by_hold": {
+    "same_day (hold_days=0)": {
+      "n": 2766,
+      "mean_net_pnl_pct": -14.99097205699178,
+      "se_mean": 0.6938139741691005,
+      "win_rate": 0.3749096167751265
+    },
+    "held_overnight (hold_days>=1)": {
+      "n": 0
+    }
+  },
+  "underlying_proxy": {
+    "remaining_intraday_net": {
+      "n": 2775,
+      "mean": -0.0006839780441934201,
+      "std": 0.012220441901947604,
+      "se_mean": 0.0002319826028572489,
+      "pos_freq": 0.48036036036036034
+    },
+    "next_overnight_net": {
+      "n": 2765,
+      "mean": -0.0009361277507302595,
+      "std": 0.0139062644413681,
+      "se_mean": 0.0002644617794837064,
+      "pos_freq": 0.46835443037974683
+    },
+    "remaining_intraday_gross": {
+      "n": 2775,
+      "mean": -0.00048397804419342456,
+      "std": 0.012220441901947604,
+      "se_mean": 0.0002319826028572489,
+      "pos_freq": 0.489009009009009
+    },
+    "next_overnight_gross": {
+      "n": 2765,
+      "mean": -0.0007361277507302588,
+      "std": 0.0139062644413681,
+      "se_mean": 0.0002644617794837064,
+      "pos_freq": 0.4759493670886076
+    }
+  },
+  "by_direction": {
+    "long (CALL)": {
+      "intraday_net": {
+        "n": 1570,
+        "mean": -0.0012549615401805324,
+        "std": 0.012278556079996547,
+        "se_mean": 0.00030988280033334087,
+        "pos_freq": 0.46305732484076434
+      },
+      "overnight_net": {
+        "n": 1565,
+        "mean": 0.00016033440870549847,
+        "std": 0.01410249136202902,
+        "se_mean": 0.00035648287477842405,
+        "pos_freq": 0.5156549520766773
+      }
+    },
+    "short (PUT)": {
+      "intraday_net": {
+        "n": 1205,
+        "mean": 5.995895887691781e-05,
+        "std": 0.012109040064015893,
+        "se_mean": 0.00034883189934639236,
+        "pos_freq": 0.5029045643153527
+      },
+      "overnight_net": {
+        "n": 1200,
+        "mean": -0.0023660971503277196,
+        "std": 0.013518896317562116,
+        "se_mean": 0.0003902569214045564,
+        "pos_freq": 0.4066666666666667
+      }
+    }
+  },
+  "flag_counts": {
+    "overnight_bars_missing": 10
+  }
+}
