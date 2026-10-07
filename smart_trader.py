@@ -275,6 +275,27 @@ class SmartOptionsTrader:
                 self.profitability_gate_rules['pop_calibration'] = cal
                 print(f"[POP RECAL] gate calibration active: {cal}")
 
+        # Session-bias rule into the gate (default OFF -> legacy behavior).
+        # Measured from live decisions (session_signal_eval.py artifact): the
+        # underlying's rest-of-session drift after a signal fires. Live data
+        # shows CALL signals bleed -12.6bp rest-of-day (t=-4.1) while PUT
+        # signals are flat. When USE_SESSION_BIAS_IN_GATE is on, a side with
+        # significantly negative drift gets its ev_per_dollar_risk bar RAISED
+        # by the implied premium drag (|bp|/1e4 * SESSION_BIAS_LEVERAGE).
+        # Veto-only and fail-open: a missing/malformed artifact leaves the
+        # gate at legacy behavior.
+        self.use_session_bias_in_gate = _flag('USE_SESSION_BIAS_IN_GATE')
+        if self.use_session_bias_in_gate:
+            sb = self._load_session_bias(
+                path=env_vars.get('SESSION_EVAL_JSON',
+                                  'session_signal_eval_live.json'),
+                leverage=_f2('SESSION_BIAS_LEVERAGE', 20.0),
+                min_abs_t=_f2('SESSION_BIAS_MIN_T', 2.0),
+            )
+            if sb:
+                self.profitability_gate_rules['session_bias'] = sb
+                print(f"[SESSION BIAS] gate rule active: {sb}")
+
         # --- Phase 3: direction quality + sizing safety -------------------- #
         # All OFF by default so default behavior is byte-for-byte unchanged.
         #  * USE_SKIP_ON_WEAK_SIGNAL: when on, determine_option_strategy may
@@ -1450,6 +1471,35 @@ class SmartOptionsTrader:
         except (TypeError, ValueError):
             pass
         return None
+
+    @staticmethod
+    def _load_session_bias(path: str, leverage: float = 20.0,
+                           min_abs_t: float = 2.0):
+        """Build the session_bias gate rule from a measured eval artifact.
+
+        Reads ``session_signal_eval_live.json`` (session_signal_eval.py
+        output) and extracts, per side, the net rest-of-session underlying
+        drift mean (in bp) and its t-stat (mean / se_mean). Returns the rule
+        dict consumed by profitability_validator.DEFAULT_RULES['session_bias']
+        or None on any problem (fail-open -> legacy gate behavior).
+        """
+        try:
+            import json as _json
+            with open(path, encoding='utf-8') as fh:
+                ev = _json.load(fh)
+            by_dir = ev.get('by_direction') or {}
+            rule = {'leverage': float(leverage), 'min_abs_t': float(min_abs_t)}
+            for side, key in (('call', 'long (CALL)'), ('put', 'short (PUT)')):
+                s = (by_dir.get(key) or {}).get('intraday_net') or {}
+                n, mean, se = s.get('n'), s.get('mean'), s.get('se_mean')
+                if not n or mean is None or not se:
+                    return None
+                rule[f'{side}_bp'] = float(mean) * 1e4
+                rule[f'{side}_t'] = float(mean) / float(se)
+            return rule
+        except Exception as exc:
+            print(f"[SESSION BIAS] load failed ({exc}); gate unchanged")
+            return None
 
     def calculate_dynamic_levels(self, ticker: str = None, current_price: float = None) -> Dict:
         """Calculate dynamic stop loss and take profit levels"""

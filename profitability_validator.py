@@ -29,7 +29,40 @@ DEFAULT_RULES = {
     #   {"0.6": 0.35, "0.7": 0.42}   -> piecewise floor-bucket lookup (keys=raw 0.1 buckets)
     #   callable(pop) -> corrected   -> arbitrary curve
     "pop_calibration": None,
+    # Session-bias penalty (default OFF -> legacy behavior). Measured from
+    # live episodes (session_signal_eval.py): the signed underlying drift
+    # over the REST OF THE SESSION after a signal fires. When a side's drift
+    # is significantly negative (|t| >= min_abs_t and bp < 0), the
+    # ev_per_dollar_risk bar is RAISED by the expected premium drag
+    #   drag = |drift_bp| / 1e4 * leverage
+    # where ``leverage`` approximates option gearing (delta * S / premium;
+    # ~10-25x for the near-dated contracts traded here -- an estimate, not a
+    # measurement). Veto-only: the rule can only raise the bar, never lower
+    # it, and never flips a block into a pass. Fail-open on any bad config.
+    # Form: {"call_bp": -12.6, "call_t": -4.0, "put_bp": 0.6, "put_t": 0.2,
+    #        "leverage": 20.0, "min_abs_t": 2.0}
+    "session_bias": None,
 }
+
+
+def _session_bias_drag(side: Optional[str], sb: Any) -> float:
+    """Premium-drag (per $ risk) implied by measured session drift. Pure,
+    fail-open: returns 0.0 (no penalty) unless the side's drift is negative
+    AND statistically significant under the supplied rule dict."""
+    try:
+        if not side or not isinstance(sb, dict):
+            return 0.0
+        bp = _num(sb.get(f"{side}_bp"), None)
+        t = _num(sb.get(f"{side}_t"), None)
+        if bp is None or t is None or bp >= 0:
+            return 0.0
+        min_abs_t = _num(sb.get("min_abs_t"), 2.0) or 2.0
+        if abs(t) < min_abs_t:
+            return 0.0
+        leverage = _num(sb.get("leverage"), 20.0) or 20.0
+        return abs(bp) / 1e4 * leverage
+    except Exception:
+        return 0.0
 
 
 def _apply_pop_calibration(pop: Optional[float], cal: Any) -> Optional[float]:
@@ -202,6 +235,19 @@ def validate_trade(candidate: Dict[str, Any], rules: Optional[Dict[str, Any]] = 
         if ob_imb is not None and abs(ob_imb) < 0.05:
             reasons.append(f"orderbook_imbalance {ob_imb:.3f} too weak for conviction")
 
+    # Session-bias penalty (veto-only): a significantly negative measured
+    # rest-of-session drift for this side raises the ev_per_dollar_risk bar
+    # by the implied premium drag. Default OFF (session_bias=None -> drag 0).
+    session_drag = _session_bias_drag(intended_side, cfg.get("session_bias"))
+    if session_drag > 0 and ev_per_dollar_risk is not None:
+        raised_bar = cfg["min_ev_per_dollar_risk"] + session_drag
+        if ev_per_dollar_risk < raised_bar:
+            reasons.append(
+                f"session_bias: ev_per_dollar_risk {ev_per_dollar_risk:.4f} < "
+                f"{raised_bar:.4f} (base {cfg['min_ev_per_dollar_risk']:.4f} + "
+                f"measured {intended_side} rest-of-session drag {session_drag:.4f})"
+            )
+
     summary = {
         "signal_strength": signal_strength,
         "probability_of_profit": pop,
@@ -211,6 +257,8 @@ def validate_trade(candidate: Dict[str, Any], rules: Optional[Dict[str, Any]] = 
         "p_no_trade": p_no_trade,
         "oracle_agreement": agreement,
         "orderbook_imbalance": _num(robinhood_book.get("orderbook_imbalance"), None),
+        "session_bias_side": intended_side,
+        "session_bias_drag": session_drag,
     }
     return {"pass": not reasons, "reasons": reasons, "summary": summary}
 
@@ -294,5 +342,40 @@ if __name__ == "__main__":
         raise RuntimeError("bad curve")
     cal_bad = validate_trade(sample_ok, {"pop_calibration": _boom})
     assert cal_bad["summary"]["probability_of_profit"] == 0.68
+
+    # Session bias: default OFF must not change the legacy verdict or drag.
+    assert validate_trade(sample_ok)["summary"]["session_bias_drag"] == 0.0
+    assert validate_trade(sample_ok)["pass"] is True
+
+    # Live measured rule (session_signal_eval_live.json): CALL rest-of-day
+    # drift -12.55bp (t=-4.05) -> drag 12.55/1e4*20 = 0.0251, raising the
+    # CALL bar to 0.008+0.0251=0.0331 which blocks sample_ok (ev/$ = 0.02).
+    live_rule = {"session_bias": {"call_bp": -12.55, "call_t": -4.05,
+                                  "put_bp": 0.60, "put_t": 0.17,
+                                  "leverage": 20.0, "min_abs_t": 2.0}}
+    sb_call = validate_trade(sample_ok, live_rule)
+    assert abs(sb_call["summary"]["session_bias_drag"] - 0.0251) < 1e-9
+    assert sb_call["pass"] is False
+    assert any(r.startswith("session_bias:") for r in sb_call["reasons"])
+
+    # PUT side has an insignificant positive drift -> no penalty.
+    sample_put = {**sample_ok, "option": {**sample_ok["option"], "type": "put"},
+                  "oracle_probability": {"p_call": 0.20, "p_put": 0.60,
+                                         "p_no_trade": 0.20}}
+    sb_put = validate_trade(sample_put, live_rule)
+    assert sb_put["summary"]["session_bias_drag"] == 0.0
+    assert sb_put["pass"] is True
+
+    # High-EV CALL clears the raised bar.
+    sample_hi = {**sample_ok,
+                 "entry_stamp": {**sample_ok["entry_stamp"],
+                                 "ev_per_dollar_risk": 0.05}}
+    assert validate_trade(sample_hi, live_rule)["pass"] is True
+
+    # Fail-open: malformed session_bias config -> no penalty, legacy verdict.
+    for junk in ("garbage", {"call_bp": "x", "call_t": None}, 42, [1, 2]):
+        sb_junk = validate_trade(sample_ok, {"session_bias": junk})
+        assert sb_junk["summary"]["session_bias_drag"] == 0.0
+        assert sb_junk["pass"] is True
 
     print("profitability validator self-test: PASS")
