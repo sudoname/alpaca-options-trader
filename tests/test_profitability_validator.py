@@ -187,3 +187,50 @@ class TestSessionBiasLoader:
         p2 = tmp_path / "empty.json"
         p2.write_text(json.dumps({"by_direction": {}}))
         assert SmartOptionsTrader._load_session_bias(str(p2)) is None
+
+
+# --------------------------------------------------------------------------- #
+# orderbook_veto rule (legacy default ON; False = observe-only)                #
+# --------------------------------------------------------------------------- #
+
+def make_weak_book_candidate():
+    """Otherwise-strong candidate whose only flaw is a weak imbalance."""
+    c = make_candidate(True)
+    c["robinhood_book"] = {"orderbook_imbalance": 0.03}
+    return c
+
+
+class TestOrderbookVeto:
+    def test_default_rules_keep_legacy_veto(self):
+        assert DEFAULT_RULES["orderbook_veto"] is True
+        decision = validate_trade(make_weak_book_candidate(), DEFAULT_RULES)
+        assert decision["pass"] is False
+        assert decision["reasons"] == [
+            "orderbook_imbalance 0.030 too weak for conviction"]
+
+    def test_observe_only_does_not_veto_but_still_records(self):
+        rules = {**DEFAULT_RULES, "orderbook_veto": False}
+        decision = validate_trade(make_weak_book_candidate(), rules)
+        assert decision["pass"] is True
+        assert decision["summary"]["orderbook_imbalance"] == 0.03
+
+    def test_strong_imbalance_passes_either_way(self):
+        for veto in (True, False):
+            rules = {**DEFAULT_RULES, "orderbook_veto": veto}
+            decision = validate_trade(make_candidate(True), rules)
+            assert decision["pass"] is True
+
+    def test_missing_imbalance_never_vetoes(self):
+        c = make_candidate(True)
+        c["robinhood_book"] = {"orderbook_imbalance": None}
+        decision = validate_trade(c, DEFAULT_RULES)
+        assert decision["pass"] is True
+        c2 = make_candidate(True)
+        del c2["robinhood_book"]
+        assert validate_trade(c2, DEFAULT_RULES)["pass"] is True
+
+    def test_observe_only_never_rescues_other_failures(self):
+        rules = {**DEFAULT_RULES, "orderbook_veto": False}
+        decision = validate_trade(make_candidate(False), rules)
+        assert decision["pass"] is False
+        assert not any("orderbook" in r for r in decision["reasons"])

@@ -42,6 +42,13 @@ DEFAULT_RULES = {
     # Form: {"call_bp": -12.6, "call_t": -4.0, "put_bp": 0.6, "put_t": 0.2,
     #        "leverage": 20.0, "min_abs_t": 2.0}
     "session_bias": None,
+    # Orderbook-imbalance veto (default True = legacy behavior: when imbalance
+    # data is present and |imbalance| < 0.05 the trade is blocked as "too weak
+    # for conviction"). Set False to OBSERVE ONLY: the imbalance still lands in
+    # the summary for shadow evaluation but never vetoes. The 0.05 threshold is
+    # UNMEASURED against realized outcomes; keep the veto off until the shadow
+    # ledger shows the signal predicts anything.
+    "orderbook_veto": True,
 }
 
 
@@ -230,7 +237,7 @@ def validate_trade(candidate: Dict[str, Any], rules: Optional[Dict[str, Any]] = 
                 f"oracle_agreement {agreement:.3f} < {cfg['min_directional_agreement']:.3f}"
             )
 
-    if "orderbook_imbalance" in robinhood_book:
+    if cfg.get("orderbook_veto", True) and "orderbook_imbalance" in robinhood_book:
         ob_imb = _num(robinhood_book.get("orderbook_imbalance"), None)
         if ob_imb is not None and abs(ob_imb) < 0.05:
             reasons.append(f"orderbook_imbalance {ob_imb:.3f} too weak for conviction")

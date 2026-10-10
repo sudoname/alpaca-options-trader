@@ -296,6 +296,21 @@ class SmartOptionsTrader:
                 self.profitability_gate_rules['session_bias'] = sb
                 print(f"[SESSION BIAS] gate rule active: {sb}")
 
+        # Orderbook-imbalance veto control (legacy behavior = veto active
+        # whenever imbalance data is present: |imbalance| < 0.05 blocks the
+        # trade). USE_ORDERBOOK_VETO=false makes that rule OBSERVE-ONLY, and
+        # ENABLE_ORDERBOOK_SHADOW=1 appends every observed book + gate verdict
+        # to orderbook_shadow.jsonl so the (unmeasured) 0.05 threshold can be
+        # evaluated against realized outcomes BEFORE it is allowed to veto.
+        # Both unset -> behavior byte-identical to before.
+        self.profitability_gate_rules['orderbook_veto'] = str(
+            env_vars.get('USE_ORDERBOOK_VETO', 'true')
+        ).strip().lower() in ('1', 'true', 'yes', 'on')
+        self.enable_orderbook_shadow = _flag('ENABLE_ORDERBOOK_SHADOW')
+        if not self.profitability_gate_rules['orderbook_veto']:
+            print("[OB SHADOW] orderbook veto observe-only "
+                  f"(shadow={'on' if self.enable_orderbook_shadow else 'off'})")
+
         # --- Phase 3: direction quality + sizing safety -------------------- #
         # All OFF by default so default behavior is byte-for-byte unchanged.
         #  * USE_SKIP_ON_WEAK_SIGNAL: when on, determine_option_strategy may
@@ -2772,6 +2787,34 @@ class SmartOptionsTrader:
                       f"P(no-trade)={verdict['summary'].get('p_no_trade')} "
                       f"agree={verdict['summary'].get('oracle_agreement')} "
                       f"-> {'ALLOW' if verdict['pass'] else 'BLOCK'}")
+                # Shadow-record the Robinhood book observation alongside the
+                # gate verdict (recording only; cannot affect the verdict).
+                # Default OFF via ENABLE_ORDERBOOK_SHADOW.
+                if ob_imb is not None and getattr(self, 'enable_orderbook_shadow', False):
+                    try:
+                        import json as _json
+                        from datetime import datetime as _dt, timezone as _tz
+                        _row = {
+                            'type': 'orderbook_shadow',
+                            'recorded_at': _dt.now(_tz.utc).isoformat(),
+                            'symbol': underlying_symbol,
+                            'option_symbol': option.get('symbol'),
+                            'side': option.get('type'),
+                            'book': book if isinstance(book, dict) else
+                                    {'orderbook_imbalance': ob_imb},
+                            'would_block_weak': abs(ob_imb) < 0.05,
+                            'veto_active': bool(
+                                self.profitability_gate_rules.get(
+                                    'orderbook_veto', True)),
+                            'gate_pass': verdict['pass'],
+                            'gate_reasons': verdict['reasons'],
+                            'summary': verdict['summary'],
+                        }
+                        with open('orderbook_shadow.jsonl', 'a',
+                                  encoding='utf-8') as _fh:
+                            _fh.write(_json.dumps(_row, default=str) + '\n')
+                    except Exception as _exc:
+                        print(f"[OB SHADOW] append ignored: {_exc}")
                 if not verdict['pass']:
                     reason = '; '.join(verdict['reasons']) or 'profitability rule set failed'
                     if getattr(self, 'profitability_gate_dryrun', False):
