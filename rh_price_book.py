@@ -20,6 +20,15 @@ path:
     failing session for a cooldown; every public path HARD fails open to
     ``None`` on any error. Only called in intraday mode, behind
     ``USE_ORDERBOOK_IMBALANCE``.
+
+Authentication (TOTP optional):
+  * Accounts with device-approval/SMS 2FA (no TOTP secret) authenticate once
+    interactively: ``python rh_price_book.py --login`` — prompts/approvals are
+    allowed there, and the session is pickled for later headless reuse.
+  * The headless trade path NEVER prompts or blocks on stdin: without a TOTP
+    code or a stored session pickle, ``_ensure_login`` returns ``False``
+    without touching the network, and any unexpected robin_stocks challenge
+    prompt raises immediately instead of hanging.
 """
 
 import time as _time
@@ -29,6 +38,9 @@ RH_PRICEBOOK_TTL_SEC = 5.0
 RH_CIRCUIT_MAX_FAILS = 3
 RH_CIRCUIT_COOLDOWN_SEC = 300.0
 DEFAULT_LEVELS = 5
+# Ask robin_stocks for a long-lived token so one interactive --login lasts
+# ~8.5 days of headless reuse before re-approval is needed.
+RH_SESSION_EXPIRES_SEC = 734000
 
 
 # --------------------------------------------------------------------------- #
@@ -83,6 +95,34 @@ def _imbalance_from_book(bids, asks, levels: int = DEFAULT_LEVELS) -> Optional[D
 
 
 # --------------------------------------------------------------------------- #
+# Session helpers
+# --------------------------------------------------------------------------- #
+def _stored_session_files(pickle_name: Optional[str] = None) -> List[str]:
+    """Best-effort list of stored robin_stocks session pickles. Never raises.
+
+    robin_stocks keeps sessions under ``~/.tokens/robinhood*.pickle``; the
+    optional ``pickle_name`` (our RH_PICKLE_PATH) is also checked both as a
+    literal file and as a directory of pickles, since robin_stocks treats it
+    as a filename suffix but users may point it at a real path.
+    """
+    import glob
+    import os
+
+    found: List[str] = []
+    try:
+        if pickle_name:
+            if os.path.isfile(pickle_name):
+                found.append(pickle_name)
+            elif os.path.isdir(pickle_name):
+                found.extend(glob.glob(os.path.join(pickle_name, "*.pickle")))
+        tokens_dir = os.path.expanduser("~/.tokens")
+        found.extend(glob.glob(os.path.join(tokens_dir, "*.pickle")))
+    except Exception:  # pragma: no cover - fail-open
+        pass
+    return found
+
+
+# --------------------------------------------------------------------------- #
 # Live client (network; lazy, cached, circuit-broken, fail-open)
 # --------------------------------------------------------------------------- #
 class RHPriceBookClient:
@@ -101,32 +141,60 @@ class RHPriceBookClient:
         self._circuit_open_until = 0.0
 
     # --- session ------------------------------------------------------------
-    def _ensure_login(self) -> bool:
+    def _ensure_login(self, interactive: bool = False) -> bool:
+        """Log in, reusing a stored session pickle when possible.
+
+        Headless (``interactive=False``, the trade path): NEVER prompts or
+        blocks on stdin. Without a TOTP code or a stored session pickle it
+        returns ``False`` immediately — no network call. If robin_stocks
+        still raises a challenge (SMS code ``input()`` / device-approval
+        poll), stdin is patched to raise so the attempt dies fast instead of
+        hanging inside the live gate.
+
+        Interactive (``--login`` CLI): prompts are allowed, so SMS codes and
+        device approvals work; the session is pickled for headless reuse.
+        """
         if self._logged_in:
             return True
         try:
             import robin_stocks.robinhood as rh
         except Exception:
             return False
+        mfa_code = None
+        if self.mfa_secret:
+            try:
+                import pyotp
+                mfa_code = pyotp.TOTP(self.mfa_secret).now()
+            except Exception:
+                mfa_code = None
+        if not interactive and not mfa_code and \
+                not _stored_session_files(self.pickle_path):
+            # Nothing that could complete a headless login; don't even try —
+            # robin_stocks would fall into an SMS input() prompt or a ~2 min
+            # device-approval poll, and this runs inside the live gate path.
+            return False
+        kwargs = {"username": self.username, "password": self.password,
+                  "store_session": True, "expiresIn": RH_SESSION_EXPIRES_SEC}
+        if mfa_code:
+            kwargs["mfa_code"] = mfa_code
+        if self.pickle_path:
+            kwargs["pickle_name"] = self.pickle_path
+        import builtins
+        real_input = builtins.input
         try:
-            mfa_code = None
-            if self.mfa_secret:
-                try:
-                    import pyotp
-                    mfa_code = pyotp.TOTP(self.mfa_secret).now()
-                except Exception:
-                    mfa_code = None
-            kwargs = {"username": self.username, "password": self.password,
-                      "store_session": True}
-            if mfa_code:
-                kwargs["mfa_code"] = mfa_code
-            if self.pickle_path:
-                kwargs["pickle_name"] = self.pickle_path
+            if not interactive:
+                def _no_input(*_a, **_k):
+                    raise EOFError(
+                        "rh_price_book: interactive login required "
+                        "(run: python rh_price_book.py --login)")
+                builtins.input = _no_input
             rh.login(**kwargs)
             self._logged_in = True
             return True
         except Exception:
             return False
+        finally:
+            builtins.input = real_input
 
     # --- circuit breaker ----------------------------------------------------
     def _circuit_blocked(self) -> bool:
@@ -266,7 +334,57 @@ def _self_test() -> int:
     return 0 if ok else 1
 
 
+# --------------------------------------------------------------------------- #
+# CLI (interactive login + live fetch test)
+# --------------------------------------------------------------------------- #
+def _interactive_login() -> int:
+    """One-time interactive Robinhood login (SMS / device approval allowed)."""
+    client = get_client()
+    if client is None:
+        print("No client: set RH_USERNAME / RH_PASSWORD (and optionally "
+              "RH_MFA_SECRET / RH_PICKLE_PATH) in the environment or .env.")
+        return 1
+    print(f"Logging in to Robinhood as {client.username} ...")
+    print("If challenged: approve the device prompt in your Robinhood app, "
+          "or type the SMS/email code at the prompt below.")
+    if client._ensure_login(interactive=True):
+        days = RH_SESSION_EXPIRES_SEC // 86400
+        print("Login OK. Session pickle stored; headless runs will reuse it "
+              f"for ~{days} days, then re-run --login.")
+        return 0
+    print("Login FAILED. Check credentials / approve the challenge, "
+          "then retry --login.")
+    return 1
+
+
+def _test_fetch(symbol: str) -> int:
+    """Fetch a live order-book imbalance once and print it."""
+    result = get_order_book_imbalance(symbol)
+    print(f"{symbol} order-book imbalance: {result}")
+    if result is None:
+        print("None can mean: no stored session (run --login first), "
+              "no Robinhood Gold (Level II needs Gold), market closed, "
+              "or an empty book.")
+        return 1
+    return 0
+
+
 if __name__ == "__main__":
+    import argparse
     import sys
 
+    parser = argparse.ArgumentParser(
+        description="Robinhood price-book helper (default: offline self-test)")
+    parser.add_argument(
+        "--login", action="store_true",
+        help="one-time interactive login (SMS / device approval allowed); "
+             "stores a session pickle for headless reuse")
+    parser.add_argument(
+        "--test", metavar="SYMBOL",
+        help="fetch the live order-book imbalance for SYMBOL")
+    args = parser.parse_args()
+    if args.login:
+        sys.exit(_interactive_login())
+    if args.test:
+        sys.exit(_test_fetch(args.test))
     sys.exit(_self_test())
