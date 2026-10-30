@@ -234,7 +234,7 @@ class TelegramTradingBot:
         if self._markdown_balanced(text):
             data["parse_mode"] = "Markdown"
         try:
-            response = requests.post(url, data=data)
+            response = requests.post(url, data=data, timeout=15)
             if response.status_code == 200:
                 return True
             print(f"Send message HTTP {response.status_code}: "
@@ -242,7 +242,7 @@ class TelegramTradingBot:
             if "parse_mode" not in data:
                 return False
             data.pop("parse_mode", None)
-            response = requests.post(url, data=data)
+            response = requests.post(url, data=data, timeout=15)
             return response.status_code == 200
         except Exception as e:
             print(f"Send message error: {e}")
@@ -264,7 +264,10 @@ class TelegramTradingBot:
         params = {"offset": self.last_update_id + 1}
 
         try:
-            response = requests.get(url, params=params)
+            # timeout is load-bearing: a single stalled connection here
+            # (observed in prod) hangs the main loop forever, killing all
+            # inbound command handling while daemon threads keep sending.
+            response = requests.get(url, params=params, timeout=30)
             if response.status_code == 200:
                 return response.json()
         except Exception as e:
@@ -998,7 +1001,8 @@ Monitoring started..."""
                         'end': end_time.strftime('%Y-%m-%d'),
                         'limit': 400,
                         'feed': 'iex'  # Use IEX data for free tier
-                    }
+                    },
+                    timeout=15
                 )
                 if year_response.status_code == 200:
                     year_bars = year_response.json().get('bars', [])
