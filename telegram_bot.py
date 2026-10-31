@@ -102,6 +102,23 @@ class TelegramTradingBot:
         self.daily_oracle_report_state_file = env_vars.get(
             'DAILY_ORACLE_REPORT_STATE_FILE', 'oracle_daily_report_state.json')
 
+        # TradingAgents RESEARCH command (shadow-only decision support for the
+        # human; see TRADINGAGENTS_SHADOW.md). When ENABLE_TRADINGAGENTS_RESEARCH
+        # is on, "RESEARCH NVDA" runs the multi-agent LLM debate in a background
+        # thread (takes minutes, costs LLM credits) and sends the report when
+        # done. It NEVER feeds any gate or order path. Default off -> the
+        # command replies that the feature is disabled.
+        self.tradingagents_research_enabled = env_vars.get(
+            'ENABLE_TRADINGAGENTS_RESEARCH', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
+        # Interpreter for the research subprocess; TradingAgents lives in its
+        # own venv to keep its heavy deps out of the trading venv.
+        self.tradingagents_python = env_vars.get('TA_PYTHON', '').strip()
+        try:
+            self.tradingagents_timeout_sec = int(
+                env_vars.get('TA_RESEARCH_TIMEOUT_SEC', '900'))
+        except (TypeError, ValueError):
+            self.tradingagents_timeout_sec = 900
+
         if not self.bot_token:
             print("\n❌ Missing TELEGRAM_BOT_TOKEN in .env file")
             print("1. Create bot with @BotFather on Telegram")
@@ -504,6 +521,11 @@ class TelegramTradingBot:
             rest = text.replace('/BEST_EV_PAPER_RUN', '').replace('BEST_EV_PAPER_RUN', '', 1)
             return self.best_ev_paper_run(rest, chat_id)
 
+        elif text.startswith('RESEARCH ') or text.startswith('/RESEARCH '):
+            parts = text.replace('/RESEARCH', '').replace('RESEARCH', '', 1).split()
+            symbol = parts[0].strip().upper() if parts else ''
+            return self.tradingagents_research(symbol, chat_id)
+
         elif text == 'START':
             return self.start_monitoring()
 
@@ -522,6 +544,54 @@ class TelegramTradingBot:
 
         else:
             return "❓ Unknown command. Send HELP for available commands."
+
+    def tradingagents_research(self, symbol, chat_id):
+        """RESEARCH <ticker>: run the TradingAgents multi-agent debate in a
+        background thread and send the report when it finishes.
+
+        Shadow-only decision support for the HUMAN (TRADINGAGENTS_SHADOW.md):
+        the output never feeds any gate, score, or order path. The subprocess
+        runs under TA_PYTHON (a separate venv) so TradingAgents' heavy
+        dependencies stay out of the trading venv.
+        """
+        if not self.tradingagents_research_enabled:
+            return ("🔒 TradingAgents research is disabled. Set "
+                    "ENABLE_TRADINGAGENTS_RESEARCH=1 in .env to enable.")
+        if not re.fullmatch(r'[A-Z]{1,5}', symbol or ''):
+            return "❌ Usage: RESEARCH <TICKER> (e.g. RESEARCH NVDA)"
+
+        timeout_sec = self.tradingagents_timeout_sec
+
+        def _worker():
+            import subprocess
+            import sys as _sys
+            python = self.tradingagents_python or _sys.executable
+            try:
+                proc = subprocess.run(
+                    [python, 'tradingagents_shadow.py', '--research', symbol],
+                    capture_output=True, text=True, timeout=timeout_sec)
+                out = (proc.stdout or '').strip()
+                if proc.returncode != 0 and (proc.stderr or '').strip():
+                    out = (out + '\n' + proc.stderr.strip()).strip()
+                if not out:
+                    out = 'no output'
+                if len(out) > 12000:   # send_message chunks, but cap the spam
+                    out = '...(truncated)...\n' + out[-12000:]
+                self.send_message(
+                    f"🧪 TradingAgents research {symbol} (shadow-only, "
+                    f"not a validated signal):\n\n{out}", chat_id)
+            except subprocess.TimeoutExpired:
+                self.send_message(
+                    f"⏱ TradingAgents research {symbol} timed out after "
+                    f"{timeout_sec}s.", chat_id)
+            except Exception as e:
+                self.send_message(
+                    f"❌ TradingAgents research {symbol} failed: {e}", chat_id)
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return (f"⏳ TradingAgents research started for {symbol} — the "
+                "multi-agent debate takes several minutes and uses LLM "
+                "credits. I'll send the report here when it finishes.")
 
     def determine_option_type(self, market_data):
         """
