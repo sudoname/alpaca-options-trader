@@ -135,6 +135,26 @@ def _stored_session_files(pickle_name: Optional[str] = None) -> List[str]:
     return found
 
 
+def _login_paused() -> bool:
+    """True when RH_PAUSE_LOGIN is set: no AUTOMATIC login attempts at all.
+
+    Hard kill switch for rate-limit recovery (Robinhood 429s the login
+    endpoint and robin_stocks does not expose Retry-After, so the only safe
+    move is full silence). Read at call time (shell env first, then .env via
+    ConfigLoader) so it can be toggled without restarting services.
+    Interactive ``--login`` is operator-driven and ignores it. Never raises.
+    """
+    try:
+        import os
+        val = os.environ.get("RH_PAUSE_LOGIN", "")
+        if not val:
+            from config_loader import ConfigLoader
+            val = ConfigLoader().get("RH_PAUSE_LOGIN", "")
+        return str(val).strip().lower() in ("1", "true", "yes", "on")
+    except Exception:  # pragma: no cover - fail-open
+        return False
+
+
 # --------------------------------------------------------------------------- #
 # Live client (network; lazy, cached, circuit-broken, fail-open)
 # --------------------------------------------------------------------------- #
@@ -172,10 +192,12 @@ class RHPriceBookClient:
         """
         if self._logged_in:
             return True
-        if not interactive and _time.time() < self._next_login_attempt:
-            # Recent headless login failure: stay off the login endpoint so
-            # Robinhood's 429 rate limit can decay (interactive --login is
-            # operator-driven and always allowed).
+        if not interactive and (_login_paused()
+                                or _time.time() < self._next_login_attempt):
+            # RH_PAUSE_LOGIN kill switch, or a recent headless login failure:
+            # stay off the login endpoint so Robinhood's 429 rate limit can
+            # decay (interactive --login is operator-driven and always
+            # allowed).
             return False
         try:
             import robin_stocks.robinhood as rh

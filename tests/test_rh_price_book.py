@@ -224,6 +224,37 @@ class TestLoginVerification:
 
 
 # --------------------------------------------------------------------------- #
+# RH_PAUSE_LOGIN kill switch: pause ALL automatic login attempts (429 recovery)
+# --------------------------------------------------------------------------- #
+class TestPauseLogin:
+    def test_pause_blocks_headless_pre_network(self, monkeypatch):
+        calls = []
+        install_fake_rh(monkeypatch, lambda **kw: calls.append(kw))
+        fake_sessions(monkeypatch)                 # pickle present: would attempt
+        monkeypatch.setenv("RH_PAUSE_LOGIN", "1")
+        client = make_client()
+        assert client._ensure_login() is False
+        assert calls == []                         # zero network traffic
+
+    def test_interactive_login_ignores_pause(self, monkeypatch):
+        calls = []
+        install_fake_rh(monkeypatch, lambda **kw: calls.append(kw))
+        no_sessions(monkeypatch)
+        monkeypatch.setenv("RH_PAUSE_LOGIN", "1")
+        client = make_client()
+        assert client._ensure_login(interactive=True) is True
+        assert len(calls) == 1                     # the one operator attempt
+
+    def test_falsy_values_do_not_pause(self, monkeypatch):
+        calls = []
+        install_fake_rh(monkeypatch, lambda **kw: calls.append(kw))
+        fake_sessions(monkeypatch)
+        monkeypatch.setenv("RH_PAUSE_LOGIN", "0")
+        assert make_client()._ensure_login() is True
+        assert len(calls) == 1
+
+
+# --------------------------------------------------------------------------- #
 # Headless login cooldown (anti-429: a stale pickle must not make services
 # hammer the login endpoint and keep the operator rate-limited out of --login)
 # --------------------------------------------------------------------------- #
