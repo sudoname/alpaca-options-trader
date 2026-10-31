@@ -17,6 +17,7 @@ import rh_price_book
 from rh_price_book import (
     RH_ALERT_AFTER_TRIPS,
     RH_CIRCUIT_MAX_FAILS,
+    RH_LOGIN_RETRY_SEC,
     RH_SESSION_EXPIRES_SEC,
     RHPriceBookClient,
     _stored_session_files,
@@ -220,6 +221,66 @@ class TestLoginVerification:
         mod.load_user_profile = profile
         no_sessions(monkeypatch)
         assert make_client()._ensure_login(interactive=True) is False
+
+
+# --------------------------------------------------------------------------- #
+# Headless login cooldown (anti-429: a stale pickle must not make services
+# hammer the login endpoint and keep the operator rate-limited out of --login)
+# --------------------------------------------------------------------------- #
+class TestLoginCooldown:
+    def _failing_rh(self, monkeypatch):
+        calls = []
+
+        def login_fn(**kw):
+            calls.append(kw)
+            raise RuntimeError("429 rate limited")
+
+        install_fake_rh(monkeypatch, login_fn)
+        fake_sessions(monkeypatch)
+        return calls
+
+    def test_failure_blocks_next_headless_attempt_pre_network(self, monkeypatch):
+        calls = self._failing_rh(monkeypatch)
+        client = make_client()
+        assert client._ensure_login() is False
+        assert len(calls) == 1
+        assert client._ensure_login() is False     # within cooldown
+        assert len(calls) == 1                     # no second network attempt
+
+    def test_cooldown_expires(self, monkeypatch):
+        calls = self._failing_rh(monkeypatch)
+        client = make_client()
+        client._ensure_login()
+        monkeypatch.setattr(
+            rh_price_book._time, "time",
+            lambda t=rh_price_book._time.time(): t + RH_LOGIN_RETRY_SEC + 1)
+        client._ensure_login()
+        assert len(calls) == 2                     # retried after cooldown
+
+    def test_interactive_bypasses_cooldown(self, monkeypatch):
+        calls = self._failing_rh(monkeypatch)
+        client = make_client()
+        client._ensure_login()                     # arms the cooldown
+        assert client._ensure_login(interactive=True) is False
+        assert len(calls) == 2                     # operator attempt went out
+
+    def test_success_resets_cooldown(self, monkeypatch):
+        calls = []
+        install_fake_rh(monkeypatch, lambda **kw: calls.append(kw))
+        fake_sessions(monkeypatch)
+        client = make_client()
+        client._next_login_attempt = rh_price_book._time.time() - 1
+        assert client._ensure_login() is True
+        assert client._next_login_attempt == 0.0
+
+    def test_probe_failure_also_arms_cooldown(self, monkeypatch):
+        # robin_stocks "prints 429 and returns normally" path.
+        mod = install_fake_rh(monkeypatch, lambda **kw: None)
+        mod.load_user_profile = lambda: None
+        fake_sessions(monkeypatch)
+        client = make_client()
+        assert client._ensure_login() is False
+        assert client._next_login_attempt > rh_price_book._time.time()
 
 
 # --------------------------------------------------------------------------- #

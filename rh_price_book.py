@@ -45,6 +45,11 @@ RH_CIRCUIT_MAX_FAILS = 3
 RH_CIRCUIT_COOLDOWN_SEC = 300.0
 # Consecutive circuit trips before the one-shot "session down" Telegram alert.
 RH_ALERT_AFTER_TRIPS = 2
+# Minimum wait between failed HEADLESS login attempts. Robinhood 429s the
+# login endpoint aggressively (observed in prod); without this, a stale
+# pickle makes the services re-attempt login every circuit window and the
+# rate limit never decays, locking the operator out of --login too.
+RH_LOGIN_RETRY_SEC = 1800.0
 DEFAULT_LEVELS = 5
 # Ask robin_stocks for a long-lived token so one interactive --login lasts
 # ~8.5 days of headless reuse before re-approval is needed.
@@ -149,6 +154,7 @@ class RHPriceBookClient:
         self._circuit_open_until = 0.0
         self._trip_count = 0            # consecutive circuit trips
         self._alerted = False           # one-shot alert sent for this outage
+        self._next_login_attempt = 0.0  # headless login cooldown (anti-429)
 
     # --- session ------------------------------------------------------------
     def _ensure_login(self, interactive: bool = False) -> bool:
@@ -166,6 +172,11 @@ class RHPriceBookClient:
         """
         if self._logged_in:
             return True
+        if not interactive and _time.time() < self._next_login_attempt:
+            # Recent headless login failure: stay off the login endpoint so
+            # Robinhood's 429 rate limit can decay (interactive --login is
+            # operator-driven and always allowed).
+            return False
         try:
             import robin_stocks.robinhood as rh
         except Exception:
@@ -211,10 +222,16 @@ class RHPriceBookClient:
                 except Exception:
                     prof = None
                 if not (isinstance(prof, dict) and prof):
+                    if not interactive:
+                        self._next_login_attempt = (
+                            _time.time() + RH_LOGIN_RETRY_SEC)
                     return False
             self._logged_in = True
+            self._next_login_attempt = 0.0
             return True
         except Exception:
+            if not interactive:
+                self._next_login_attempt = _time.time() + RH_LOGIN_RETRY_SEC
             return False
         finally:
             builtins.input = real_input
