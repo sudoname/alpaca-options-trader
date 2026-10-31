@@ -199,6 +199,19 @@ class RHPriceBookClient:
                         "(run: python rh_price_book.py --login)")
                 builtins.input = _no_input
             rh.login(**kwargs)
+            # robin_stocks.login PRINTS some failures (e.g. HTTP 429 rate
+            # limit: "Login failed. Check credentials and try again.") and
+            # returns normally — observed in prod producing a false "Login
+            # OK". Verify with a cheap authenticated probe instead of
+            # trusting the absence of an exception.
+            probe = getattr(rh, "load_user_profile", None)
+            if probe is not None:
+                try:
+                    prof = probe()
+                except Exception:
+                    prof = None
+                if not (isinstance(prof, dict) and prof):
+                    return False
             self._logged_in = True
             return True
         except Exception:

@@ -180,6 +180,49 @@ class TestTotp:
 
 
 # --------------------------------------------------------------------------- #
+# Post-login verification (observed prod failure: robin_stocks PRINTS a 429
+# "Login failed" and returns normally -> false "Login OK")
+# --------------------------------------------------------------------------- #
+class TestLoginVerification:
+    def test_print_but_fail_login_is_detected(self, monkeypatch):
+        # login() returns without raising, but no session exists: the
+        # authenticated probe raises -> must report failure.
+        def profile():
+            raise RuntimeError("load_user_profile can only be called when logged in")
+
+        mod = install_fake_rh(monkeypatch, lambda **kw: None)
+        mod.load_user_profile = profile
+        fake_sessions(monkeypatch)
+        client = make_client()
+        assert client._ensure_login() is False
+        assert client._logged_in is False
+
+    def test_falsy_profile_is_failure(self, monkeypatch):
+        mod = install_fake_rh(monkeypatch, lambda **kw: None)
+        mod.load_user_profile = lambda: {}
+        fake_sessions(monkeypatch)
+        assert make_client()._ensure_login() is False
+
+    def test_valid_profile_is_success(self, monkeypatch):
+        mod = install_fake_rh(monkeypatch, lambda **kw: None)
+        mod.load_user_profile = lambda: {"id": "abc"}
+        fake_sessions(monkeypatch)
+        client = make_client()
+        assert client._ensure_login() is True
+        assert client._logged_in is True
+
+    def test_interactive_also_verified(self, monkeypatch):
+        # The --login CLI must not print "Login OK" on a rate-limited login.
+        def profile():
+            raise RuntimeError("not logged in")
+
+        mod = install_fake_rh(monkeypatch, lambda **kw: None)
+        mod.load_user_profile = profile
+        no_sessions(monkeypatch)
+        assert make_client()._ensure_login(interactive=True) is False
+
+
+# --------------------------------------------------------------------------- #
 # Circuit trips: session-latch drop + one-shot Telegram alert
 # (observed prod failure: expired token -> 2 weeks of silent 401s)
 # --------------------------------------------------------------------------- #
