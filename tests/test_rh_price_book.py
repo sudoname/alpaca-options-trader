@@ -15,6 +15,8 @@ import types
 
 import rh_price_book
 from rh_price_book import (
+    RH_ALERT_AFTER_TRIPS,
+    RH_CIRCUIT_MAX_FAILS,
     RH_SESSION_EXPIRES_SEC,
     RHPriceBookClient,
     _stored_session_files,
@@ -175,6 +177,94 @@ class TestTotp:
         client = make_client(mfa_secret="BASE32SECRET")
         assert client._ensure_login() is False
         assert calls == []
+
+
+# --------------------------------------------------------------------------- #
+# Circuit trips: session-latch drop + one-shot Telegram alert
+# (observed prod failure: expired token -> 2 weeks of silent 401s)
+# --------------------------------------------------------------------------- #
+def trip_circuit(client, times=1):
+    for _ in range(times * RH_CIRCUIT_MAX_FAILS):
+        client._note_failure()
+
+
+class TestCircuitAlert:
+    def test_trip_drops_session_latch(self):
+        client = make_client()
+        client._alert_session_down = lambda: None
+        client._logged_in = True
+        trip_circuit(client, times=1)
+        # A fresh --login pickle must be re-read on the next window.
+        assert client._logged_in is False
+
+    def test_alert_fires_once_after_threshold_trips(self):
+        client = make_client()
+        alerts = []
+        client._alert_session_down = lambda: alerts.append(1)
+        trip_circuit(client, times=RH_ALERT_AFTER_TRIPS - 1)
+        assert alerts == []                      # below threshold: silent
+        trip_circuit(client, times=1)
+        assert alerts == [1]                     # threshold reached: one alert
+        trip_circuit(client, times=3)
+        assert alerts == [1]                     # never repeats mid-outage
+
+    def test_success_resets_and_rearms(self):
+        client = make_client()
+        alerts = []
+        client._alert_session_down = lambda: alerts.append(1)
+        trip_circuit(client, times=RH_ALERT_AFTER_TRIPS)
+        assert alerts == [1]
+        client._note_success()                   # outage over
+        assert client._trip_count == 0
+        trip_circuit(client, times=RH_ALERT_AFTER_TRIPS)
+        assert alerts == [1, 1]                  # next distinct outage alerts
+
+    def _fake_config(self, monkeypatch, values):
+        mod = types.ModuleType("config_loader")
+
+        class ConfigLoader:
+            def get(self, key, default=""):
+                return values.get(key, default)
+
+        mod.ConfigLoader = ConfigLoader
+        monkeypatch.setitem(sys.modules, "config_loader", mod)
+
+    def _fake_requests(self, monkeypatch, posts, exc=None):
+        mod = types.ModuleType("requests")
+
+        def post(url, data=None, timeout=None):
+            if exc:
+                raise exc
+            posts.append({"url": url, "data": data, "timeout": timeout})
+
+        mod.post = post
+        monkeypatch.setitem(sys.modules, "requests", mod)
+
+    def test_alert_posts_to_telegram(self, monkeypatch):
+        posts = []
+        self._fake_config(monkeypatch, {"TELEGRAM_BOT_TOKEN": "tok",
+                                        "TELEGRAM_CHAT_ID": "42"})
+        self._fake_requests(monkeypatch, posts)
+        make_client()._alert_session_down()
+        assert len(posts) == 1
+        p = posts[0]
+        assert "bottok/sendMessage" in p["url"]
+        assert p["data"]["chat_id"] == "42"
+        assert "--login" in p["data"]["text"]
+        assert p["timeout"] is not None          # must never hang the gate path
+
+    def test_alert_without_creds_posts_nothing(self, monkeypatch):
+        posts = []
+        self._fake_config(monkeypatch, {})
+        self._fake_requests(monkeypatch, posts)
+        make_client()._alert_session_down()
+        assert posts == []
+
+    def test_alert_never_raises(self, monkeypatch):
+        self._fake_config(monkeypatch, {"TELEGRAM_BOT_TOKEN": "tok",
+                                        "TELEGRAM_CHAT_ID": "42"})
+        self._fake_requests(monkeypatch, [], exc=RuntimeError("net down"))
+        make_client()._alert_session_down()      # must not raise
 
 
 # --------------------------------------------------------------------------- #

@@ -20,6 +20,12 @@ path:
     failing session for a cooldown; every public path HARD fails open to
     ``None`` on any error. Only called in intraday mode, behind
     ``USE_ORDERBOOK_IMBALANCE``.
+  * Expired-session self-healing: each circuit trip drops the in-memory
+    ``_logged_in`` latch, so after the operator re-runs ``--login`` the
+    running services pick up the fresh pickle on the next window — no
+    restart needed. After ``RH_ALERT_AFTER_TRIPS`` consecutive trips a
+    one-shot Telegram alert is sent (observed failure mode: a silently
+    expired token produced two weeks of 401s and no data).
 
 Authentication (TOTP optional):
   * Accounts with device-approval/SMS 2FA (no TOTP secret) authenticate once
@@ -37,6 +43,8 @@ from typing import Dict, List, Optional
 RH_PRICEBOOK_TTL_SEC = 5.0
 RH_CIRCUIT_MAX_FAILS = 3
 RH_CIRCUIT_COOLDOWN_SEC = 300.0
+# Consecutive circuit trips before the one-shot "session down" Telegram alert.
+RH_ALERT_AFTER_TRIPS = 2
 DEFAULT_LEVELS = 5
 # Ask robin_stocks for a long-lived token so one interactive --login lasts
 # ~8.5 days of headless reuse before re-approval is needed.
@@ -139,6 +147,8 @@ class RHPriceBookClient:
         self._cache: Dict = {}          # symbol -> (ts, result)
         self._fail_count = 0
         self._circuit_open_until = 0.0
+        self._trip_count = 0            # consecutive circuit trips
+        self._alerted = False           # one-shot alert sent for this outage
 
     # --- session ------------------------------------------------------------
     def _ensure_login(self, interactive: bool = False) -> bool:
@@ -205,9 +215,43 @@ class RHPriceBookClient:
         if self._fail_count >= RH_CIRCUIT_MAX_FAILS:
             self._circuit_open_until = _time.time() + RH_CIRCUIT_COOLDOWN_SEC
             self._fail_count = 0
+            self._trip_count += 1
+            # Drop the in-memory session latch: a dead token otherwise 401s
+            # forever (observed in prod for 2 weeks). Re-reading the pickle on
+            # the next window means a fresh `--login` heals running services
+            # without a restart.
+            self._logged_in = False
+            if self._trip_count >= RH_ALERT_AFTER_TRIPS and not self._alerted:
+                self._alerted = True
+                self._alert_session_down()
 
     def _note_success(self) -> None:
         self._fail_count = 0
+        self._trip_count = 0
+        self._alerted = False           # re-arm for the next distinct outage
+
+    def _alert_session_down(self) -> None:
+        """One-shot Telegram note that the RH session is unusable. Never raises."""
+        try:
+            from config_loader import ConfigLoader
+            env = ConfigLoader()
+            token = env.get("TELEGRAM_BOT_TOKEN", "")
+            chat_id = env.get("TELEGRAM_CHAT_ID", "")
+            if not token or not chat_id:
+                return
+            import requests
+            requests.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                data={"chat_id": chat_id, "text": (
+                    "⚠️ Robinhood session unusable (expired or unauthorized) — "
+                    "order-book data is NOT being recorded.\n"
+                    "Fix: cd /var/www/alps && ./venv/bin/python "
+                    "rh_price_book.py --login\n"
+                    "Running services recover on their own after login "
+                    "(no restart needed).")},
+                timeout=10)
+        except Exception:  # pragma: no cover - fail-open
+            pass
 
     # --- public -------------------------------------------------------------
     def get_order_book_imbalance(self, symbol: str,
