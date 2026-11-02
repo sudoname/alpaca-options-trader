@@ -77,6 +77,22 @@ class SmartOptionsTrader:
         except Exception as e:
             print(f"[SHADOW] Recorder unavailable: {e}")
 
+        # Research decision ledger: immutable candidate snapshots + append-only
+        # idempotent lifecycle events in research_ledger.db, linked by the SAME
+        # decision_id as episodes.db. Flag-gated (ENABLE_DECISION_LEDGER, default
+        # OFF -> self.research_capture stays None and nothing is touched) and
+        # fail-open: a logging failure can never block an order, a risk check,
+        # or position management.
+        self.research_capture = None
+        try:
+            from research_capture import ResearchCapture
+            _cap = ResearchCapture()
+            if _cap.enabled:
+                self.research_capture = _cap
+                print("[LEDGER] Decision ledger active -> research_ledger.db")
+        except Exception as e:
+            print(f"[LEDGER] Decision ledger unavailable: {e}")
+
         # Risk engine: hard caps that live OUTSIDE the learner (per-trade budget,
         # daily loss, max concurrent, PDT, kill-switch). It is the last line of
         # capital protection and runs BEFORE every order is sent. Fail-closed: if
@@ -1096,34 +1112,54 @@ class SmartOptionsTrader:
                                  quote, qty, risk_verdict):
         """Record a risk-blocked entry as a SKIP decision (verdict in risk_json).
 
-        Observational only; never raises into the trading path. No-op unless the
-        shadow recorder is active. This ensures blocked trades are not silently
-        dropped from the episode record.
+        Observational only; never raises into the trading path. Shadow recorder
+        (episodes.db) and research ledger (research_ledger.db) are independent
+        sinks sharing the same decision_id when both are active. This ensures
+        blocked trades are not silently dropped from the episode record.
         """
-        if not getattr(self, 'shadow_recorder', None):
-            return
-        try:
-            analysis_ctx = {
-                'direction': (option.get('type') or 'call').upper(),
-                'momentum': dynamic_levels.get('momentum', 0),
-                'confidence': option.get('score', 0),
-                'should_trade': False,
-            }
-            self.shadow_recorder.on_decision(
-                symbol=option['symbol'],
-                underlying=underlying_symbol,
-                analysis=analysis_ctx,
-                quote=quote,
-                entry_premium=(quote or {}).get('ask'),
-                qty=qty,
-                mode='live-paper-blocked',
-                as_of=datetime.now().isoformat(),
-                day_of_week=datetime.now().weekday(),
-                risk=risk_verdict,
-            )
-            print("[RISK] Blocked decision recorded to episodes.db")
-        except Exception as e:
-            print(f"[RISK] block-record failed: {e}")
+        did = None
+        if getattr(self, 'shadow_recorder', None):
+            try:
+                analysis_ctx = {
+                    'direction': (option.get('type') or 'call').upper(),
+                    'momentum': dynamic_levels.get('momentum', 0),
+                    'confidence': option.get('score', 0),
+                    'should_trade': False,
+                }
+                did = self.shadow_recorder.on_decision(
+                    symbol=option['symbol'],
+                    underlying=underlying_symbol,
+                    analysis=analysis_ctx,
+                    quote=quote,
+                    entry_premium=(quote or {}).get('ask'),
+                    qty=qty,
+                    mode='live-paper-blocked',
+                    as_of=datetime.now().isoformat(),
+                    day_of_week=datetime.now().weekday(),
+                    risk=risk_verdict,
+                )
+                print("[RISK] Blocked decision recorded to episodes.db")
+            except Exception as e:
+                print(f"[RISK] block-record failed: {e}")
+
+        # Research ledger (flag-gated, fail-open): immutable snapshot of the
+        # rejected candidate with a machine reason code. Reuses the episode
+        # decision_id when the shadow recorder produced one.
+        if getattr(self, 'research_capture', None):
+            try:
+                _reason = (risk_verdict or {}).get('reason') or 'risk_blocked'
+                self.research_capture.on_candidate(
+                    decision_id=did, accepted=False,
+                    reject_code=f"risk_blocked:{_reason}",
+                    symbol=option.get('symbol'), underlying=underlying_symbol,
+                    quote=quote,
+                    direction=(option.get('type') or 'call').upper(),
+                    score=option.get('score'),
+                    signals={'momentum': dynamic_levels.get('momentum', 0)},
+                    sizing={'qty': qty}, risk=risk_verdict,
+                    dynamic_levels=dynamic_levels)
+            except Exception:
+                pass
 
     # ----------------------------------------------------------------------- #
     # Operational safety: duplicate guard / stale quote / fill readback /
@@ -3026,6 +3062,31 @@ class SmartOptionsTrader:
             if status in ('rejected', 'canceled', 'expired') and filled_qty <= 0:
                 print(f"[FILL] Order {order_id} {status} with no fill; no position opened.")
                 self.last_block_reason = f"the broker {status} the order with no fill"
+                # Research ledger (flag-gated, fail-open): the bot ACCEPTED this
+                # candidate and submitted an order, but the broker terminated it
+                # with no fill. Snapshot + submitted + reject events so the
+                # attempt is evidence, not silence.
+                if getattr(self, 'research_capture', None):
+                    try:
+                        _did = self.research_capture.on_candidate(
+                            decision_id=None, accepted=True,
+                            symbol=option.get('symbol'),
+                            underlying=underlying_symbol,
+                            quote={'bid': bid_price,
+                                   'ask': (current_option_price or {}).get('ask')},
+                            direction=(option.get('type') or 'call').upper(),
+                            score=option.get('score'),
+                            sizing={'qty': order_quantity},
+                            risk=risk_verdict,
+                            dynamic_levels=dynamic_levels)
+                        self.research_capture.on_order_submitted(
+                            _did, order_id, qty=order_quantity,
+                            event_at=(filled or {}).get('submitted_at'))
+                        self.research_capture.on_broker_reject(
+                            _did, order_id, status=status,
+                            reason=f'broker_{status}_no_fill')
+                    except Exception:
+                        pass
                 return None
 
             entry_ask = current_option_price['ask']  # quote ask drives cost model
@@ -3234,6 +3295,49 @@ class SmartOptionsTrader:
                 except Exception as e:
                     print(f"[RL] observe failed: {e}")
 
+            # Research ledger (flag-gated, fail-open): immutable snapshot of the
+            # ACCEPTED candidate plus append-only submitted/fill lifecycle events,
+            # under the SAME decision_id as episodes.db when the shadow recorder
+            # minted one (otherwise the ledger mints a uuid and we attach it to
+            # trade_info so the close path can find it). Never blocks the order.
+            if getattr(self, 'research_capture', None):
+                try:
+                    _metrics = trade_info.get('metrics') or {}
+                    _did = self.research_capture.on_candidate(
+                        decision_id=trade_info.get('decision_id'),
+                        accepted=True,
+                        symbol=option['symbol'],
+                        underlying=underlying_symbol,
+                        quote={'bid': trade_info.get('entry_bid'),
+                               'ask': trade_info.get('entry_ask')},
+                        underlying_price=trade_info.get('entry_underlying_price'),
+                        greeks={'iv': option.get('implied_volatility'),
+                                'delta': option.get('delta')},
+                        direction=action,
+                        score=option.get('score'),
+                        p_win=_metrics.get('probability_of_profit'),
+                        ev=_metrics.get('expected_value'),
+                        signals={'momentum': dynamic_levels.get('momentum', 0),
+                                 'volatility': dynamic_levels.get('volatility')},
+                        regime=dynamic_levels.get('market_regime'),
+                        sizing={'qty': order_quantity},
+                        risk=risk_verdict,
+                        dynamic_levels=dynamic_levels)
+                    if _did and not trade_info.get('decision_id'):
+                        trade_info['decision_id'] = _did
+                    self.research_capture.on_order_submitted(
+                        _did, order_id, qty=order_quantity,
+                        limit_price=entry_price,
+                        event_at=filled.get('submitted_at'))
+                    if filled_qty > 0:
+                        self.research_capture.on_fill(
+                            _did, order_id, qty=filled_qty, price=fill_price,
+                            status=status,
+                            partial=(status == 'partially_filled'),
+                            event_at=filled.get('filled_at'))
+                except Exception:
+                    pass
+
             # Save to active trades file (after decision_id is attached).
             self.save_active_trade(trade_info)
 
@@ -3248,6 +3352,28 @@ class SmartOptionsTrader:
         except Exception:
             print(f"[ORDER ERROR] Order rejected (HTTP {response.status_code})")
             self.last_block_reason = f"the broker rejected the order (HTTP {response.status_code})"
+        # Research ledger (flag-gated, fail-open): the bot ACCEPTED this
+        # candidate but the broker refused the submission at the HTTP layer.
+        # Snapshot + reject event so the attempt is evidence, not silence.
+        if getattr(self, 'research_capture', None):
+            try:
+                _did = self.research_capture.on_candidate(
+                    decision_id=None, accepted=True,
+                    symbol=option.get('symbol'),
+                    underlying=underlying_symbol,
+                    quote={'bid': bid_price,
+                           'ask': (current_option_price or {}).get('ask')},
+                    direction=(option.get('type') or 'call').upper(),
+                    score=option.get('score'),
+                    sizing={'qty': order_quantity},
+                    risk=risk_verdict,
+                    dynamic_levels=dynamic_levels,
+                    extra={'http_status': response.status_code})
+                self.research_capture.on_broker_reject(
+                    _did, status=str(response.status_code),
+                    reason=(self.last_block_reason or 'broker_rejected'))
+            except Exception:
+                pass
         return None
 
     def _build_evidence_ctx(self, underlying_symbol: str, option: Dict,
@@ -4060,6 +4186,23 @@ class SmartOptionsTrader:
                 print(f"[RL] Outcome recorded: {pnl_percent:+.1f}%")
             except Exception as e:
                 print(f"[RL] record_outcome failed: {e}")
+
+        # Research ledger (flag-gated, fail-open): append exit + realized
+        # outcome events to the decision's append-only lifecycle. Independent
+        # of the shadow recorder; never affects the close that just happened.
+        # pnl_percent here is GROSS; net-of-cost is left to the reconciler.
+        # exit_price is honest-None when unknown rather than estimated.
+        if getattr(self, 'research_capture', None) and trade.get('decision_id'):
+            try:
+                self.research_capture.on_exit(
+                    trade['decision_id'],
+                    order_id=trade.get('order_id'),
+                    qty=trade.get('quantity', 1) or 1,
+                    exit_price=trade.get('exit_price'),
+                    reason=outcome,
+                    gross_pnl_pct=pnl_percent)
+            except Exception:
+                pass
 
         # Oracle 3.0: semantic trade memory (analytics-only, opt-in, fail-open).
         # Append a context-only postmortem so a later decision can RETRIEVE
