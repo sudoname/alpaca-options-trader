@@ -2756,6 +2756,27 @@ class SmartOptionsTrader:
                             f"EV gate: expected value per dollar at risk "
                             f"({evpdr:+.4f}) is below the floor "
                             f"({self.min_ev_per_dollar_risk:+.4f})")
+                        # Research ledger (flag-gated, fail-open): rejected
+                        # candidate with a machine-readable reason code.
+                        if getattr(self, 'research_capture', None):
+                            try:
+                                self.research_capture.on_candidate(
+                                    decision_id=None, accepted=False,
+                                    reject_code='ev_gate:ev_per_dollar_risk_below_floor',
+                                    symbol=option.get('symbol'),
+                                    underlying=underlying_symbol,
+                                    quote={'bid': bid_price,
+                                           'ask': current_option_price.get('ask')},
+                                    direction=(option.get('type') or '').upper(),
+                                    score=option.get('score'),
+                                    p_win=gate_stamp.get('probability_of_profit'),
+                                    ev=gate_stamp.get('expected_value'),
+                                    sizing={'qty': order_quantity},
+                                    dynamic_levels=dynamic_levels,
+                                    extra={'ev_per_dollar_risk': evpdr,
+                                           'floor': self.min_ev_per_dollar_risk})
+                            except Exception:
+                                pass
                         return None
             except Exception as e:
                 print(f"[EV GATE] error (ignored): {e}")
@@ -2857,6 +2878,29 @@ class SmartOptionsTrader:
                         print(f"[PROFIT GATE] would-block: {reason}")
                     else:
                         self.last_block_reason = f"profitability gate: {reason}"
+                        # Research ledger (flag-gated, fail-open): rejected
+                        # candidate with a machine-readable reason code.
+                        if getattr(self, 'research_capture', None):
+                            try:
+                                _s = verdict.get('summary') or {}
+                                self.research_capture.on_candidate(
+                                    decision_id=None, accepted=False,
+                                    reject_code=f'profit_gate:{reason}',
+                                    symbol=option.get('symbol'),
+                                    underlying=underlying_symbol,
+                                    quote={'bid': bid_price,
+                                           'ask': current_option_price.get('ask')},
+                                    direction=(option.get('type') or '').upper(),
+                                    score=option.get('score'),
+                                    p_win=_s.get('probability_of_profit'),
+                                    ev=_s.get('expected_value'),
+                                    sizing={'qty': order_quantity},
+                                    dynamic_levels=dynamic_levels,
+                                    extra={'ev_per_dollar_risk':
+                                               _s.get('ev_per_dollar_risk'),
+                                           'orderbook_imbalance': ob_imb})
+                            except Exception:
+                                pass
                         return None
             except Exception as e:
                 print(f"[PROFIT GATE] error (ignored): {e}")
