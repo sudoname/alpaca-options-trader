@@ -1,5 +1,13 @@
 # Profitability Tuning Proposal (paper-only, for review)
 
+> **Update 2026-11-02:** `MAX_SPREAD_PCT` was relaxed `2 -> 5` and
+> `MAX_BUDGET_PER_TRADE` raised `500 -> 2000` in production. At 2%/$500 the
+> selector admitted zero candidates (every contract died on budget or spread),
+> so no evidence was accruing. 5% is a deliberate trade-off against the
+> friction findings below; the decision ledger (`RESEARCH_LAYER.md`) now
+> records every accepted/rejected candidate so the cost of the looser gate is
+> measurable rather than assumed.
+
 Branch: `profitability-tuning`. **No production changes are applied by this branch.**
 It contains (1) the exact `.env` changes to make on the server and (2) one small,
 flag-gated code change so the profitability gate can use a *calibrated* PoP.
