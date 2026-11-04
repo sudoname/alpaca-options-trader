@@ -1415,6 +1415,40 @@ class SmartOptionsTrader:
             return [float(bar['c']) for bar in bars]
         return []
 
+    def get_daily_bars(self, ticker: str = None, days: int = 40) -> Dict:
+        """Daily closes AND volumes (same endpoint as get_price_history).
+
+        Returns {'closes': [...], 'volumes': [...]}; empty lists on failure.
+        Used by the shadow strategy layer (volume confirmation).
+        """
+        symbol = ticker or self.ticker
+        if not symbol:
+            return {'closes': [], 'volumes': []}
+
+        end_time = datetime.now()
+        start_time = end_time - timedelta(days=days)
+        try:
+            response = requests.get(
+                f"{self.data_url}/v2/stocks/{symbol}/bars",
+                headers=self.headers,
+                params={
+                    'timeframe': '1Day',
+                    'start': start_time.strftime('%Y-%m-%d'),
+                    'end': end_time.strftime('%Y-%m-%d'),
+                    'limit': days + 5,
+                    'feed': 'iex'
+                }
+            )
+            if response.status_code == 200:
+                bars = response.json().get('bars', []) or []
+                return {
+                    'closes': [float(bar['c']) for bar in bars],
+                    'volumes': [float(bar.get('v') or 0) for bar in bars],
+                }
+        except Exception:
+            pass
+        return {'closes': [], 'volumes': []}
+
     def calculate_volatility(self, ticker: str = None) -> float:
         """Calculate historical volatility"""
         # ~30 calendar days (~20 trading bars / ~19 returns) for a stable

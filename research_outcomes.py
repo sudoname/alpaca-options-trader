@@ -281,6 +281,69 @@ class OutcomeReconciler:
                 summary["resolved"] += 1
         return summary
 
+    # --------------------------------- 5) shadow-strategy entry counterfactual
+    def resolve_shadow(self, horizon_min: float = 390.0) -> Dict:
+        """Resolve accepted shadow-strategy entries into SIMULATED outcomes.
+
+        Mirror of :meth:`resolve_skipped` for ``kind='shadow_candidate'`` rows
+        with ``accepted=True`` (a shadow strategy's would-be entries). Same
+        ``underlying_counterfactual_v1`` policy, same honest limits: this is
+        the forward underlying move in the shadow direction — never option
+        P/L, never mixed with realized results. The payload carries the
+        ``shadow_variant`` so per-variant reports can aggregate it.
+        """
+        summary = {"checked": 0, "resolved": 0, "no_entry_price": 0,
+                   "not_due": 0, "no_price": 0, "skipped_no_fetcher": 0}
+        if self.price_fn is None:
+            summary["skipped_no_fetcher"] = 1
+            return summary
+        import json as _json
+        from skip_counterfactual import counterfactual_return
+
+        already = set(self.ledger.decision_ids_with_event("outcome"))
+        cache: Dict[str, Optional[float]] = {}
+        for snap in self.ledger.snapshots(accepted=True, kind="shadow_candidate"):
+            if snap["decision_id"] in already:
+                continue
+            summary["checked"] += 1
+            ts = _parse_iso(snap.get("event_at_utc"))
+            if ts is None or (self.now - ts).total_seconds() / 60.0 < horizon_min:
+                summary["not_due"] += 1
+                continue
+            entry = _f(snap.get("underlying_price"))
+            if entry is None or entry <= 0:
+                summary["no_entry_price"] += 1
+                continue
+            und = snap.get("underlying")
+            if und not in cache:
+                try:
+                    cache[und] = self.price_fn(und)
+                except Exception:
+                    cache[und] = None
+            now_px = cache[und]
+            cf = counterfactual_return(snap.get("direction"), entry, now_px)
+            if cf is None:
+                summary["no_price"] += 1
+                continue
+            variant = None
+            try:
+                variant = (_json.loads(snap.get("extra_json") or "{}")
+                           or {}).get("shadow_variant")
+            except ValueError:
+                pass
+            if self._emit(
+                decision_id=snap["decision_id"], event_type="outcome",
+                price=now_px,
+                event_at=self.now.isoformat(),
+                payload={"class": "simulated", "policy": SKIP_POLICY,
+                         "horizon_min": horizon_min,
+                         "entry_underlying_price": entry,
+                         "counterfactual_pnl_pct": cf,
+                         "shadow_variant": variant},
+            ):
+                summary["resolved"] += 1
+        return summary
+
     # --------------------------------------------------------- classification
     def classify(self) -> Dict:
         """Count decisions by outcome class: realized / simulated / unresolved."""
@@ -312,6 +375,7 @@ class OutcomeReconciler:
             out["activities"] = self.reconcile_activities(activities_after)
         out["expired"] = self.reconcile_expired()
         out["skipped"] = self.resolve_skipped(horizon_min=skip_horizon_min)
+        out["shadow"] = self.resolve_shadow(horizon_min=skip_horizon_min)
         out["classes"] = self.classify()
         return out
 

@@ -168,6 +168,54 @@ python -m pytest tests/test_research_layer.py -v
 * `compare shadow` requires the shadow variant to have logged against the same
   decision ids as baseline; disjoint cohorts produce a note, not a verdict.
 
+## Shadow strategies (observe-only strategy experiments)
+
+`shadow_strategies.py` adds a pluggable strategy interface plus two
+observe-only strategies that evaluate the same symbol universe as the live
+scanner every entry-window cycle and log their would-be trades into the
+ledger as `kind='shadow_candidate'` rows (via the existing fail-open
+`ShadowComparator`). **They place no orders, feed no gate, and change no
+live behavior.** Default OFF.
+
+* `simons_meanrev` — cross-sectional mean reversion: z-score of the last
+  close vs a 20-day SMA; z <= -1.5 → CALL (oversold), z >= +1.5 → PUT
+  (overbought); only the top-K by |z| per cycle are "accepted", the rest log
+  `shadow:not_top_k`.
+* `soros_momentum` — 5-day momentum with volume confirmation: |5d return| >
+  2% with last volume > 1.2x the 20-day average; exhaustion filter rejects
+  moves > 2 sigma*sqrt(3) over 3 days (`shadow:exhausted`).
+
+Enable with `ENABLE_SHADOW_STRATEGIES=1` (requires the decision ledger to be
+on). Strategy selection and parameters: `SHADOW_STRATEGY_LIST`,
+`SHADOW_SIMONS_WINDOW/Z_ENTRY/TOP_K`, `SHADOW_SOROS_MOM_THRESH/VOL_MULT`,
+`SHADOW_CF_HORIZON_MIN` (resolution horizon, default 390 min = one session).
+On start the scheduler logs `[SHADOW-STRAT] active: <variants>`.
+
+Scoring: `reconcile --apply` (or the scheduler's periodic reconciler) runs
+`resolve_shadow()`, which after the horizon prices the underlying move and
+writes an idempotent outcome event with
+`payload.class='simulated'`, `policy='underlying_counterfactual_v1'`, and
+`counterfactual_pnl_pct` (CALL = underlying up %, PUT = underlying down %).
+**All shadow outcomes are underlying-move counterfactuals, not option P/L**
+— good for measuring direction edge, not cost/exit tuning. Because the rows
+are `kind='shadow_candidate'` and the outcomes `class='simulated'`, nothing
+shadow ever enters baseline analytics or validation metrics.
+
+Read results with:
+
+```bash
+python research_cli.py compare shadow --variant simons_meanrev
+python research_cli.py compare shadow --variant soros_momentum
+```
+
+The output includes a `counterfactual_outcomes` block: n entries, n
+resolved, hit-rate (counterfactual_pnl_pct > 0), avg/median pnl %, and a
+per-direction split. Promotion of a variant to live trading is deliberately
+NOT automated — it would be a separate explicit human change.
+
+Rollback: set `ENABLE_SHADOW_STRATEGIES=0` and restart; existing shadow rows
+stay in the ledger but nothing new is written or resolved.
+
 ## Rollback
 
 1. Set `ENABLE_DECISION_LEDGER=0` (or remove it) and restart the bot — the

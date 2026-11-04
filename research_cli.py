@@ -42,6 +42,58 @@ def _print(obj):
     print(json.dumps(obj, indent=2, default=str))
 
 
+def _shadow_outcome_summary(led, variant, since=None, until=None):
+    """Counterfactual outcome summary for one shadow variant.
+
+    Joins accepted ``shadow_candidate`` snapshots for the variant to their
+    ``class: simulated`` outcome events (written by
+    research_outcomes.resolve_shadow). Underlying-move counterfactuals only —
+    not option P/L.
+    """
+    marker = f'"shadow_variant": "{variant}"'
+    entries = {}  # decision_id -> direction
+    for s in led.snapshots(since=since, until=until, kind="shadow_candidate"):
+        if s.get("accepted") and marker in (s.get("extra_json") or ""):
+            entries[s["decision_id"]] = s.get("direction") or "?"
+    out = {"n_entries": len(entries), "n_resolved": 0, "hit_rate": None,
+           "avg_pnl_pct": None, "median_pnl_pct": None, "by_direction": {}}
+    if not entries:
+        return out
+    pnls, by_dir = [], {}
+    rows = led._rows("SELECT decision_id, payload_json FROM events "
+                     "WHERE event_type = 'outcome'", ())
+    for r in rows:
+        did = r["decision_id"]
+        if did not in entries:
+            continue
+        try:
+            payload = json.loads(r.get("payload_json") or "{}") or {}
+        except ValueError:
+            continue
+        if payload.get("class") != "simulated":
+            continue
+        pnl = payload.get("counterfactual_pnl_pct")
+        if not isinstance(pnl, (int, float)):
+            continue
+        pnls.append(float(pnl))
+        by_dir.setdefault(entries[did], []).append(float(pnl))
+    if pnls:
+        pnls.sort()
+        n = len(pnls)
+        mid = n // 2
+        med = pnls[mid] if n % 2 else (pnls[mid - 1] + pnls[mid]) / 2.0
+        out["n_resolved"] = n
+        out["hit_rate"] = round(sum(1 for p in pnls if p > 0) / n, 4)
+        out["avg_pnl_pct"] = round(sum(pnls) / n, 4)
+        out["median_pnl_pct"] = round(med, 4)
+        for d, vals in sorted(by_dir.items()):
+            out["by_direction"][d] = {
+                "n": len(vals),
+                "hit_rate": round(sum(1 for p in vals if p > 0) / len(vals), 4),
+                "avg_pnl_pct": round(sum(vals) / len(vals), 4)}
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Commands
 # --------------------------------------------------------------------------- #
@@ -120,8 +172,11 @@ def cmd_compare(args) -> int:
         from research_experiments import compare_shadow_to_baseline
         led = _open_ledger(args.db)
         try:
-            _print(compare_shadow_to_baseline(
-                led, args.variant, since=args.since, until=args.until))
+            out = compare_shadow_to_baseline(
+                led, args.variant, since=args.since, until=args.until)
+            out["counterfactual_outcomes"] = _shadow_outcome_summary(
+                led, args.variant, since=args.since, until=args.until)
+            _print(out)
             return 0
         finally:
             led.close()
@@ -285,6 +340,21 @@ def _seed_demo_ledger(path: str, n: int = 8) -> None:
         symbol="SPY261218C00500000", direction="CALL", score=6.0,
         strategy_version="shadow:v2", extra={"shadow_variant": "v2"},
         event_at="2026-10-01T14:30:00+00:00")
+    # One shadow-only snapshot with a resolved simulated counterfactual.
+    led.record_snapshot(
+        decision_id="shadow-cf-0", kind="shadow_candidate", accepted=True,
+        symbol="QQQ", underlying="QQQ", underlying_price=400.0,
+        direction="CALL", score=7.0,
+        strategy_version="shadow:v2", extra={"shadow_variant": "v2"},
+        event_at="2026-10-02T14:30:00+00:00")
+    led.record_event(
+        decision_id="shadow-cf-0", event_type="outcome", price=410.0,
+        event_at="2026-10-02T21:00:00+00:00",
+        payload={"class": "simulated",
+                 "policy": "underlying_counterfactual_v1",
+                 "entry_underlying_price": 400.0,
+                 "counterfactual_pnl_pct": 2.5,
+                 "shadow_variant": "v2"})
     led.close()
 
 
@@ -338,7 +408,7 @@ def _self_test() -> int:
         led = ResearchLedger(db)
         n_events = led.stats()["events"]
         led.close()
-        if n_events != 8 * 4:
+        if n_events != 8 * 4 + 1:   # +1 seeded shadow counterfactual outcome
             print("FAIL: dry-run reconcile wrote events", n_events); ok = False
 
         # replay single scenario
@@ -377,10 +447,17 @@ def _self_test() -> int:
         # compare shadow
         code, out = _run_json(["compare", "shadow", "--db", db,
                                "--variant", "v2"])
-        if code != 0 or out.get("shadow", {}).get("n") != 1:
+        if code != 0 or out.get("shadow", {}).get("n") != 2:
             print("FAIL: compare shadow", code, out); ok = False
         if out.get("shared_decision_ids") != 1:
             print("FAIL: shadow overlap", out); ok = False
+        cf = out.get("counterfactual_outcomes", {})
+        if cf.get("n_entries") != 2 or cf.get("n_resolved") != 1:
+            print("FAIL: shadow counterfactual counts", cf); ok = False
+        if cf.get("hit_rate") != 1.0 or cf.get("avg_pnl_pct") != 2.5:
+            print("FAIL: shadow counterfactual stats", cf); ok = False
+        if cf.get("by_direction", {}).get("CALL", {}).get("n") != 1:
+            print("FAIL: shadow counterfactual by_direction", cf); ok = False
         code, _ = _run_json(["compare", "shadow", "--db", db])
         if code != 2:
             print("FAIL: shadow without --variant should exit 2"); ok = False

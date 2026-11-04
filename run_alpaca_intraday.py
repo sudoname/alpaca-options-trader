@@ -134,6 +134,17 @@ class Config:
         # declined setup is logged before its forward-underlying-return outcome
         # is resolved. ~390 = one trading day, so skips resolve next session.
         self.skip_cf_horizon_min = int(get("SKIP_CF_HORIZON_MIN", "390"))
+        # Shadow strategy layer (observe-only; default OFF). Shadow strategies
+        # evaluate the same universe each entry-window scan and log would-be
+        # trades as kind='shadow_candidate' ledger rows; outcomes resolve as
+        # simulated underlying-move counterfactuals after SHADOW_CF_HORIZON_MIN.
+        self.enable_shadow_strategies = _truthy(get("ENABLE_SHADOW_STRATEGIES", "0"))
+        self.shadow_strategy_list = [
+            s.strip() for s in
+            get("SHADOW_STRATEGY_LIST", "simons_meanrev,soros_momentum").split(",")
+            if s.strip()
+        ]
+        self.shadow_cf_horizon_min = int(get("SHADOW_CF_HORIZON_MIN", "390"))
         if armed_override is None:
             self.armed = _truthy(get("SCHEDULER_ARMED", "0"))
         else:
@@ -412,6 +423,28 @@ class IntradayScheduler:
         # pure-helper --selftest stays deterministic.
         self.base_symbols = list(config.symbols)
         self.symbols = list(config.symbols)
+        # Shadow strategy runner (observe-only, flag-gated, fail-open). Only
+        # constructed when ENABLE_SHADOW_STRATEGIES is truthy AND the research
+        # ledger is active on the trader; a construction error leaves it None.
+        self.shadow_runner = None
+        try:
+            if (getattr(config, "enable_shadow_strategies", False)
+                    and trader is not None
+                    and getattr(trader, "research_capture", None) is not None):
+                from shadow_strategies import ShadowStrategyRunner, build_strategies
+                strategies = build_strategies(config.shadow_strategy_list)
+                if strategies:
+                    self.shadow_runner = ShadowStrategyRunner(
+                        trader.research_capture._ledger,
+                        strategies,
+                        fetch_bars=trader.get_daily_bars,
+                        fetch_price=trader.get_current_price,
+                    )
+                    log("[SHADOW-STRAT] active: "
+                        + ",".join(s.variant for s in strategies))
+        except Exception as e:
+            self.shadow_runner = None
+            log(f"[WARN] shadow strategy runner unavailable: {e}")
 
     # -- trading universe ---------------------------------------------------- #
     def _refresh_universe(self):
@@ -555,6 +588,28 @@ class IntradayScheduler:
                 log(f"[SKIP-CF] resolved {n} counterfactual skips")
         except Exception as e:
             log(f"[WARN] skip-counterfactual resolve failed: {e}")
+
+    def _resolve_shadow_counterfactuals(self):
+        """Resolve due shadow-strategy entries into simulated outcome events.
+
+        No-op unless the shadow runner is active (which implies the research
+        ledger is too). Same cadence and fail-open pattern as
+        _resolve_skip_counterfactuals."""
+        if self.shadow_runner is None:
+            return
+        cap = getattr(self.trader, "research_capture", None)
+        ledger = getattr(cap, "_ledger", None) if cap else None
+        if ledger is None:
+            return
+        try:
+            from research_outcomes import OutcomeReconciler
+            rec = OutcomeReconciler(
+                ledger, price_fn=self.trader.get_current_price, apply=True)
+            s = rec.resolve_shadow(horizon_min=self.cfg.shadow_cf_horizon_min)
+            if s.get("resolved"):
+                log(f"[SHADOW-STRAT] resolved {s['resolved']} counterfactual outcomes")
+        except Exception as e:
+            log(f"[WARN] shadow-counterfactual resolve failed: {e}")
 
     def _record_capskip_cf(self, sym, base_cap, eff_cap, held, low_iv, rvol):
         """Record the contract the per-underlying cap just blocked as a SKIP
@@ -797,7 +852,10 @@ class IntradayScheduler:
     def _rank_and_enter(self):
         """Evaluate the whole universe, rank by score (desc), then enter in that
         order. Armed mode stops at max_new_trades_per_day so the cap fills with
-        the highest-scoring setups; dry-run previews all candidates, ranked."""
+        the highest-scoring setups; dry-run previews all candidates, ranked.
+
+        Returns the (sorted) candidate list so observe-only consumers (shadow
+        strategies) can see what the baseline considered this scan."""
         candidates = []
         for sym in self.symbols:
             try:
@@ -810,7 +868,7 @@ class IntradayScheduler:
 
         if not candidates:
             log("[ENTRY] no candidates this scan")
-            return
+            return candidates
 
         candidates.sort(key=lambda c: c["score"], reverse=True)
         log("[RANK] " + ", ".join(f"{c['sym']}({c['score']:.0f})" for c in candidates))
@@ -823,6 +881,7 @@ class IntradayScheduler:
                 self._enter_candidate(cand)
             except Exception as e:
                 log(f"[WARN] entry attempt failed for {cand['sym']}: {e}")
+        return candidates
 
     # -- heartbeat ----------------------------------------------------------- #
     def _write_status(self, parsed):
@@ -880,6 +939,10 @@ class IntradayScheduler:
         # created_at the episode store stamps at decision time (no tz drift).
         self._resolve_skip_counterfactuals()
 
+        # 1f) resolve due shadow-strategy entries (simulated counterfactuals).
+        # No-op unless the shadow runner is active; fail-open.
+        self._resolve_shadow_counterfactuals()
+
         # 1c) time stop (hold-overnight mode): positions held past
         # MAX_HOLD_DAYS calendar days are force-closed so nothing rots while
         # waiting on a TP/SL that never resolves. No-op when disabled (0).
@@ -930,12 +993,22 @@ class IntradayScheduler:
         if in_entry_window(parsed["now"], parsed["next_close"],
                            start_et=self.cfg.entry_start_et,
                            cutoff_min=self.cfg.entry_cutoff_min):
+            candidates = []
             if self.trades_today >= self.cfg.max_new_trades_per_day:
                 log(f"[CAP] reached max_new_trades_per_day={self.cfg.max_new_trades_per_day}")
             elif not self._pdt_ok():
                 log("[PDT] no day-trade headroom; skipping entries")
             else:
-                self._rank_and_enter()
+                candidates = self._rank_and_enter() or []
+            # Shadow strategies observe every entry-window scan, even when the
+            # live cap/PDT blocked entries this cycle. Observe-only; fail-open.
+            if self.shadow_runner is not None:
+                try:
+                    s = self.shadow_runner.run_cycle(self.symbols, candidates)
+                    if s.get("submitted"):
+                        log(f"[SHADOW-STRAT] logged {s['submitted']} shadow decisions")
+                except Exception as e:
+                    log(f"[WARN] shadow strategy cycle failed: {e}")
         else:
             mtc = minutes_to_close(parsed["now"], parsed["next_close"])
             log(f"[WAIT] outside entry window (min_to_close={mtc:.0f})")
