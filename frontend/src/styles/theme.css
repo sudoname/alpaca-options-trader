@@ -1,28 +1,33 @@
+/*
+ * Anduril-style tactical palette: near-black monochrome base, amber accent.
+ * Dark-only app — :root and .dark are intentionally identical so a stale
+ * theme cookie can never flip the dashboard to a light palette.
+ */
 :root {
-  --radius: 0.625rem;
-  --background: oklch(1 0 0);
-  --foreground: oklch(0.129 0.042 264.695);
-  --card: oklch(1 0 0);
-  --card-foreground: oklch(0.129 0.042 264.695);
-  --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.129 0.042 264.695);
-  --primary: oklch(0.208 0.042 265.755);
-  --primary-foreground: oklch(0.984 0.003 247.858);
-  --secondary: oklch(0.968 0.007 247.896);
-  --secondary-foreground: oklch(0.208 0.042 265.755);
-  --muted: oklch(0.968 0.007 247.896);
-  --muted-foreground: oklch(0.554 0.046 257.417);
-  --accent: oklch(0.968 0.007 247.896);
-  --accent-foreground: oklch(0.208 0.042 265.755);
-  --destructive: oklch(0.577 0.245 27.325);
-  --border: oklch(0.929 0.013 255.508);
-  --input: oklch(0.929 0.013 255.508);
-  --ring: oklch(0.704 0.04 256.788);
-  --chart-1: oklch(0.646 0.222 41.116);
-  --chart-2: oklch(0.6 0.118 184.704);
-  --chart-3: oklch(0.398 0.07 227.392);
-  --chart-4: oklch(0.828 0.189 84.429);
-  --chart-5: oklch(0.769 0.188 70.08);
+  --radius: 0rem;
+  --background: #0a0a0a;
+  --foreground: #e6e6e6;
+  --card: #0e0e0e;
+  --card-foreground: #e6e6e6;
+  --popover: #0e0e0e;
+  --popover-foreground: #e6e6e6;
+  --primary: #ffb000;
+  --primary-foreground: #0a0a0a;
+  --secondary: #161616;
+  --secondary-foreground: #e6e6e6;
+  --muted: #141414;
+  --muted-foreground: #8a8a8a;
+  --accent: #161616;
+  --accent-foreground: #e6e6e6;
+  --destructive: #f85149;
+  --border: #1f1f1f;
+  --input: #262626;
+  --ring: #ffb000;
+  --chart-1: #ffb000;
+  --chart-2: #3fb950;
+  --chart-3: #d29922;
+  --chart-4: #e6e6e6;
+  --chart-5: #f85149;
 
   --sidebar: var(--background);
   --sidebar-foreground: var(--foreground);
@@ -35,40 +40,42 @@
 }
 
 .dark {
-  /* GitHub-dark palette (matches the legacy Oracle dashboard) */
-  --background: #0d1117;
-  --foreground: #c9d1d9;
-  --card: #161b22;
-  --card-foreground: #c9d1d9;
-  --popover: #161b22;
-  --popover-foreground: #c9d1d9;
-  --primary: #58a6ff;
-  --primary-foreground: #0d1117;
-  --secondary: #21262d;
-  --secondary-foreground: #c9d1d9;
-  --muted: #161b22;
-  --muted-foreground: #8b949e;
-  --accent: #21262d;
-  --accent-foreground: #c9d1d9;
+  --background: #0a0a0a;
+  --foreground: #e6e6e6;
+  --card: #0e0e0e;
+  --card-foreground: #e6e6e6;
+  --popover: #0e0e0e;
+  --popover-foreground: #e6e6e6;
+  --primary: #ffb000;
+  --primary-foreground: #0a0a0a;
+  --secondary: #161616;
+  --secondary-foreground: #e6e6e6;
+  --muted: #141414;
+  --muted-foreground: #8a8a8a;
+  --accent: #161616;
+  --accent-foreground: #e6e6e6;
   --destructive: #f85149;
-  --border: #30363d;
-  --input: #30363d;
-  --ring: #58a6ff;
-  --chart-1: #58a6ff;
+  --border: #1f1f1f;
+  --input: #262626;
+  --ring: #ffb000;
+  --chart-1: #ffb000;
   --chart-2: #3fb950;
   --chart-3: #d29922;
-  --chart-4: #bc8cff;
+  --chart-4: #e6e6e6;
   --chart-5: #f85149;
 }
 
 @theme inline {
   --font-inter: 'Inter', 'sans-serif';
   --font-manrope: 'Manrope', 'sans-serif';
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
 
-  --radius-sm: calc(var(--radius) - 4px);
-  --radius-md: calc(var(--radius) - 2px);
-  --radius-lg: var(--radius);
-  --radius-xl: calc(var(--radius) + 4px);
+  /* HUD look: hard-zero every radius step (the calc chain would otherwise
+     leave rounded-xl at 4px even with --radius: 0). */
+  --radius-sm: 0px;
+  --radius-md: 0px;
+  --radius-lg: 0px;
+  --radius-xl: 0px;
   --color-background: var(--background);
   --color-foreground: var(--foreground);
   --color-card: var(--card);

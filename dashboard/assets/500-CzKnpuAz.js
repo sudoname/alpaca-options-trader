@@ -1,0 +1,1 @@
+import{c as e}from"./index-D7D-RFN0.js";var t=e;export{t as component};

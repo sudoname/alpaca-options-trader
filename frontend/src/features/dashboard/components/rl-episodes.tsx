@@ -48,7 +48,6 @@ export function RlEpisodes() {
             <Bar
               dataKey='count'
               fill={ORA.accent}
-              radius={[3, 3, 0, 0]}
               isAnimationActive={false}
             />
           </BarChart>

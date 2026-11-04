@@ -1,6 +1,7 @@
 import { type ReactNode } from 'react'
 import { cn } from '@/lib/utils'
 import { Card, CardContent } from '@/components/ui/card'
+import { HudCorners } from './chart-card'
 
 type StatCardProps = {
   label: string
@@ -28,13 +29,14 @@ export function StatCard({
           : ''
       : ''
   return (
-    <Card>
+    <Card className='relative gap-0 py-0'>
+      <HudCorners />
       <CardContent className='px-4 py-3'>
-        <div className='text-muted-foreground text-xs font-medium tracking-wide uppercase'>
+        <div className='text-muted-foreground font-mono text-[10px] font-medium tracking-[0.18em] uppercase'>
           {label}
         </div>
         <div
-          className={cn('mt-1 text-2xl font-bold', signClass)}
+          className={cn('mt-1 font-mono text-2xl font-bold tabular-nums', signClass)}
           style={valueColor ? { color: valueColor } : undefined}
         >
           {value}

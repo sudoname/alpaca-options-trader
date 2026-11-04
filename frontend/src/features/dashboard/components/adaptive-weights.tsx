@@ -43,7 +43,6 @@ export function AdaptiveWeights() {
             <Bar
               dataKey='weight'
               fill={ORA.accent}
-              radius={[3, 3, 0, 0]}
               isAnimationActive={false}
             />
           </BarChart>

@@ -46,7 +46,6 @@ export function FeatureImportance() {
             <Bar
               dataKey='importance'
               fill={ORA.green}
-              radius={[0, 3, 3, 0]}
               isAnimationActive={false}
             />
           </BarChart>

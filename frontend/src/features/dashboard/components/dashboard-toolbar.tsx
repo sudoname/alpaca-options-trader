@@ -7,9 +7,9 @@ import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 
 const STATUS_STYLES: Record<string, string> = {
-  live: 'bg-[#3fb950]/15 text-[#3fb950]',
-  refreshing: 'bg-[#58a6ff]/15 text-[#58a6ff]',
-  error: 'bg-[#f85149]/15 text-[#f85149]',
+  live: 'border-[#3fb950]/40 bg-[#3fb950]/10 text-[#3fb950]',
+  refreshing: 'border-[#ffb000]/40 bg-[#ffb000]/10 text-[#ffb000]',
+  error: 'border-[#f85149]/40 bg-[#f85149]/10 text-[#f85149]',
 }
 
 export function DashboardToolbar() {
@@ -21,14 +21,15 @@ export function DashboardToolbar() {
     <div className='flex flex-wrap items-center gap-3'>
       <span
         className={cn(
-          'rounded-full px-2.5 py-0.5 text-xs font-medium',
+          'flex items-center gap-1.5 border px-2 py-0.5 font-mono text-[10px] font-medium tracking-[0.15em] uppercase',
           STATUS_STYLES[status]
         )}
       >
+        <span aria-hidden className='size-1.5 animate-pulse bg-current' />
         {status}
       </span>
       {lastUpdated ? (
-        <span className='text-muted-foreground text-xs'>
+        <span className='text-muted-foreground font-mono text-[10px] tracking-[0.1em] uppercase'>
           updated {lastUpdated.toLocaleTimeString()}
         </span>
       ) : null}
@@ -38,7 +39,10 @@ export function DashboardToolbar() {
           checked={autoRefresh}
           onCheckedChange={setAutoRefresh}
         />
-        <Label htmlFor='autorefresh' className='text-muted-foreground text-xs'>
+        <Label
+          htmlFor='autorefresh'
+          className='text-muted-foreground font-mono text-[10px] tracking-[0.1em] uppercase'
+        >
           Auto-refresh
         </Label>
       </div>

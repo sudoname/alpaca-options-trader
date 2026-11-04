@@ -65,7 +65,6 @@ export function EvAttribution() {
               dataKey='win_rate'
               name='win rate'
               fill={ORA.accent}
-              radius={[3, 3, 0, 0]}
               isAnimationActive={false}
             />
             <Line

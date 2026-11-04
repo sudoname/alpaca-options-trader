@@ -15,6 +15,17 @@
   }
   body {
     @apply min-h-svh w-full bg-background text-foreground has-[div[data-variant='inset']]:bg-sidebar;
+    /* HUD hairline grid */
+    background-image:
+      linear-gradient(to right, rgb(255 255 255 / 0.015) 1px, transparent 1px),
+      linear-gradient(to bottom, rgb(255 255 255 / 0.015) 1px, transparent 1px);
+    background-size: 48px 48px;
+  }
+
+  /* Monospace tick labels on all recharts axes */
+  .recharts-cartesian-axis-tick-value,
+  .recharts-polar-angle-axis-tick-value {
+    font-family: var(--font-mono);
   }
 
   /* Override Radix scroll locking for sticky headers */
@@ -55,6 +66,17 @@
 
 @utility faded-bottom {
   @apply after:pointer-events-none after:absolute after:inset-s-0 after:bottom-0 after:hidden after:h-32 after:w-full after:rounded-b-2xl after:bg-[linear-gradient(180deg,transparent_10%,var(--background)_70%)] md:after:block;
+}
+
+/* HUD section numbering: panels whose titles carry .hud-index are numbered
+   automatically ("01 / ", "02 / ", ...) in DOM order within .hud-sections. */
+.hud-sections {
+  counter-reset: hud-section;
+}
+.hud-sections .hud-index::before {
+  counter-increment: hud-section;
+  content: counter(hud-section, decimal-leading-zero) ' / ';
+  color: var(--color-primary);
 }
 
 /* styles.css */

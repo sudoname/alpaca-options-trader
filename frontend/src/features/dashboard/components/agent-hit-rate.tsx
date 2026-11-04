@@ -60,7 +60,6 @@ export function AgentHitRate() {
             <Bar
               dataKey='hit_rate'
               fill={ORA.accent}
-              radius={[0, 3, 3, 0]}
               isAnimationActive={false}
             />
           </BarChart>

@@ -54,9 +54,9 @@ export function Gauge({
         <path
           d={arcPath(0, 1)}
           fill='none'
-          stroke='#1c2330'
+          stroke={ORA.grid}
           strokeWidth={SW}
-          strokeLinecap='round'
+          strokeLinecap='butt'
         />
         {bands ? (
           // Banded variant: one colored segment per Fear & Greed band.
@@ -76,7 +76,7 @@ export function Gauge({
             fill='none'
             stroke={color}
             strokeWidth={SW}
-            strokeLinecap='round'
+            strokeLinecap='butt'
           />
         )}
         {bands ? (
@@ -105,6 +105,7 @@ export function Gauge({
           textAnchor='middle'
           fontSize='30'
           fontWeight='700'
+          fontFamily={ORA.mono}
           fill={valueColor}
         >
           {valueText}
