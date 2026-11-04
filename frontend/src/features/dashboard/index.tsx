@@ -16,6 +16,7 @@ import { RegimeCard } from './components/regime-card'
 import { RegimePerformance } from './components/regime-performance'
 import { RlEpisodes } from './components/rl-episodes'
 import { SentimentCard } from './components/sentiment-card'
+import { ShadowResearch } from './components/shadow-research'
 
 export function Dashboard() {
   return (
@@ -50,6 +51,10 @@ export function Dashboard() {
 
         <div className='mt-4'>
           <PutTimeStop />
+        </div>
+
+        <div className='mt-4'>
+          <ShadowResearch />
         </div>
 
         <div className='mt-4'>

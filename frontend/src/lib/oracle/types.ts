@@ -209,3 +209,37 @@ export type PutTimeStop = ApiEnvelope & {
   count_hurt?: number | null
   boundaries?: PutTimeStopBoundary[]
 }
+
+export type ShadowVariantStats = {
+  variant?: string
+  n_candidates?: number | null
+  n_accepted?: number | null
+  n_resolved?: number | null
+  hit_rate?: number | null
+  avg_pnl_pct?: number | null
+  median_pnl_pct?: number | null
+  reject_codes?: Record<string, number>
+  by_direction?: Record<
+    string,
+    { n?: number | null; hit_rate?: number | null; avg_pnl_pct?: number | null }
+  >
+}
+
+export type ShadowCandidateRow = {
+  at?: string
+  variant?: string
+  underlying?: string
+  direction?: string
+  score?: number | null
+  underlying_price?: number | null
+  accepted?: boolean
+  reject_code?: string | null
+  pnl_pct?: number | null
+}
+
+export type ShadowResearch = ApiEnvelope & {
+  n_candidates?: number | null
+  n_accepted?: number | null
+  variants?: ShadowVariantStats[]
+  recent?: ShadowCandidateRow[]
+}

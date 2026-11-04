@@ -421,6 +421,112 @@ def create_app(config: "DashboardConfig" = None) -> Flask:
             return drv2._json_safe(report)
         return _cached_json("daily-v2", provider)
 
+    # -- shadow strategies: observe-only research panel ------------------- #
+    # Read-only view over research_ledger.db ``kind='shadow_candidate'`` rows
+    # (written live by the flag-gated ShadowStrategyRunner) plus their
+    # ``class=simulated`` counterfactual outcomes. These are underlying-move
+    # counterfactuals, NOT option P/L. Pure/fail-open: a missing ledger yields
+    # INSUFFICIENT_DATA; the db is never created by the dashboard.
+    @app.route("/api/shadow-research")
+    def shadow_research():
+        def provider():
+            import json as _json
+            db = "research_ledger.db"
+            if not os.path.isfile(db):
+                return {"verdict": VERDICT_INSUFFICIENT,
+                        "variants": [], "recent": []}
+            from research_ledger import ResearchLedger
+            led = ResearchLedger(db)
+            try:
+                rows = led.snapshots(kind="shadow_candidate")
+                pnl_by_id = {}
+                for e in led._rows(
+                        "SELECT decision_id, payload_json FROM events "
+                        "WHERE event_type = 'outcome'", ()):
+                    try:
+                        p = _json.loads(e.get("payload_json") or "{}") or {}
+                    except ValueError:
+                        continue
+                    pnl = p.get("counterfactual_pnl_pct")
+                    if p.get("class") == "simulated" \
+                            and isinstance(pnl, (int, float)):
+                        pnl_by_id[e["decision_id"]] = float(pnl)
+            finally:
+                led.close()
+
+            def _variant_of(r):
+                try:
+                    extra = _json.loads(r.get("extra_json") or "{}") or {}
+                except ValueError:
+                    extra = {}
+                v = extra.get("shadow_variant")
+                if v:
+                    return str(v)
+                sv = str(r.get("strategy_version") or "")
+                return sv[7:] if sv.startswith("shadow:") else (sv or "?")
+
+            by_variant: dict = {}
+            recent = []
+            for r in rows:
+                var = _variant_of(r)
+                agg = by_variant.setdefault(var, {
+                    "variant": var, "n_candidates": 0, "n_accepted": 0,
+                    "reject_codes": {}, "pnls": [], "by_direction": {}})
+                agg["n_candidates"] += 1
+                accepted = bool(r.get("accepted"))
+                pnl = pnl_by_id.get(r.get("decision_id"))
+                if accepted:
+                    agg["n_accepted"] += 1
+                    if pnl is not None:
+                        agg["pnls"].append(pnl)
+                        d = r.get("direction") or "?"
+                        agg["by_direction"].setdefault(d, []).append(pnl)
+                else:
+                    code = r.get("reject_code") or "?"
+                    agg["reject_codes"][code] = \
+                        agg["reject_codes"].get(code, 0) + 1
+                recent.append({
+                    "at": r.get("event_at_utc"),
+                    "variant": var,
+                    "underlying": r.get("underlying") or r.get("symbol"),
+                    "direction": r.get("direction"),
+                    "score": r.get("score"),
+                    "underlying_price": r.get("underlying_price"),
+                    "accepted": accepted,
+                    "reject_code": r.get("reject_code"),
+                    "pnl_pct": pnl,
+                })
+
+            variants = []
+            for var in sorted(by_variant):
+                agg = by_variant[var]
+                pnls = sorted(agg.pop("pnls"))
+                dirs = agg.pop("by_direction")
+                n = len(pnls)
+                agg["n_resolved"] = n
+                agg["hit_rate"] = \
+                    round(sum(1 for p in pnls if p > 0) / n, 4) if n else None
+                agg["avg_pnl_pct"] = round(sum(pnls) / n, 4) if n else None
+                agg["median_pnl_pct"] = round(
+                    pnls[n // 2] if n % 2 else
+                    (pnls[n // 2 - 1] + pnls[n // 2]) / 2.0, 4) if n else None
+                agg["by_direction"] = {
+                    d: {"n": len(v),
+                        "hit_rate": round(
+                            sum(1 for p in v if p > 0) / len(v), 4),
+                        "avg_pnl_pct": round(sum(v) / len(v), 4)}
+                    for d, v in sorted(dirs.items())}
+                variants.append(agg)
+
+            recent.sort(key=lambda x: str(x.get("at") or ""), reverse=True)
+            verdict = "OK" if rows else VERDICT_INSUFFICIENT
+            return {"verdict": verdict,
+                    "n_candidates": len(rows),
+                    "n_accepted": sum(v["n_accepted"] for v in variants),
+                    "variants": variants,
+                    "recent": recent[:50]}
+        return _cached_json("shadow-research", provider)
+
     # -- static frontend ------------------------------------------------- #
     @app.route("/")
     def index():
@@ -477,6 +583,7 @@ def _self_test() -> int:
         "/api/explain/SPY", "/api/positions",
         "/api/single-leg/kpis", "/api/single-leg/positions",
         "/api/single-leg/episodes", "/api/put-time-stop",
+        "/api/shadow-research",
     )
     for path in endpoints:
         r = client.get(path)
