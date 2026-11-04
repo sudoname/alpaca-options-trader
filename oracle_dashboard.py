@@ -527,6 +527,122 @@ def create_app(config: "DashboardConfig" = None) -> Flask:
                     "recent": recent[:50]}
         return _cached_json("shadow-research", provider)
 
+    # -- trade log: merged open/close feed from the live bot's stores ----- #
+    # Read-only over active_trades.json + trading_history.json via
+    # single_leg_reports.compute_trade_log. Fail-open: missing stores yield
+    # INSUFFICIENT_DATA. ?limit= is clamped 1-200 and keyed into the cache.
+    @app.route("/api/trade-log")
+    def trade_log():
+        try:
+            limit = int(request.args.get("limit", "50"))
+        except (TypeError, ValueError):
+            limit = 50
+        limit = max(1, min(limit, 200))
+
+        def provider():
+            import single_leg_reports as slr
+            return slr.compute_trade_log(limit)
+        return _cached_json(f"trade-log:{limit}", provider)
+
+    # -- node status: health of the trading stack ------------------------- #
+    # Read-only over scheduler_status.json (heartbeat/mode/PDT), the trade
+    # stores (last fill, open count), and research_ledger.db (row counts).
+    # Pure/fail-open: every missing source degrades its own node to "offline"
+    # and the verdict to INSUFFICIENT_DATA when nothing exists at all.
+    @app.route("/api/node-status")
+    def node_status():
+        def provider():
+            import json as _json
+            from datetime import datetime as _dt
+
+            any_source = False
+
+            # -- scheduler node (scheduler_status.json) ------------------ #
+            scheduler = {"status": "offline", "mode": None, "is_open": None,
+                         "heartbeat_age_s": None, "trades_today": None,
+                         "max_new_trades_per_day": None,
+                         "scan_interval_min": None, "symbols_watched": None,
+                         "pdt_remaining": None, "pdt_can_trade": None}
+            sched_file = "scheduler_status.json"
+            if os.path.isfile(sched_file):
+                any_source = True
+                try:
+                    with open(sched_file, "r") as f:
+                        s = _json.load(f) or {}
+                except Exception:
+                    s = {}
+                if isinstance(s, dict) and s:
+                    scheduler["mode"] = s.get("mode")
+                    scheduler["is_open"] = s.get("is_open")
+                    scheduler["trades_today"] = s.get("trades_today")
+                    scheduler["max_new_trades_per_day"] = \
+                        s.get("max_new_trades_per_day")
+                    scheduler["scan_interval_min"] = s.get("scan_interval_min")
+                    syms = s.get("symbols")
+                    scheduler["symbols_watched"] = \
+                        len(syms) if isinstance(syms, list) else None
+                    pdt = s.get("pdt") if isinstance(s.get("pdt"), dict) else {}
+                    scheduler["pdt_remaining"] = pdt.get("remaining")
+                    scheduler["pdt_can_trade"] = pdt.get("can_trade")
+                    age_s = None
+                    try:
+                        hb = _dt.fromisoformat(str(s.get("last_heartbeat")))
+                        age_s = (_dt.now() - hb).total_seconds()
+                    except (TypeError, ValueError):
+                        pass
+                    scheduler["heartbeat_age_s"] = \
+                        round(age_s, 1) if age_s is not None else None
+                    try:
+                        interval = float(s.get("scan_interval_min") or 0)
+                    except (TypeError, ValueError):
+                        interval = 0.0
+                    fresh_s = max(2 * interval * 60, 30 * 60)
+                    if age_s is not None and age_s <= fresh_s:
+                        scheduler["status"] = "online"
+                    else:
+                        scheduler["status"] = "stale"
+
+            # -- trades node (active + history stores) -------------------- #
+            trades = {"status": "offline", "last_trade_at": None,
+                      "open_count": None}
+            import single_leg_reports as slr
+            has_store = (os.path.isfile(slr.ACTIVE_TRADES_FILE)
+                         or os.path.isfile(slr.TRADE_HISTORY_FILE))
+            if has_store:
+                any_source = True
+                active = slr._load_active_trades()
+                history = slr._load_history_trades()
+                times = [str(t.get("exit_time") or t.get("entry_time") or "")
+                         for t in history if isinstance(t, dict)]
+                times += [str(t.get("entry_time") or "")
+                          for t in active if isinstance(t, dict)]
+                times = [t for t in times if t]
+                trades["last_trade_at"] = max(times) if times else None
+                trades["open_count"] = len(active)
+                trades["status"] = "online" if (active or history) else "stale"
+
+            # -- ledger node (research_ledger.db) -------------------------- #
+            ledger = {"status": "offline", "snapshots": None, "events": None}
+            if os.path.isfile("research_ledger.db"):
+                any_source = True
+                try:
+                    from research_ledger import ResearchLedger
+                    led = ResearchLedger("research_ledger.db")
+                    try:
+                        st = led.stats()
+                    finally:
+                        led.close()
+                    ledger["snapshots"] = st.get("snapshots")
+                    ledger["events"] = st.get("events")
+                    ledger["status"] = "online"
+                except Exception:
+                    ledger["status"] = "stale"
+
+            verdict = "OK" if any_source else VERDICT_INSUFFICIENT
+            return {"verdict": verdict, "scheduler": scheduler,
+                    "trades": trades, "ledger": ledger}
+        return _cached_json("node-status", provider)
+
     # -- static frontend ------------------------------------------------- #
     @app.route("/")
     def index():
@@ -583,7 +699,7 @@ def _self_test() -> int:
         "/api/explain/SPY", "/api/positions",
         "/api/single-leg/kpis", "/api/single-leg/positions",
         "/api/single-leg/episodes", "/api/put-time-stop",
-        "/api/shadow-research",
+        "/api/shadow-research", "/api/node-status", "/api/trade-log",
     )
     for path in endpoints:
         r = client.get(path)

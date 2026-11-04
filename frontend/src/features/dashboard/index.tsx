@@ -8,6 +8,7 @@ import { ExplainTicker } from './components/explain-ticker'
 import { FeatureImportance } from './components/feature-importance'
 import { Hypotheses } from './components/hypotheses'
 import { KpiRow } from './components/kpi-row'
+import { NodeStatus } from './components/node-status'
 import { OpenPositions } from './components/open-positions'
 import { ProbabilityCalibration } from './components/probability-calibration'
 import { PutTimeStop } from './components/put-time-stop'
@@ -16,6 +17,7 @@ import { RegimePerformance } from './components/regime-performance'
 import { RlEpisodes } from './components/rl-episodes'
 import { SentimentCard } from './components/sentiment-card'
 import { ShadowResearch } from './components/shadow-research'
+import { TradeLog } from './components/trade-log'
 
 export function Dashboard() {
   return (
@@ -34,7 +36,11 @@ export function Dashboard() {
       </Header>
 
       <Main className='hud-sections'>
-        <KpiRow />
+        <NodeStatus />
+
+        <div className='mt-4'>
+          <KpiRow />
+        </div>
 
         <div className='mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2'>
           <RegimeCard />
@@ -51,6 +57,10 @@ export function Dashboard() {
 
         <div className='mt-4'>
           <OpenPositions />
+        </div>
+
+        <div className='mt-4'>
+          <TradeLog />
         </div>
 
         <div className='mt-4'>

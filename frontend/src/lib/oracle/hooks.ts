@@ -17,6 +17,7 @@ import {
   type FeatureImportance,
   type Hypotheses,
   type Kpis,
+  type NodeStatus,
   type Positions,
   type Probability,
   type PutTimeStop,
@@ -24,6 +25,7 @@ import {
   type RegimePerformance,
   type Sentiment,
   type ShadowResearch,
+  type TradeLog,
   type Weights,
 } from './types'
 
@@ -68,6 +70,10 @@ export const usePutTimeStop = () =>
   useOracleQuery<PutTimeStop>('put-time-stop', 'put-time-stop')
 export const useShadowResearch = () =>
   useOracleQuery<ShadowResearch>('shadow-research', 'shadow-research')
+export const useNodeStatus = () =>
+  useOracleQuery<NodeStatus>('node-status', 'node-status')
+export const useTradeLog = () =>
+  useOracleQuery<TradeLog>('trade-log', 'trade-log')
 
 // Explain-a-Ticker: lazy, enabled only when a validated ticker is provided.
 export function useExplain(ticker: string | null) {

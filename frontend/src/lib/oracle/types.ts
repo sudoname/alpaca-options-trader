@@ -243,3 +243,50 @@ export type ShadowResearch = ApiEnvelope & {
   variants?: ShadowVariantStats[]
   recent?: ShadowCandidateRow[]
 }
+
+export type NodeHealth = 'online' | 'stale' | 'offline' | string
+
+export type NodeStatus = ApiEnvelope & {
+  scheduler?: {
+    status?: NodeHealth
+    mode?: string | null
+    is_open?: boolean | null
+    heartbeat_age_s?: number | null
+    trades_today?: number | null
+    max_new_trades_per_day?: number | null
+    scan_interval_min?: number | null
+    symbols_watched?: number | null
+    pdt_remaining?: number | null
+    pdt_can_trade?: boolean | null
+  }
+  trades?: {
+    status?: NodeHealth
+    last_trade_at?: string | null
+    open_count?: number | null
+  }
+  ledger?: {
+    status?: NodeHealth
+    snapshots?: number | null
+    events?: number | null
+  }
+}
+
+export type TradeLogRow = {
+  at?: string | null
+  event?: 'OPEN' | 'CLOSE' | string
+  symbol?: string | null
+  underlying?: string | null
+  opt_type?: string | null
+  qty?: number | null
+  price?: number | null
+  pnl?: number | null
+  pnl_percent?: number | null
+  outcome?: string | null
+  regime?: string | null
+}
+
+export type TradeLog = ApiEnvelope & {
+  rows?: TradeLogRow[]
+  count?: number | null
+  total?: number | null
+}

@@ -321,6 +321,104 @@ def compute_single_leg_episodes(*, episode_db: str = EPISODE_DB_FILE) -> Dict:
 
 
 # --------------------------------------------------------------------------- #
+# Trade log (merged open + close events, newest first)
+# --------------------------------------------------------------------------- #
+def _parse_occ(symbol) -> Dict[str, Optional[str]]:
+    """Best-effort underlying + option type from an OCC symbol.
+
+    OCC format: ROOT + YYMMDD + C/P + 8-digit strike, so the C/P flag sits 9
+    characters from the end. Fails open to Nones for anything malformed.
+    """
+    underlying = None
+    opt_type = None
+    try:
+        s = str(symbol or "")
+        i = 0
+        while i < len(s) and s[i].isalpha():
+            i += 1
+        underlying = s[:i] or None
+        if len(s) >= 9:
+            flag = s[-9]
+            if flag == "C":
+                opt_type = "CALL"
+            elif flag == "P":
+                opt_type = "PUT"
+    except Exception:
+        pass
+    return {"underlying": underlying, "opt_type": opt_type}
+
+
+def compute_trade_log(
+    limit: int = 50,
+    *,
+    active_path: str = ACTIVE_TRADES_FILE,
+    history_path: str = TRADE_HISTORY_FILE,
+) -> Dict:
+    """Chronological feed of executed trades (opens + closes), newest first.
+
+    CLOSE rows come from trading_history.json, OPEN rows from active_trades.json.
+    Read-only over the same stores the KPI/positions reports use; fails open to
+    INSUFFICIENT_DATA when both stores are empty or missing.
+    """
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 50
+    limit = max(1, min(limit, 200))
+
+    rows: List[Dict] = []
+
+    for t in _load_history_trades(history_path):
+        if not isinstance(t, dict):
+            continue
+        sym = t.get("symbol")
+        occ = _parse_occ(sym)
+        rows.append({
+            "at": t.get("exit_time") or t.get("entry_time"),
+            "event": "CLOSE",
+            "symbol": sym,
+            "underlying": occ["underlying"],
+            "opt_type": occ["opt_type"],
+            "qty": None,
+            "price": None,
+            "pnl": _coerce_float(t.get("pnl")),
+            "pnl_percent": _coerce_float(t.get("pnl_percent")),
+            "outcome": t.get("outcome"),
+            "regime": t.get("regime_label"),
+        })
+
+    for t in _load_active_trades(active_path):
+        if not isinstance(t, dict):
+            continue
+        sym = t.get("symbol")
+        occ = _parse_occ(sym)
+        rows.append({
+            "at": t.get("entry_time"),
+            "event": "OPEN",
+            "symbol": sym,
+            "underlying": t.get("underlying_symbol") or occ["underlying"],
+            "opt_type": occ["opt_type"],
+            "qty": _coerce_float(t.get("quantity")),
+            "price": _coerce_float(t.get("entry_price")),
+            "pnl": None,
+            "pnl_percent": None,
+            "outcome": None,
+            "regime": None,
+        })
+
+    rows.sort(key=lambda r: str(r.get("at") or ""), reverse=True)
+    total = len(rows)
+    rows = rows[:limit]
+
+    return {
+        "verdict": VERDICT_OK if rows else VERDICT_INSUFFICIENT,
+        "rows": rows,
+        "count": len(rows),
+        "total": total,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Self-test (no creds, no network; uses temp files / an in-memory DB)
 # --------------------------------------------------------------------------- #
 def _self_test() -> int:
