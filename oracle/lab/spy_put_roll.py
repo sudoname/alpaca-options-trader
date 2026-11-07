@@ -1,4 +1,4 @@
-"""Replay SPY same-day puts on completed bars and timestamped option BBOs.
+"""Replay SPY same-day options on completed bars and timestamped option BBOs.
 
 Run from the repository root.
 
@@ -17,7 +17,7 @@ Bar timestamps are the end of the minute. Optional received_at is when a row
 became available to the strategy. Use actual quote sizes in contracts. The
 model assumes sale proceeds are reusable intraday unless --cash-account is
 given. Each file starts with the configured balance. The three profiles use
-the same opening signal. Hold keeps the first put until a stop or cutoff,
+the same opening signal. Hold keeps the first contract until a stop or cutoff,
 fixed_roll reuses a fixed premium budget, and capped_roll reinvests a share
 of cumulative realized gains up to the configured premium cap. This is an
 offline replay and expects normalized data from a historical quote feed.
@@ -41,6 +41,7 @@ from oracle.execution.fill_simulator import FillSimulator, LatencyConfig
 MINUTE = timedelta(minutes=1)
 SOURCE = "spy_put_roll"
 PROFILES = ("hold", "fixed_roll", "capped_roll")
+DIRECTIONS = ("put", "call", "both")
 
 
 @dataclass(frozen=True)
@@ -81,11 +82,16 @@ class Order:
     limit: float | None = None
 
 
-class PutReplay:
-    def __init__(self, session, config, profile):
+class OptionRoll:
+    def __init__(self, session, config, profile, direction="put", audit=None):
+        if profile not in PROFILES or direction not in DIRECTIONS[:2]:
+            raise ValueError(f"Unknown profile or direction: {profile!r}, {direction!r}")
         self.session = session
         self.cfg = config
         self.profile = profile
+        self.direction = direction
+        self.sign = -1 if direction == "put" else 1
+        self.audit = audit
         self.opening_end = session.opened + config.opening_minutes * MINUTE
         self.order_cutoff = session.closed - 30 * MINUTE
         self.flatten_at = session.closed - 40 * MINUTE
@@ -121,7 +127,30 @@ class PutReplay:
     def net_pnl(self):
         return self.broker.realized_pnl - self.fees
 
-    def on_bar(self, event):
+    def observation(self, event, *, warmup=False):
+        market_time = event.event_timestamp
+        now = event.received_timestamp or market_time
+        if market_time.utcoffset() is None or now.utcoffset() is None:
+            raise ValueError("Timestamps must include a UTC offset")
+        if now < market_time:
+            raise ValueError("An event cannot be received before its market timestamp")
+        if not self.session.opened < now < self.session.closed or market_time < self.session.opened:
+            return None
+        if isinstance(event, BarEvent) and event.symbol == "SPY":
+            if not warmup and now - market_time >= MINUTE:
+                return None
+        elif isinstance(event, OptionQuoteEvent):
+            contract = _contract(event.symbol)
+            if not contract or contract[:3] != ("SPY", self.trade_date, self.direction[0].upper()):
+                return None
+        else:
+            return None
+        # Order observations by availability and retain their market time.
+        now = now.astimezone(timezone.utc)
+        return replace(event, event_timestamp=now, received_timestamp=now,
+                       data={**event.data, "market_timestamp": market_time})
+
+    def on_bar(self, event, *, warmup=False):
         ended = event.data["market_timestamp"]
         now = event.event_timestamp
         if ended <= self.opening_end:
@@ -129,12 +158,13 @@ class PutReplay:
         self.last_bar = event
         self.turnover += event.v * (event.h + event.l + event.c) / 3
         self.volume += event.v
-        self.decide(now, allow_entry=True)
+        if not warmup:
+            self.decide(now, allow_entry=True)
 
     def on_quote(self, quote):
         previous = self.quotes.get(quote.symbol)
-        if previous and quote.data["market_timestamp"] < previous.data["market_timestamp"]:
-            return  # delayed update cannot supersede a newer market snapshot
+        if previous and quote.data["market_timestamp"] <= previous.data["market_timestamp"]:
+            return  # repeated snapshots cannot replenish displayed liquidity
         self.quotes[quote.symbol] = quote
         order = self.pending
         if order is not None and order.symbol == quote.symbol:
@@ -142,13 +172,25 @@ class PutReplay:
         # Update risk intraminute. Entry still requires a completed SPY bar.
         if quote.symbol == self.held:
             self.decide(quote.event_timestamp)
-            if quote.bid > 0 and quote.ask >= quote.bid and quote.data["bid_size"] > 0:
+            if (self.fresh(quote, quote.event_timestamp) and quote.bid > 0
+                    and quote.ask >= quote.bid and quote.data["bid_size"] > 0):
                 qty = self.broker.books[self.held].qty
                 self.mark_equity(self.cash + qty * (quote.bid * CONTRACT_MULTIPLIER - self.fee))
 
     def mark_equity(self, equity):
         self.peak_equity = max(self.peak_equity, equity)
         self.max_drawdown = max(self.max_drawdown, self.peak_equity - equity)
+
+    def record(self, kind, now, **data):
+        if self.audit is not None:
+            self.audit({"event": kind, "direction": self.direction,
+                        "observed_at": now.isoformat(), **data})
+
+    def submit(self, order):
+        self.pending = order
+        self.record("simulated_intent", order.submitted_at, side=order.side,
+                    contract=order.symbol, quantity=order.qty, limit=order.limit,
+                    reason=order.reason)
 
     def decide(self, now, *, allow_entry=False):
         if self.pending and self.pending.side == "sell":
@@ -158,6 +200,7 @@ class PutReplay:
 
         bar = self.last_bar
         vwap = self.turnover / self.volume if self.volume else 0.0
+        current_bar = bar is not None and now - bar.data["market_timestamp"] <= MINUTE
         if self.held:
             book = self.broker.books[self.held]
             quote = self.quotes[self.held]
@@ -165,51 +208,53 @@ class PutReplay:
             reason = None
             if now >= self.flatten_at:
                 reason = "time_exit"
-            elif bar and vwap and bar.c >= vwap:
-                reason = "vwap_reclaim"
+            elif current_bar and vwap and self.sign * (bar.c - vwap) <= 0:
+                reason = "vwap_reclaim" if self.sign < 0 else "vwap_breakdown"
             elif self.fresh(quote, now):
                 if quote.bid <= book.avg_price * (1 - self.cfg.stop_loss):
                     reason = "premium_stop"
                 elif (self.profile != "hold" and self.entries <= self.cfg.max_rolls
-                      and now < self.roll_until and bar
-                      and now - bar.data["market_timestamp"] <= MINUTE
-                      and bar.c - strike <= 2
+                      and now < self.roll_until and current_bar
+                      and self.sign * (strike - bar.c) <= 2
                       and quote.bid >= book.avg_price * (1 + self.cfg.roll_gain)):
                     reason = "roll_winner"
             if reason:
                 self.can_roll = reason == "roll_winner"
-                self.pending = Order("sell", self.held, int(book.qty), now, reason)
+                self.submit(Order("sell", self.held, int(book.qty), now, reason))
             return
 
         cutoff = self.roll_until if self.entries else self.initial_until
         if self.pending:
-            if (now >= cutoff or not self.bearish(bar, vwap)
+            if (now >= cutoff or not current_bar or not self.opening_signal(bar, vwap)
                     or now - self.pending.submitted_at
                     > timedelta(seconds=self.cfg.order_timeout_seconds)):
                 self.cancelled_buys += 1
+                self.record("simulated_cancel", now, contract=self.pending.symbol)
                 self.pending = None
             else:
                 return
 
-        if (not allow_entry or now >= cutoff or not bar
+        if (not allow_entry or now >= cutoff or not current_bar
                 or (self.entries and not self.can_roll)):
             return
-        if now <= self.opening_end or not self.bearish(bar, vwap):
+        if now <= self.opening_end or not self.opening_signal(bar, vwap):
             return
         self.submit_buy(now, bar.c)
 
-    def bearish(self, bar, vwap):
+    def opening_signal(self, bar, vwap):
         if bar is None or len(self.opening_bars) != self.cfg.opening_minutes:
             return False
         first, last = self.opening_bars[0], self.opening_bars[-1]
         if any(item.data["market_timestamp"] != self.session.opened + i * MINUTE
                for i, item in enumerate(self.opening_bars, 1)):
             return False
-        return (
-            first.o <= self.session.previous_close * (1 - self.cfg.gap_down)
-            and last.c <= first.o * (1 - self.cfg.opening_decline)
-            and bar.c < min(vwap, min(item.l for item in self.opening_bars))
-        )
+        sign = self.sign
+        edge = max(item.h if sign > 0 else -item.l for item in self.opening_bars)
+        return (vwap > 0
+                and sign * (first.o - self.session.previous_close)
+                >= self.session.previous_close * self.cfg.gap_down
+                and sign * (last.c - first.o) >= first.o * self.cfg.opening_decline
+                and sign * bar.c > max(sign * vwap, edge))
 
     def fresh(self, quote, now):
         market_time = quote.data["market_timestamp"]
@@ -230,10 +275,11 @@ class PutReplay:
         candidates = []
         for symbol, quote in self.quotes.items():
             strike = _contract(symbol)[3]
-            distance = spot - strike
+            distance = self.sign * (strike - spot)
             if not 3 <= distance <= 5:
                 continue
-            if self.previous_strike is not None and strike >= self.previous_strike:
+            if (self.previous_strike is not None
+                    and self.sign * (strike - self.previous_strike) <= 0):
                 continue
             if not self.fresh(quote, now) or not self.liquid(quote):
                 continue
@@ -244,8 +290,9 @@ class PutReplay:
                 candidates.append((abs(distance - 4), quote.ask - quote.bid, symbol, qty, limit))
         if candidates:
             _, _, symbol, qty, limit = min(candidates)
-            reason = "roll_entry" if self.entries else "opening_breakdown"
-            self.pending = Order("buy", symbol, qty, now, reason, limit)
+            opening = "opening_breakdown" if self.sign < 0 else "opening_breakout"
+            self.submit(Order("buy", symbol, qty, now,
+                              "roll_entry" if self.entries else opening, limit))
 
     def try_fill(self, order, quote):
         now = quote.event_timestamp
@@ -265,7 +312,7 @@ class PutReplay:
             qty = min(order.qty, quote.data["bid_size"])
 
         self.broker.on_trade_intent(TradeIntentEvent(
-            symbol="SPY", contract=order.symbol, side=order.side, direction="PUT",
+            symbol="SPY", contract=order.symbol, side=order.side, direction=self.direction.upper(),
             qty=qty, order_type="limit" if order.limit else "market",
             limit_price=order.limit, bid=quote.bid, ask=quote.ask, market=quote.data,
             event_timestamp=now, source=SOURCE,
@@ -274,6 +321,7 @@ class PutReplay:
         record = self.broker.order_log[-1]
         record.update(ts=now.isoformat(), submitted_at=order.submitted_at.isoformat(),
                       reason=order.reason, remaining_before_attempt=order.qty)
+        self.record("simulated_attempt", now, order=dict(record))
         filled = int(record["filled_qty"])
         if not filled:
             return
@@ -304,6 +352,7 @@ class PutReplay:
     def report(self):
         return {
             "profile": self.profile,
+            "direction": self.direction,
             "net_realized_pnl": round(self.net_pnl, 2),
             "ending_cash": round(self.cash, 2),
             "estimated_fees": round(self.fees, 2),
@@ -322,44 +371,16 @@ def _contract(symbol):
     return parse_occ(symbol)
 
 
-def replay(session, events, config=Config(), profile="capped_roll"):
+def replay(session, events, config=Config(), profile="capped_roll", direction="put"):
     """Replay one session. Events are ordered by availability; tied bars run first."""
-    if profile not in PROFILES:
-        raise ValueError(f"Unknown profile {profile!r}")
-    model = PutReplay(session, config, profile)
+    model = OptionRoll(session, config, profile, direction)
     bus = EventBus()
     bus.subscribe("BAR", model.on_bar)
     bus.subscribe("OPTION_QUOTE", model.on_quote)
     bus.subscribe("TIMER", lambda event: model.decide(event.event_timestamp))
     bus.publish(TimerEvent(event_timestamp=model.flatten_at))
     # At a tie, observe the completed SPY bar before attempting a quote fill.
-    available = []
-    for event in events:
-        if (event.event_timestamp.utcoffset() is None
-                or (event.received_timestamp is not None
-                    and event.received_timestamp.utcoffset() is None)):
-            raise ValueError("Timestamps must include a UTC offset")
-        market_time = event.event_timestamp.astimezone(timezone.utc)
-        now = (event.received_timestamp or market_time).astimezone(timezone.utc)
-        if now < market_time:
-            raise ValueError("An event cannot be received before its market timestamp")
-        if not session.opened < now < session.closed or market_time < session.opened:
-            continue
-        if isinstance(event, BarEvent) and event.symbol == "SPY":
-            if now - market_time >= MINUTE:
-                continue
-        elif isinstance(event, OptionQuoteEvent):
-            contract = _contract(event.symbol)
-            if not contract or contract[:3] != ("SPY", model.trade_date, "P"):
-                continue
-        else:
-            continue
-        # The bus orders replay observations by availability. Keep the
-        # original market time for completed-bar and quote-freshness checks.
-        available.append(replace(
-            event, event_timestamp=now, received_timestamp=now,
-            data={**event.data, "market_timestamp": market_time},
-        ))
+    available = [seen for event in events if (seen := model.observation(event)) is not None]
     available.sort(key=lambda event: (event.event_timestamp, not isinstance(event, BarEvent)))
     bus.publish_all(available)
     bus.run(max_events=len(available) + 1)
@@ -370,7 +391,7 @@ def replay(session, events, config=Config(), profile="capped_roll"):
     report["data"] = {
         "bars": bar_count,
         "expected_bars": int((session.closed - session.opened) // MINUTE) - 1,
-        "same_day_put_quotes": len(available) - bar_count,
+        f"same_day_{direction}_quotes": len(available) - bar_count,
     }
     return report
 
@@ -434,6 +455,7 @@ def main():
     parser.add_argument("--daily-loss", type=float, default=Config.daily_loss)
     parser.add_argument("--reinvest-fraction", type=float, default=Config.reinvest_fraction)
     parser.add_argument("--profile", choices=PROFILES, help="Run only this profile")
+    parser.add_argument("--direction", choices=DIRECTIONS, default="put")
     args = parser.parse_args()
     budgets = (args.starting_cash, args.base_premium, args.max_premium, args.daily_loss)
     if any(not math.isfinite(value) or value <= 0 for value in budgets):
@@ -447,7 +469,9 @@ def main():
     )
     for path in args.session:
         session, events = load_feed(path)
-        results = [replay(session, events, config, profile)
+        directions = DIRECTIONS[:2] if args.direction == "both" else (args.direction,)
+        results = [replay(session, events, config, profile, direction)
+                   for direction in directions
                    for profile in ((args.profile,) if args.profile else PROFILES)]
         print(json.dumps({"session": session.opened.date().isoformat(), "results": results}))
 

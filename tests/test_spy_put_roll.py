@@ -77,6 +77,9 @@ class TestPutReplay(unittest.TestCase):
             if event not in (quote(12, 2, FIRST, 3.50, 3.53),
                              quote(350, 1, FIRST, 4.00, 4.03))
         ]
+        duplicate = quote(12, 1, FIRST, 3.50, 3.53, size=1)
+        events.append(replace(duplicate, received_timestamp=duplicate.event_timestamp
+                              + timedelta(seconds=1)))
         config = Config(base_premium=300, daily_loss=300)
         result = replay(SESSION, events, config)
         self.assertEqual([order["filled_qty"] for order in fills(result)], [2, 1])
@@ -99,3 +102,21 @@ class TestPutReplay(unittest.TestCase):
     def test_small_balance_and_incomplete_opening_range_abstain(self):
         self.assertEqual(fills(replay(SESSION, feed(), Config(starting_cash=50))), [])
         self.assertEqual(fills(replay(SESSION, feed()[1:])), [])
+
+    def test_mirrored_calls_roll_higher_and_abstain_on_bearish_open(self):
+        mirrored = []
+        for event in feed():
+            if isinstance(event, BarEvent):
+                mirrored.append(replace(event, o=1520 - event.o, h=1520 - event.l,
+                                        l=1520 - event.h, c=1520 - event.c))
+            else:
+                strike = 1520000 - int(event.symbol[-8:])
+                mirrored.append(replace(event, symbol=f"SPY261105C{strike:08d}"))
+        bullish = replace(SESSION, previous_close=755)
+        report = replay(bullish, mirrored, direction="call")
+        trades = fills(report)
+        self.assertEqual([order["contract"] for order in trades],
+                         ["SPY261105C00769000"] * 2 + ["SPY261105C00772000"] * 2)
+        self.assertEqual(trades[0]["reason"], "opening_breakout")
+        self.assertTrue(report["flat_at_end"])
+        self.assertEqual(fills(replay(SESSION, feed(), direction="call")), [])
