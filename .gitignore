@@ -91,3 +91,6 @@ nul
 .vscode/
 .idea/
 .claude/
+
+# pushed by the spy-ml shadow trader (runtime data, not source)
+shadow_pnl.json
