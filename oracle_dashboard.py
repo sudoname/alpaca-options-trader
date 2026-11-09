@@ -643,6 +643,41 @@ def create_app(config: "DashboardConfig" = None) -> Flask:
                     "trades": trades, "ledger": ledger}
         return _cached_json("node-status", provider)
 
+    @app.route("/api/shadow-pnl")
+    def shadow_pnl():
+        """Shadow options trader P/L (pushed as shadow_pnl.json by the
+        spy-ml shadow trader; see that repo's shadow_trader.py)."""
+        def provider():
+            import json as _json
+            from datetime import datetime as _dt
+            path = "shadow_pnl.json"
+            if not os.path.isfile(path):
+                return {"verdict": VERDICT_INSUFFICIENT,
+                        "hint": "shadow_pnl.json not found"}
+            try:
+                with open(path, "r") as f:
+                    data = _json.load(f)
+            except Exception as e:
+                return {"verdict": VERDICT_ERROR, "error": str(e)}
+            if not isinstance(data, dict) or "books" not in data:
+                return {"verdict": VERDICT_INSUFFICIENT,
+                        "hint": "unexpected shadow_pnl.json shape"}
+            # freshness: updated_at is US/Eastern wall time from the pusher
+            age_s = None
+            try:
+                from zoneinfo import ZoneInfo
+                upd = _dt.fromisoformat(str(data.get("updated_at")))
+                now_et = _dt.now(ZoneInfo("America/New_York")) \
+                    .replace(tzinfo=None)
+                age_s = round((now_et - upd).total_seconds(), 1)
+            except (TypeError, ValueError):
+                pass
+            data["age_s"] = age_s
+            data["stale"] = bool(age_s is None or age_s > 1200)
+            data.setdefault("verdict", "OK")
+            return data
+        return _cached_json("shadow-pnl", provider)
+
     # -- static frontend ------------------------------------------------- #
     @app.route("/")
     def index():

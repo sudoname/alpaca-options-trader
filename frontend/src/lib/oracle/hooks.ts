@@ -24,6 +24,7 @@ import {
   type Regime,
   type RegimePerformance,
   type Sentiment,
+  type ShadowPnl,
   type ShadowResearch,
   type TradeLog,
   type Weights,
@@ -70,6 +71,8 @@ export const usePutTimeStop = () =>
   useOracleQuery<PutTimeStop>('put-time-stop', 'put-time-stop')
 export const useShadowResearch = () =>
   useOracleQuery<ShadowResearch>('shadow-research', 'shadow-research')
+export const useShadowPnl = () =>
+  useOracleQuery<ShadowPnl>('shadow-pnl', 'shadow-pnl')
 export const useNodeStatus = () =>
   useOracleQuery<NodeStatus>('node-status', 'node-status')
 export const useTradeLog = () =>

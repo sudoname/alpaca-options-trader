@@ -290,3 +290,45 @@ export type TradeLog = ApiEnvelope & {
   count?: number | null
   total?: number | null
 }
+
+// Shadow options trader (spy-ml monitor -> Alpaca paper): shadow_pnl.json
+export type ShadowPnlBook = {
+  today_pnl?: number | null
+  total_pnl?: number | null
+  trades?: number | null
+  wins?: number | null
+  open?: number | null
+  skipped?: number | null
+}
+
+export type ShadowPnlOpenTrade = {
+  book?: string
+  entry_time?: string | null
+  legs?: string[]
+  entry_cost?: number | null
+  last_mid?: number | null
+  peak?: number | null
+  tp_gain?: number | null
+  trail_pct?: number | null
+}
+
+export type ShadowPnlClosedTrade = {
+  book?: string
+  day?: string | null
+  pnl?: number | null
+  exit_reason?: string | null
+  entry_time?: string | null
+  exit_time?: string | null
+  legs?: string[]
+}
+
+export type ShadowPnl = ApiEnvelope & {
+  updated_at?: string | null
+  today_pnl?: number | null
+  total_pnl?: number | null
+  books?: Record<string, ShadowPnlBook>
+  open_trades?: ShadowPnlOpenTrade[]
+  last_trades?: ShadowPnlClosedTrade[]
+  age_s?: number | null
+  stale?: boolean
+}

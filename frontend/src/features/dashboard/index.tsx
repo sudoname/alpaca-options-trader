@@ -17,6 +17,7 @@ import { RegimePerformance } from './components/regime-performance'
 import { RlEpisodes } from './components/rl-episodes'
 import { SentimentCard } from './components/sentiment-card'
 import { ShadowResearch } from './components/shadow-research'
+import { ShadowTraderPnl } from './components/shadow-trader-pnl'
 import { TradeLog } from './components/trade-log'
 
 export function Dashboard() {
@@ -65,6 +66,10 @@ export function Dashboard() {
 
         <div className='mt-4'>
           <PutTimeStop />
+        </div>
+
+        <div className='mt-4'>
+          <ShadowTraderPnl />
         </div>
 
         <div className='mt-4'>
