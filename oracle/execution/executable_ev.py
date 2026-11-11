@@ -7,11 +7,16 @@ mid. This module makes the gap explicit by producing THREE numbers for the same
 contract:
 
   * theoretical_EV — the model's edge priced at fair value (what the screener
-    ranks on). Unchanged; sourced from the contract / ``ev_engine``.
-  * executable_EV  — the edge AFTER realistic execution: entry above mid, exit
-    below mid (Upgrade-2A ``fill_model``), broker fees (``cost_model``), and the
-    probability the order fills at all. This is the number a shadow/paper run
-    should actually believe.
+    ranks on). MUST be the GROSS strategy EV in total dollars (multiplier and
+    quantity applied, NO execution costs subtracted yet) — this module charges
+    its own frictions, so feeding it an already-cost-netted number double-charges
+    costs (the Phase-1 bug: stamp net EV in -> −$3.77 instead of +$2.21).
+  * net_ev_after_costs — theoretical_EV minus modeled round-trip execution
+    costs (spread/slippage + fees), charged exactly ONCE, before fill scaling.
+  * executable_EV  — net_ev_after_costs scaled by fill probability. The one
+    interpretation of fill_probability everywhere: P(the entry order fills);
+    a nonfill is a $0 opportunity (no position, no edge, no loss). This is the
+    number a shadow/paper run should actually believe.
   * realized_EV    — computed post-hoc from the ACTUAL fills once a trade closes
     (Upgrade-2D telemetry feeds this back to calibrate the two above).
 
@@ -90,6 +95,7 @@ class ExecutableEV:
     theoretical_EV: Optional[float]
     executable_EV: Optional[float]
     execution_risk: Optional[float]
+    net_ev_after_costs: Optional[float] = None  # theo − execution_cost, pre fill-prob
     qty: int = 1
     status: str = "ok"
     reasons: tuple = ()
@@ -117,17 +123,31 @@ def compute_executable_ev(contract: Mapping[str, Any],
                           theoretical_ev: Optional[float] = None,
                           market: Optional[Mapping[str, Any]] = None,
                           order_type: str = "market",
-                          limit_price: Optional[float] = None) -> ExecutableEV:
+                          limit_price: Optional[float] = None,
+                          max_quote_age_s: Optional[float] = None) -> ExecutableEV:
     """Turn a candidate ``contract`` + ``quote`` into the theoretical/executable
     EV split. Never raises.
 
-    ``theoretical_EV`` is taken from ``theoretical_ev`` if given, else the
-    contract's ``expected_value`` (``ev_engine`` output). Execution frictions are
-    modeled as a round trip: pay ``expected_entry_price`` (>= mid) to open and
-    receive ``expected_exit_price`` (<= mid) to close AT the entry-time quote —
-    a conservative same-quote round trip — plus broker/OCC fees. The whole thing
-    is then scaled by ``fill_probability`` because an order that does not fill
-    earns nothing.
+    ``theoretical_ev`` MUST be the GROSS strategy EV in total dollars (option
+    multiplier and quantity applied; NO execution costs subtracted — this
+    function charges spread/slippage/fees itself, exactly once). If omitted it
+    falls back to the contract's ``expected_value``; CAUTION: ``ev_engine``
+    stamps that field NET of its own modeled costs, so prefer passing an
+    explicit gross ``theoretical_ev`` (see entry_ev_stamp's
+    ``gross_expected_value``) to avoid re-introducing the double charge.
+
+    Execution frictions are modeled as a round trip: pay
+    ``expected_entry_price`` (>= mid) to open and receive
+    ``expected_exit_price`` (<= mid) to close AT the entry-time quote — a
+    conservative same-quote round trip — plus broker/OCC fees. The cost-netted
+    edge (``net_ev_after_costs``) is then scaled by ``fill_probability``:
+    P(entry order fills), applied exactly once, because an order that does not
+    fill earns nothing (a $0 opportunity).
+
+    An unusable quote (crossed, one-sided, non-positive, or — when
+    ``max_quote_age_s`` is set — older than that against ``market['quote_age_s']``)
+    yields ``status='unusable_quote'`` with ``executable_EV=None`` and a reason
+    code naming why; theoretical_EV passes through untouched.
     """
     fm = fill_model or FillModel()
     cm = cost_model or CostModel()
@@ -157,8 +177,32 @@ def compute_executable_ev(contract: Mapping[str, Any],
             spread_cost=0.0, slippage_estimate=0.0, fill_probability=0.0,
             expected_fill_delay=0.0, liquidity_penalty=0.0, fees=0.0,
             execution_cost=0.0, theoretical_EV=theo, executable_EV=None,
-            execution_risk=None, qty=qty, status="no_quote",
-            reasons=("no_quote",))
+            execution_risk=None, net_ev_after_costs=None, qty=qty,
+            status="no_quote", reasons=("no_quote",))
+
+    # Unusable quote -> unavailable EV with a reason code (never a number we
+    # would pretend to trade on). Theoretical EV passes through untouched.
+    unusable = None
+    if (ask is not None and ask <= 0) or (bid is not None and bid < 0):
+        unusable = "nonpositive_quote"
+    elif bid is None or ask is None:
+        unusable = "one_sided_quote"
+    elif bid > ask + _EPS:
+        unusable = "crossed_quote"
+    elif max_quote_age_s is not None:
+        age = _num((market or {}).get("quote_age_s"))
+        if age is not None and age > max_quote_age_s:
+            unusable = "stale_quote"
+    if unusable is not None:
+        return ExecutableEV(
+            symbol=sym, theoretical_fair_value=fair_value,
+            displayed_bid=bid, displayed_ask=ask, mid_price=mid,
+            expected_entry_price=None, expected_exit_price=None,
+            spread_cost=0.0, slippage_estimate=0.0, fill_probability=0.0,
+            expected_fill_delay=0.0, liquidity_penalty=0.0, fees=0.0,
+            execution_cost=0.0, theoretical_EV=theo, executable_EV=None,
+            execution_risk=None, net_ev_after_costs=None, qty=qty,
+            status="unusable_quote", reasons=(unusable,))
 
     # ---- entry fill (BUY): conservative price >= mid --------------------- #
     entry_order = OrderRequest(sym or "OPT", "buy", qty, order_type=order_type,
@@ -191,12 +235,13 @@ def compute_executable_ev(contract: Mapping[str, Any],
         reasons.append("fill_probability<1")
 
     # ---- executable EV --------------------------------------------------- #
-    executable = execution_risk = None
+    # Single-charge accounting: theo is GROSS; modeled execution costs are
+    # subtracted exactly once; fill probability is applied exactly once.
+    executable = execution_risk = net_after = None
     if theo is not None:
-        edge_after_cost = theo - execution_cost
+        net_after = round(theo - execution_cost, 6)
         # An order that does not fill earns nothing (no position, no edge).
-        executable = round(fill_prob * edge_after_cost, 6)
-        denom = abs(theo) if abs(theo) > _EPS else _EPS
+        executable = round(fill_prob * net_after, 6)
         # fraction of the theoretical edge consumed by execution (incl. no-fill)
         execution_risk = round(1.0 - (executable / theo), 6) if abs(theo) > _EPS \
             else None
@@ -217,6 +262,7 @@ def compute_executable_ev(contract: Mapping[str, Any],
         liquidity_penalty=liq, fees=fees, execution_cost=execution_cost,
         theoretical_EV=round(theo, 6) if theo is not None else None,
         executable_EV=executable, execution_risk=execution_risk,
+        net_ev_after_costs=net_after,
         qty=qty, status="ok", reasons=tuple(reasons),
         notes={"entry_reasons": list(entry.reasons),
                "exit_reasons": list(exit_.reasons)})
@@ -359,6 +405,37 @@ def _self_test() -> int:
                                fill_model=fm, cost_model=cm)
     if nq.status != "no_quote" or nq.executable_EV is not None:
         print("FAIL: no-quote handling", nq); ok = False
+
+    # Unusable quotes -> unavailable EV + a reason code naming why.
+    crossed = compute_executable_ev(
+        contract, 1.01, Quote("OPT", bid=1.10, ask=1.02, ts="t"),
+        fill_model=fm, cost_model=cm)
+    if crossed.status != "unusable_quote" or crossed.executable_EV is not None \
+            or "crossed_quote" not in crossed.reasons:
+        print("FAIL: crossed-quote handling", crossed); ok = False
+    one_sided = compute_executable_ev(
+        contract, None, Quote("OPT", bid=1.00, ask=None, ts="t"),
+        fill_model=fm, cost_model=cm)
+    if one_sided.status != "unusable_quote" \
+            or "one_sided_quote" not in one_sided.reasons:
+        print("FAIL: one-sided-quote handling", one_sided); ok = False
+    stale = compute_executable_ev(
+        contract, 1.01, tight, fill_model=fm, cost_model=cm,
+        market={"quote_age_s": 12.0}, max_quote_age_s=5.0)
+    if stale.status != "unusable_quote" or "stale_quote" not in stale.reasons:
+        print("FAIL: stale-quote handling", stale); ok = False
+    fresh = compute_executable_ev(
+        contract, 1.01, tight, fill_model=fm, cost_model=cm,
+        market={"quote_age_s": 2.0}, max_quote_age_s=5.0)
+    if fresh.status != "ok":
+        print("FAIL: fresh quote should pass age cap", fresh); ok = False
+
+    # Single-charge accounting identity: net = theo − execution_cost and
+    # executable = fill_prob × net (costs and fill prob applied exactly once).
+    if t.net_ev_after_costs is None \
+            or abs(t.net_ev_after_costs - (t.theoretical_EV - t.execution_cost)) > 1e-6 \
+            or abs(t.executable_EV - round(t.fill_probability * t.net_ev_after_costs, 6)) > 1e-6:
+        print("FAIL: single-charge accounting identity", t); ok = False
 
     # Determinism.
     if compute_executable_ev(contract, 1.01, tight, fill_model=fm) != \

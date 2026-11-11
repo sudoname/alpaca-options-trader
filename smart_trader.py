@@ -1801,6 +1801,40 @@ class SmartOptionsTrader:
                          else f"{f}=None({src})")
         return " ".join(parts)
 
+    @staticmethod
+    def _greeks_quality(snapshot_greeks: Optional[Dict]) -> Dict[str, str]:
+        """Per-field source labels for the Greeks/IV carried on an option dict.
+
+        'broker' when the field was actually overridden from a live snapshot
+        (present and numeric, mirroring _apply_real_greeks), 'fallback' when
+        the heuristic default is still in place. Callers must pass {} when the
+        snapshot values were NOT applied (use_real_greeks off), so the labels
+        always describe what is really in option_data, not what was available.
+        Pure helper; unit-tested separately from the selection loop.
+        """
+        snapshot_greeks = snapshot_greeks or {}
+        return {
+            f: ('broker' if isinstance(snapshot_greeks.get(f), (int, float))
+                else 'fallback')
+            for f in ('delta', 'gamma', 'theta', 'vega', 'iv')
+        }
+
+    @staticmethod
+    def _candidate_extra(option: Optional[Dict]) -> Optional[Dict]:
+        """Evidence attachments for the research ledger's extra_json.
+
+        Collects the per-field Greek quality labels and observed quote
+        timestamp (stamped by select_best_option) and the skeptic's shadow
+        review (stamped by the adversarial-thesis path) so later impact
+        studies can join them to realized outcomes. Pure; returns None when
+        nothing is attachable so legacy candidates keep an empty extra.
+        """
+        option = option or {}
+        extra = {k: option.get(k)
+                 for k in ('greeks_quality', 'quote_ts', 'thesis_review')
+                 if option.get(k) is not None}
+        return extra or None
+
     def calculate_option_score(self, option: Dict) -> float:
         """Calculate option score using ML-enhanced model"""
         base_score = 0
@@ -2282,6 +2316,7 @@ class SmartOptionsTrader:
                 bid_price = contract.get('mock_bid', 0)
                 ask_price = contract.get('mock_ask', 0)
                 spread = ask_price - bid_price
+                quote_ts = None          # synthetic quote: no observation time
                 validated_count += 1
                 print(f"[MOCK] ${strike:.2f} {contract_type.upper()} exp {expiration} - Bid: ${bid_price:.2f}, Ask: ${ask_price:.2f} (Black-Scholes)")
             else:
@@ -2294,6 +2329,7 @@ class SmartOptionsTrader:
                 ask_price = option_quote['ask']
                 bid_price = option_quote['bid']
                 spread = ask_price - bid_price
+                quote_ts = option_quote.get('ts')
                 spread_pct = (spread / ask_price * 100) if ask_price > 0 else 100
 
                 validated_count += 1
@@ -2348,6 +2384,15 @@ class SmartOptionsTrader:
                     print(f"[GREEKS] {self.ticker} {option_symbol} {log}")
             has_real_delta = isinstance(snap_greeks.get('delta'), (int, float))
             gate_delta = snap_greeks['delta'] if has_real_delta else option_data['delta']
+
+            # Phase 5: per-field evidence labels. Quality reflects what is
+            # actually IN option_data — broker labels only when USE_REAL_GREEKS
+            # applied the snapshot override; otherwise everything is 'fallback'
+            # even if a snapshot was fetched for delta gating. quote_ts is the
+            # observed quote timestamp (None for mock/synthetic quotes).
+            option_data['greeks_quality'] = self._greeks_quality(
+                snap_greeks if self.use_real_greeks else {})
+            option_data['quote_ts'] = quote_ts
 
             # Phase 2 contract gate (DTE / delta / cost-EV / liquidity). All
             # sub-gates are off by default -> (None, 1.0). A rejection logs the
@@ -2808,7 +2853,8 @@ class SmartOptionsTrader:
                                     sizing={'qty': order_quantity},
                                     dynamic_levels=dynamic_levels,
                                     extra={'ev_per_dollar_risk': evpdr,
-                                           'floor': self.min_ev_per_dollar_risk})
+                                           'floor': self.min_ev_per_dollar_risk,
+                                           **(self._candidate_extra(option) or {})})
                             except Exception:
                                 pass
                         return None
@@ -2932,7 +2978,8 @@ class SmartOptionsTrader:
                                     dynamic_levels=dynamic_levels,
                                     extra={'ev_per_dollar_risk':
                                                _s.get('ev_per_dollar_risk'),
-                                           'orderbook_imbalance': ob_imb})
+                                           'orderbook_imbalance': ob_imb,
+                                           **(self._candidate_extra(option) or {})})
                             except Exception:
                                 pass
                         return None
@@ -2958,7 +3005,18 @@ class SmartOptionsTrader:
                 _xstamp = compute_entry_stamp(
                     option, dynamic_levels, entry_price, order_quantity,
                     bid=bid_price, ask=current_option_price['ask'])
-                _theo = (_xstamp or {}).get('expected_value')
+                # Executable EV must be fed the GROSS strategy EV: the stamp's
+                # 'expected_value' is already NET of its modeled round-trip
+                # costs, and compute_executable_ev charges its own execution
+                # costs. Passing net here double-charged costs (review fixture:
+                # -$3.77 vs +$2.21 charged once). Legacy stamps (< v3) lack the
+                # gross field; reconstruct it as net + round_trip_costs.
+                _theo = (_xstamp or {}).get('gross_expected_value')
+                if _theo is None and _xstamp:
+                    _net = _xstamp.get('expected_value')
+                    _rt = _xstamp.get('round_trip_costs')
+                    _theo = (_net + _rt) if (_net is not None
+                                             and _rt is not None) else _net
                 _xquote = Quote(option['symbol'], bid=bid_price,
                                 ask=current_option_price['ask'])
                 # ENABLE_FILL_MODEL OFF -> the conservative default fill model
@@ -3389,7 +3447,7 @@ class SmartOptionsTrader:
                         quote={'bid': trade_info.get('entry_bid'),
                                'ask': trade_info.get('entry_ask')},
                         underlying_price=trade_info.get('entry_underlying_price'),
-                        greeks={'iv': option.get('implied_volatility'),
+                        greeks={'iv': option.get('iv'),
                                 'delta': option.get('delta')},
                         direction=action,
                         score=option.get('score'),
@@ -3400,7 +3458,8 @@ class SmartOptionsTrader:
                         regime=dynamic_levels.get('market_regime'),
                         sizing={'qty': order_quantity},
                         risk=risk_verdict,
-                        dynamic_levels=dynamic_levels)
+                        dynamic_levels=dynamic_levels,
+                        extra=self._candidate_extra(option))
                     if _did and not trade_info.get('decision_id'):
                         trade_info['decision_id'] = _did
                     self.research_capture.on_order_submitted(

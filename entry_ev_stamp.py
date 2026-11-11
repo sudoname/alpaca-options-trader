@@ -31,13 +31,28 @@ Model (deterministic, unit-testable, no network):
   * EV (net)   = gross - round-trip costs (CostModel when available, else a
                  full-spread + per-contract-fee fallback, else 0).
 
+Field semantics (all EV/cost fields are TOTAL DOLLARS for the whole position,
+i.e. the 100x option multiplier and ``quantity`` are already applied — once):
+  * ``gross_expected_value``  — strategy EV BEFORE any execution costs. This is
+    the number to feed an execution-cost model (e.g.
+    ``oracle.execution.executable_ev``), which charges its own frictions.
+  * ``expected_value``        — legacy field, unchanged meaning: NET of the
+    stamp's modeled round-trip costs. Never pass this to a layer that
+    subtracts costs again (that double-charges; see stamp_version 3 note).
+  * ``round_trip_costs``      — the modeled costs linking the two:
+    gross_expected_value == expected_value + round_trip_costs.
+Rows stamped before version 3 lack ``gross_expected_value``; readers can
+reconstruct it as expected_value + round_trip_costs.
+
 Whether this belief is any good is precisely what the calibration reports
 measure — the stamp only has to be frozen, deterministic, and honest.
 """
 
 from typing import Dict, Optional
 
-STAMP_VERSION = 2
+# v3: adds gross_expected_value / quantity / ev_units (double-cost fix).
+# expected_value keeps its v2 meaning (net of round_trip_costs).
+STAMP_VERSION = 3
 POP_MODEL = "tp_sl_race_v2"
 
 # Gross EV may never exceed this fraction of the premium at risk. The signal
@@ -118,7 +133,10 @@ def compute_entry_stamp(option: Optional[Dict], dynamic_levels: Optional[Dict],
         return {
             "stamp_version": STAMP_VERSION,
             "pop_model": POP_MODEL,
+            "gross_expected_value": round(gross_ev, 2),
             "expected_value": round(ev, 2),
+            "quantity": n,
+            "ev_units": "usd_total",
             "probability_of_profit": round(pop, 4),
             "max_loss": round(premium, 2),
             "ev_per_dollar_risk": round(ev / premium, 4) if premium else None,

@@ -145,6 +145,12 @@ class Config:
             if s.strip()
         ]
         self.shadow_cf_horizon_min = int(get("SHADOW_CF_HORIZON_MIN", "390"))
+        # Phase 2 (shared decision policy): observe-only kernel shadow. When ON,
+        # each ranked candidate is also run through the pure decision kernel
+        # (oracle.decision.kernel.decide over a snapshot_builder Snapshot — the
+        # exact policy the replay consumes) and the Decision + intended order
+        # are recorded to the research ledger. Never gates/sizes/places trades.
+        self.use_kernel_shadow = _truthy(get("USE_KERNEL_SHADOW", "0"))
         if armed_override is None:
             self.armed = _truthy(get("SCHEDULER_ARMED", "0"))
         else:
@@ -849,6 +855,153 @@ class IntradayScheduler:
                 except Exception as e:
                     log(f"[SKIP-CF] capture failed for {sym}: {e}")
 
+    def _kernel_shadow(self, cand):
+        """Observe-only shared-policy shadow for one ranked candidate (Phase 2).
+
+        Builds the SAME point-in-time Snapshot the replay consumes
+        (``snapshot_from_candidate``), runs the pure decision kernel, and
+        records the frozen Decision + intended order to the research ledger
+        via research_capture (flag-gated, fail-open there too). This method
+        never gates, sizes, prices, or places a trade — any failure is logged
+        by the caller and ignored.
+        """
+        from datetime import datetime
+
+        from oracle.decision.kernel import decide
+        from oracle.decision.snapshot_builder import (
+            intended_order,
+            snapshot_from_candidate,
+        )
+
+        sym = cand.get("sym")
+        prices, momentum, volatility = (), None, None
+        try:
+            prices = tuple(self.trader.get_price_history(sym) or ())
+        except Exception:
+            prices = ()
+        try:
+            momentum = self.trader.calculate_momentum(sym)
+        except Exception:
+            momentum = None
+        try:
+            volatility = self.trader.calculate_volatility(sym)
+        except Exception:
+            volatility = None
+
+        ts = datetime.now().astimezone().isoformat()
+        snap = snapshot_from_candidate(
+            cand, timestamp=ts, prices=prices,
+            momentum=momentum, volatility=volatility)
+        d = decide(snap)
+        order = intended_order(d)
+
+        # Observe-only EV-capped limit variant (Phase 2): what buy limit the
+        # limit policy WOULD have set for this entry, with reason codes when
+        # no valid cap forms. Never alters the intended order. Fail-open.
+        entry_limit = None
+        try:
+            from oracle.execution.limit_policy import (
+                compute_entry_limit,
+                gross_ev_from_contract,
+            )
+            sc = d.selected_contract or {}
+            q = snap.quote or {}
+            if d.action == "enter" and int(d.size or 0) > 0:
+                entry_limit = compute_entry_limit(
+                    gross_ev=gross_ev_from_contract(sc),
+                    qty=int(d.size),
+                    bid=sc.get("bid", q.get("bid")),
+                    ask=sc.get("ask", q.get("ask")),
+                    quote_age_s=q.get("quote_age_s", q.get("age_s")),
+                ).to_dict()
+        except Exception:
+            entry_limit = None
+
+        reject = None
+        if d.vetoes:
+            reject = d.vetoes[0]
+        elif d.action != "enter":
+            reject = (d.reasons[0] if d.reasons else d.action)
+        log(f"[KERNEL-SHADOW] {sym}: action={d.action} dir={d.direction} "
+            f"size={d.size} contract={(d.selected_contract or {}).get('symbol')} "
+            f"vetoes={list(d.vetoes)} fp={d.fingerprint()[:12]}")
+
+        try:
+            import research_capture
+            research_capture.get_capture().on_candidate(
+                decision_id=f"kshadow-{snap.symbol}-{snap.timestamp}",
+                accepted=(d.action == "enter"),
+                reject_code=reject,
+                symbol=(d.selected_contract or {}).get("symbol"),
+                underlying=sym,
+                quote=snap.quote,
+                underlying_price=cand.get("underlying_price"),
+                direction=d.direction,
+                score=cand.get("score"),
+                p_win=d.pop,
+                ev=d.theoretical_ev,
+                sizing={"qty": d.size},
+                provenance={"source": "kernel_shadow",
+                            "model_version": d.model_version,
+                            "config_version": d.config_version},
+                strategy_version="kernel_shadow",
+                extra={"decision": d.to_dict(),
+                       "fingerprint": d.fingerprint(),
+                       "intended_order": order,
+                       "entry_limit": entry_limit},
+            )
+        except Exception as e:
+            log(f"[KERNEL-SHADOW] ledger capture failed for {sym} (ignored): {e}")
+
+        # Pre-submission order-intent persistence (Phase 2): the exact order
+        # the shared policy WOULD submit — or the no-trade decision — written
+        # to the execution-calibration ledger BEFORE any (shadow) submission,
+        # keyed by a stable client_order_id so eventual broker outcomes join
+        # back by id. Observe-only; fail-open.
+        try:
+            from oracle.execution.calibration import record_order_intent
+            sc = d.selected_contract or {}
+            q = snap.quote or {}
+            coid = f"kshadow-{snap.symbol}-{snap.timestamp}"
+            if d.action == "enter" and order:
+                el = entry_limit or {}
+                # EntryLimit.to_dict() serializes dataclass fields only; the
+                # is_ok @property is NOT in the dict — check status directly.
+                el_ok = (el.get("status") == "ok"
+                         and el.get("limit_price") is not None)
+                record_order_intent({
+                    "client_order_id": coid,
+                    "symbol": order.get("symbol"),
+                    "side": order.get("side"),
+                    "order_type": ("limit" if el_ok
+                                   else order.get("order_type")),
+                    "requested_qty": order.get("qty"),
+                    "limit_price": el.get("limit_price"),
+                    "expiry_s": el.get("expiry_s"),
+                    "bid": sc.get("bid", q.get("bid")),
+                    "ask": sc.get("ask", q.get("ask")),
+                    "quote_source": "kernel_shadow",
+                    "quote_ts": snap.timestamp,
+                    "quote_age_s": q.get("quote_age_s", q.get("age_s")),
+                    "fill_probability": sc.get("fill_probability"),
+                    "executable_EV": sc.get("executable_ev"),
+                    "strategy_mode": "kernel_shadow",
+                })
+            else:
+                record_order_intent({
+                    "trade_id": coid,
+                    "symbol": sc.get("symbol") or sym,
+                    "decision": "no_trade",
+                    "reason": reject,
+                    "bid": sc.get("bid", q.get("bid")),
+                    "ask": sc.get("ask", q.get("ask")),
+                    "quote_source": "kernel_shadow",
+                    "quote_ts": snap.timestamp,
+                    "strategy_mode": "kernel_shadow",
+                })
+        except Exception as e:
+            log(f"[KERNEL-SHADOW] intent record failed for {sym} (ignored): {e}")
+
     def _rank_and_enter(self):
         """Evaluate the whole universe, rank by score (desc), then enter in that
         order. Armed mode stops at max_new_trades_per_day so the cap fills with
@@ -872,6 +1025,16 @@ class IntradayScheduler:
 
         candidates.sort(key=lambda c: c["score"], reverse=True)
         log("[RANK] " + ", ".join(f"{c['sym']}({c['score']:.0f})" for c in candidates))
+
+        # Phase 2: observe-only kernel shadow over the ranked candidates. Runs
+        # BEFORE entries so the snapshot reflects decision-time facts; fail-open
+        # and flag-gated, never alters ranking, sizing, or placement.
+        if getattr(self.cfg, "use_kernel_shadow", False):
+            for cand in candidates:
+                try:
+                    self._kernel_shadow(cand)
+                except Exception as e:
+                    log(f"[KERNEL-SHADOW] failed for {cand.get('sym')} (ignored): {e}")
 
         for cand in candidates:
             if self.cfg.armed and self.trades_today >= self.cfg.max_new_trades_per_day:

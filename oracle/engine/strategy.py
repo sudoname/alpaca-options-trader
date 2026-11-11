@@ -120,6 +120,10 @@ class OracleStrategyAdapter:
         ctx_builder: Optional[Callable[[str, Event, Any], Dict[str, Any]]] = None,
         contract_resolver: Optional[Callable[..., Optional[tuple]]] = None,
         clock: Any = None,
+        use_kernel: bool = False,
+        decision_config: Any = None,
+        contracts_provider: Optional[Callable[..., Any]] = None,
+        entry_limit_config: Optional[Mapping[str, Any]] = None,
     ) -> None:
         self.emit = emit
         self.config = config or StrategyConfig()
@@ -127,6 +131,24 @@ class OracleStrategyAdapter:
         self._ctx_builder = ctx_builder or _default_ctx_builder
         self._contract_resolver = contract_resolver
         self.clock = clock
+        # Opt-in shared decision kernel (Phase 2). Default OFF: the legacy
+        # explain_fn path below is byte-for-byte unchanged when use_kernel is
+        # False. When True, decisions come from oracle.decision.kernel.decide
+        # over a Snapshot built by oracle.decision.snapshot_builder — the SAME
+        # policy the scheduler shadow path and the replay consume.
+        self._use_kernel = bool(use_kernel)
+        self._decision_config = decision_config
+        self._contracts_provider = contracts_provider
+        # Opt-in EV-derived buy-limit entry variant (Phase 2). None = market
+        # entry baseline (unchanged). A mapping turns kernel-mode entries into
+        # limit orders capped by oracle.execution.limit_policy; keys:
+        #   ev_floor (0.0), expiry_s (30.0), max_quote_age_s, max_spread_pct,
+        #   penny_quoted (True), tick, cost_model,
+        #   fallback: "abstain" (default; no cap -> no order, reason logged)
+        #             or "market" (no cap -> baseline market entry).
+        self._entry_limit_config = (dict(entry_limit_config)
+                                    if entry_limit_config is not None else None)
+        self.decisions: List[Any] = []    # kernel-mode telemetry (Decision objs)
         self._open_symbols: set = set()   # symbols with a live intent/position
         self.signals: List[dict] = []     # telemetry log (decisions made)
         self._corr = 0
@@ -194,6 +216,9 @@ class OracleStrategyAdapter:
             return
         if self.config.one_intent_per_symbol and symbol in self._open_symbols:
             return
+        if self._use_kernel:
+            self._decide_kernel(event)
+            return
 
         ctx = self._ctx_builder(symbol, event, self.clock) or {}
         try:
@@ -254,6 +279,139 @@ class OracleStrategyAdapter:
         if bid is None or ask is None:
             return None
         return (f"{symbol}-{direction}", bid, ask, {})
+
+    # -- kernel mode (opt-in, Phase 2 shared policy) ----------------------- #
+    def _gather_contracts(self, symbol: str, event: Event) -> tuple:
+        """Candidate contracts for the kernel. Prefers the injected
+        ``contracts_provider``; falls back to synthesizing one candidate per
+        direction from ``contract_resolver``. Fail-open to ()."""
+        if self._contracts_provider is not None:
+            try:
+                return tuple(self._contracts_provider(symbol, event,
+                                                      self.clock) or ())
+            except Exception:
+                return ()
+        out = []
+        for d in ("CALL", "PUT"):
+            resolved = self._resolve_contract(symbol, d, event)
+            if resolved:
+                contract, bid, ask, _market = resolved
+                out.append({"symbol": contract, "type": d.lower(),
+                            "bid": bid, "ask": ask})
+        return tuple(out)
+
+    def _decide_kernel(self, event: Event) -> None:
+        """Shared-policy decision: Snapshot -> kernel.decide -> intent.
+
+        The emitted TRADE_INTENT fields (contract, qty, side, order_type) come
+        from ``snapshot_builder.intended_order`` — the same projection the
+        scheduler shadow path records — so both paths stay provably identical.
+        Fail-open: any import/build failure means abstain, never raise.
+        """
+        symbol = event.symbol
+        try:
+            from oracle.decision.kernel import decide
+            from oracle.decision.snapshot_builder import (
+                intended_order,
+                snapshot_from_event,
+            )
+        except Exception:
+            return
+
+        ctx = self._ctx_builder(symbol, event, self.clock) or {}
+        contracts = self._gather_contracts(symbol, event)
+        snapshot = snapshot_from_event(event, ctx=ctx, contracts=contracts)
+        decision = decide(snapshot, config=self._decision_config)
+        self.decisions.append(decision)
+
+        actionable = decision.is_actionable() and int(decision.size or 0) > 0
+        direction = (decision.direction or "NO_TRADE").upper()
+        if self.config.emit_signal:
+            self.emit(SignalEvent(
+                symbol=symbol, event_timestamp=event.event_timestamp,
+                received_timestamp=event.received_timestamp,
+                source="strategy", strategy_mode=event.strategy_mode,
+                direction=(direction if actionable else "NO_TRADE"),
+                p_call=float(decision.p_call or 0.0),
+                p_put=float(decision.p_put or 0.0),
+                p_no_trade=float(decision.p_no_trade or 0.0)))
+        self.signals.append({
+            "symbol": symbol,
+            "direction": direction if actionable else "NO_TRADE",
+            "p_call": decision.p_call, "p_put": decision.p_put,
+            "p_no_trade": decision.p_no_trade,
+            "action": decision.action, "vetoes": list(decision.vetoes),
+            "fingerprint": decision.fingerprint(),
+            "ts": event.event_timestamp})
+
+        if not actionable:
+            return
+        order = intended_order(decision)
+        if not order:
+            return
+        sc = decision.selected_contract or {}
+        quote = snapshot.quote or {}
+        bid = sc.get("bid", quote.get("bid"))
+        ask = sc.get("ask", quote.get("ask"))
+
+        if self._entry_limit_config is not None:
+            order = self._apply_entry_limit(order, sc, quote, bid, ask)
+            if order is None:
+                return  # no valid cap; reason logged in signals entry
+
+        self._corr += 1
+        self._open_symbols.add(symbol)
+        self.emit(TradeIntentEvent(
+            symbol=symbol, contract=order["symbol"], direction=direction,
+            side=order["side"], qty=int(order["qty"]),
+            order_type=order["order_type"], limit_price=order["limit_price"],
+            bid=bid, ask=ask, market={},
+            event_timestamp=event.event_timestamp,
+            received_timestamp=event.received_timestamp,
+            source="strategy", strategy_mode=event.strategy_mode,
+            correlation_id=f"corr-{self._corr:06d}"))
+
+    # -- EV-capped limit entry (opt-in variant, Phase 2) -------------------- #
+    def _apply_entry_limit(self, order: dict, sc: Mapping[str, Any],
+                           quote: Mapping[str, Any], bid, ask) -> Optional[dict]:
+        """Rewrite the intended order as an EV-capped buy limit, or abstain.
+
+        Returns the (possibly rewritten) order dict, or None when no valid cap
+        can be formed and the fallback is 'abstain'. The full ``EntryLimit``
+        (cap, reason codes, net_ev_at_market baseline vs net_ev_at_limit) is
+        logged on the current signals entry. Fail-open: any policy failure
+        leaves the baseline market order unchanged."""
+        cfg = self._entry_limit_config or {}
+        try:
+            from oracle.execution.limit_policy import (compute_entry_limit,
+                                                       gross_ev_from_contract)
+            age = None
+            if isinstance(quote, Mapping):
+                age = quote.get("quote_age_s", quote.get("age_s"))
+            el = compute_entry_limit(
+                gross_ev=gross_ev_from_contract(sc),
+                qty=int(order.get("qty") or 0), bid=bid, ask=ask,
+                quote_age_s=age,
+                cost_model=cfg.get("cost_model"),
+                ev_floor=cfg.get("ev_floor", 0.0),
+                tick=cfg.get("tick"),
+                penny_quoted=bool(cfg.get("penny_quoted", True)),
+                max_quote_age_s=cfg.get("max_quote_age_s"),
+                max_spread_pct=cfg.get("max_spread_pct"),
+                expiry_s=cfg.get("expiry_s", 30.0))
+        except Exception:
+            return order  # fail-open: baseline market entry unchanged
+        if self.signals:
+            self.signals[-1]["entry_limit"] = el.to_dict()
+        if el.is_ok:
+            capped = dict(order)
+            capped["order_type"] = "limit"
+            capped["limit_price"] = el.limit_price
+            capped["expiry_s"] = el.expiry_s
+            return capped
+        if str(cfg.get("fallback", "abstain")).lower() == "market":
+            return order
+        return None
 
 
 def _resolve_explain_fn() -> Callable[..., Mapping[str, Any]]:
