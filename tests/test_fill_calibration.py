@@ -22,6 +22,7 @@ No creds, no network, no file writes (records are passed in directly).
 
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -57,8 +58,22 @@ def _resolved(n, *, expected_entry, actual_entry, fill_prob=1.0,
 class TestFailOpen(unittest.TestCase):
     def test_junk_and_empty_return_default(self):
         default = FillModelConfig()
-        for junk in (None, [], "x", 42, [{"bad": 1}]):
+        for junk in ([], "x", 42, [{"bad": 1}]):
             self.assertEqual(calibrated_params_from(junk, base=default), default)
+
+    def test_none_with_no_ledger_returns_default(self):
+        # records=None means "load the live ledger" — hermetically exercise the
+        # missing-ledger path from an empty cwd so a real ledger in the working
+        # directory (e.g. on the production box) can't leak into the test.
+        default = FillModelConfig()
+        cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                os.chdir(tmp)
+                self.assertEqual(calibrated_params_from(None, base=default),
+                                 default)
+            finally:
+                os.chdir(cwd)
 
     def test_below_threshold_is_byte_identical(self):
         default = FillModelConfig()
