@@ -1,0 +1,54 @@
+{
+  "probe_at_utc": "2026-11-13T23:49:02.390784+00:00",
+  "symbol": "SPG270617C00240000",
+  "session": "2026-11-12",
+  "sdk": "alpaca-py",
+  "checks": {
+    "historical_bars_1min": {
+      "ok": true,
+      "n_bars": 1,
+      "first_ts": "2026-11-12T15:30:00+00:00",
+      "last_ts": "2026-11-12T15:30:00+00:00",
+      "sample": {
+        "o": 14.4,
+        "h": 14.4,
+        "l": 14.4,
+        "c": 14.4,
+        "v": 1.0
+      }
+    },
+    "historical_trades": {
+      "ok": true,
+      "n_trades": 1,
+      "first_ts": "2026-11-12T15:30:06.678771+00:00",
+      "last_ts": "2026-11-12T15:30:06.678771+00:00"
+    },
+    "latest_quote_indicative": {
+      "ok": true,
+      "feed": "indicative",
+      "bid": 13.01,
+      "ask": 14.37,
+      "bid_size": 31.0,
+      "ask_size": 131.0,
+      "ts": "2026-11-13T20:59:59.798799+00:00"
+    },
+    "latest_quote_opra": {
+      "ok": false,
+      "error": "APIError: {\"message\":\"OPRA agreement is not signed\"}\n"
+    },
+    "snapshot_indicative": {
+      "ok": true,
+      "latest_quote_ts": "2026-11-13T20:59:59.798799+00:00",
+      "has_greeks": true,
+      "implied_vol": 0.1976
+    }
+  },
+  "historical_quotes_request_in_sdk": false,
+  "verdict": {
+    "historical_bars": true,
+    "historical_trades": true,
+    "historical_nbbo_quotes": false,
+    "opra_entitled": false,
+    "backfill_promise": "NO historical bid/ask series available via this SDK; counterfactual alternative fills require forward quote capture or labeled mid-of-trades approximation."
+  }
+}
