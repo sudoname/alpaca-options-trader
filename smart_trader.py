@@ -264,6 +264,17 @@ class SmartOptionsTrader:
             env_vars.get('USE_PROFITABILITY_GATE', 'true')
         ).strip().lower() in ('1', 'true', 'yes', 'on')
         self.profitability_gate_dryrun = _flag('PROFITABILITY_GATE_DRYRUN')
+        # Exception policy for the two ACTIVE entry gates (EV gate +
+        # profitability gate). Legacy behavior was fail-OPEN: any exception
+        # raised inside a gate was swallowed ("error (ignored)") and the entry
+        # proceeded, so a broken validator silently disabled enforcement. New
+        # default is fail-CLOSED for NEW ENTRIES only: an evaluation error
+        # blocks the entry and is captured as '<gate>:evaluation_error'. Exit
+        # management is untouched (the gates run only in the pre-submission
+        # entry path). The legacy behavior remains available per gate via
+        # PROFITABILITY_GATE_FAIL_OPEN=1 / EV_GATE_FAIL_OPEN=1.
+        self.profitability_gate_fail_open = _flag('PROFITABILITY_GATE_FAIL_OPEN')
+        self.ev_gate_fail_open = _flag('EV_GATE_FAIL_OPEN')
         self.profitability_gate_rules = {
             'min_signal_strength': _i2('PROFITABILITY_MIN_SIGNAL_STRENGTH', 4),
             'min_pop': _f2('PROFITABILITY_MIN_POP', 0.58),
@@ -2487,6 +2498,246 @@ class SmartOptionsTrader:
             return 2
         return 1
 
+    def _capture_gate_error_reject(self, gate, exc, option, underlying_symbol,
+                                   bid_price, current_option_price,
+                                   order_quantity, dynamic_levels):
+        """Record a gate evaluation error as a rejected candidate.
+
+        Writes '<gate>:evaluation_error' to the research ledger so fail-closed
+        blocks are distinguishable from rule-based blocks in later analysis.
+        Fail-open on capture problems: the block decision is already made by
+        the caller and a ledger error must never change it.
+        """
+        if not getattr(self, 'research_capture', None):
+            return
+        try:
+            self.research_capture.on_candidate(
+                decision_id=None, accepted=False,
+                reject_code=f'{gate}:evaluation_error',
+                symbol=(option or {}).get('symbol'),
+                underlying=underlying_symbol,
+                quote={'bid': bid_price,
+                       'ask': (current_option_price or {}).get('ask')},
+                direction=((option or {}).get('type') or '').upper(),
+                score=(option or {}).get('score'),
+                sizing={'qty': order_quantity},
+                dynamic_levels=dynamic_levels,
+                extra={'error': str(exc)})
+        except Exception:
+            pass
+
+    def _ev_entry_gate_allows(self, option, underlying_symbol, dynamic_levels,
+                              entry_price, order_quantity, bid_price,
+                              current_option_price):
+        """EV entry gate (USE_EV_ENTRY_GATE). True = proceed, False = block.
+
+        Computes the frozen entry-time belief on the pre-trade quote and blocks
+        entries whose expected value per dollar at risk is below the floor.
+        Exception policy: fail-CLOSED -- an evaluation error blocks the NEW
+        entry and is captured as 'ev_gate:evaluation_error'. EV_GATE_FAIL_OPEN=1
+        restores the legacy swallow-and-proceed behavior. Exit management is
+        unaffected: this runs only in the pre-submission entry path.
+        """
+        try:
+            from entry_ev_stamp import compute_entry_stamp
+            gate_stamp = compute_entry_stamp(
+                option, dynamic_levels, entry_price, order_quantity,
+                bid=bid_price, ask=current_option_price['ask'])
+            evpdr = gate_stamp.get('ev_per_dollar_risk') if gate_stamp else None
+            if evpdr is not None:
+                print(f"[EV GATE] ev/$risk={evpdr:+.4f} "
+                      f"floor={self.min_ev_per_dollar_risk:+.4f} "
+                      f"(EV ${gate_stamp['expected_value']:+.2f} "
+                      f"POP {gate_stamp['probability_of_profit']:.0%})")
+                if evpdr < self.min_ev_per_dollar_risk:
+                    print(f"[EV GATE] BLOCKED: ev/$risk {evpdr:+.4f} "
+                          f"below floor {self.min_ev_per_dollar_risk:+.4f}")
+                    self.last_block_reason = (
+                        f"EV gate: expected value per dollar at risk "
+                        f"({evpdr:+.4f}) is below the floor "
+                        f"({self.min_ev_per_dollar_risk:+.4f})")
+                    # Research ledger (flag-gated, fail-open): rejected
+                    # candidate with a machine-readable reason code.
+                    if getattr(self, 'research_capture', None):
+                        try:
+                            self.research_capture.on_candidate(
+                                decision_id=None, accepted=False,
+                                reject_code='ev_gate:ev_per_dollar_risk_below_floor',
+                                symbol=option.get('symbol'),
+                                underlying=underlying_symbol,
+                                quote={'bid': bid_price,
+                                       'ask': current_option_price.get('ask')},
+                                direction=(option.get('type') or '').upper(),
+                                score=option.get('score'),
+                                p_win=gate_stamp.get('probability_of_profit'),
+                                ev=gate_stamp.get('expected_value'),
+                                sizing={'qty': order_quantity},
+                                dynamic_levels=dynamic_levels,
+                                extra={'ev_per_dollar_risk': evpdr,
+                                       'floor': self.min_ev_per_dollar_risk,
+                                       **(self._candidate_extra(option) or {})})
+                        except Exception:
+                            pass
+                    return False
+            return True
+        except Exception as e:
+            if getattr(self, 'ev_gate_fail_open', False):
+                print(f"[EV GATE] error (ignored, fail-open): {e}")
+                return True
+            print(f"[EV GATE] error -> BLOCK (fail-closed): {e}")
+            self.last_block_reason = f"EV gate evaluation error: {e}"
+            self._capture_gate_error_reject(
+                'ev_gate', e, option, underlying_symbol, bid_price,
+                current_option_price, order_quantity, dynamic_levels)
+            return False
+
+    def _profitability_gate_allows(self, option, underlying_symbol,
+                                   dynamic_levels, entry_price, order_quantity,
+                                   bid_price, current_option_price):
+        """Profitability gate (USE_PROFITABILITY_GATE). True = proceed/dry-run,
+        False = block.
+
+        The realized-edge rule set: signal strength, POP, EV, EV/$risk, Oracle
+        no-trade mass and agreement are checked before the order is submitted.
+        Dry-run mode logs would-block without vetoing (including on evaluation
+        errors). Exception policy when ENFORCING: fail-CLOSED -- an evaluation
+        error blocks the NEW entry and is captured as
+        'profit_gate:evaluation_error'. PROFITABILITY_GATE_FAIL_OPEN=1 restores
+        the legacy swallow-and-proceed behavior. Exit management is unaffected:
+        this runs only in the pre-submission entry path.
+        """
+        try:
+            from profitability_validator import validate_trade
+            try:
+                from rh_price_book import get_order_book_imbalance
+                book = get_order_book_imbalance(underlying_symbol) or {}
+                ob_imb = (book.get('orderbook_imbalance')
+                          if isinstance(book, dict) else None)
+            except Exception:
+                ob_imb = None
+
+            gate_stamp = {}
+            try:
+                from entry_ev_stamp import compute_entry_stamp
+                gate_stamp = compute_entry_stamp(
+                    option, dynamic_levels, entry_price, order_quantity,
+                    bid=bid_price, ask=current_option_price['ask']) or {}
+            except Exception:
+                gate_stamp = {}
+
+            oracle_probability = {}
+            if isinstance(option.get('oracle_probability'), dict):
+                oracle_probability = option['oracle_probability']
+            elif getattr(self, 'use_oracle_trade_gate', False):
+                try:
+                    import oracle_intelligence_reports as oir
+                    gate_ctx = self._build_evidence_ctx(
+                        underlying_symbol, option, dynamic_levels)
+                    head = oir.compute_oracle_explain(
+                        underlying_symbol, ctx=gate_ctx)
+                    oracle_probability = ((head or {}).get('probability') or {})
+                except Exception:
+                    oracle_probability = {}
+
+            candidate = {
+                'symbol': option['symbol'],
+                'direction': option.get('type'),
+                'side': option.get('type'),
+                'intended_side': option.get('type'),
+                'option': {
+                    'type': option.get('type'),
+                    'confidence': option.get('confidence', self.last_signal_strength),
+                },
+                'entry_stamp': {
+                    'probability_of_profit': gate_stamp.get('probability_of_profit'),
+                    'expected_value': gate_stamp.get('expected_value'),
+                    'ev_per_dollar_risk': gate_stamp.get('ev_per_dollar_risk'),
+                },
+                'oracle_probability': oracle_probability,
+                'robinhood_book': {'orderbook_imbalance': ob_imb},
+            }
+            verdict = validate_trade(candidate, self.profitability_gate_rules)
+            print(f"[PROFIT GATE] signal={candidate['option'].get('confidence')} "
+                  f"POP={verdict['summary'].get('probability_of_profit')} "
+                  f"EV={verdict['summary'].get('expected_value')} "
+                  f"EV/$risk={verdict['summary'].get('ev_per_dollar_risk')} "
+                  f"P(no-trade)={verdict['summary'].get('p_no_trade')} "
+                  f"agree={verdict['summary'].get('oracle_agreement')} "
+                  f"-> {'ALLOW' if verdict['pass'] else 'BLOCK'}")
+            # Shadow-record the Robinhood book observation alongside the
+            # gate verdict (recording only; cannot affect the verdict).
+            # Default OFF via ENABLE_ORDERBOOK_SHADOW.
+            if ob_imb is not None and getattr(self, 'enable_orderbook_shadow', False):
+                try:
+                    import json as _json
+                    from datetime import datetime as _dt, timezone as _tz
+                    _row = {
+                        'type': 'orderbook_shadow',
+                        'recorded_at': _dt.now(_tz.utc).isoformat(),
+                        'symbol': underlying_symbol,
+                        'option_symbol': option.get('symbol'),
+                        'side': option.get('type'),
+                        'book': book if isinstance(book, dict) else
+                                {'orderbook_imbalance': ob_imb},
+                        'would_block_weak': abs(ob_imb) < 0.05,
+                        'veto_active': bool(
+                            self.profitability_gate_rules.get(
+                                'orderbook_veto', True)),
+                        'gate_pass': verdict['pass'],
+                        'gate_reasons': verdict['reasons'],
+                        'summary': verdict['summary'],
+                    }
+                    with open('orderbook_shadow.jsonl', 'a',
+                              encoding='utf-8') as _fh:
+                        _fh.write(_json.dumps(_row, default=str) + '\n')
+                except Exception as _exc:
+                    print(f"[OB SHADOW] append ignored: {_exc}")
+            if not verdict['pass']:
+                reason = '; '.join(verdict['reasons']) or 'profitability rule set failed'
+                if getattr(self, 'profitability_gate_dryrun', False):
+                    print(f"[PROFIT GATE] would-block: {reason}")
+                else:
+                    self.last_block_reason = f"profitability gate: {reason}"
+                    # Research ledger (flag-gated, fail-open): rejected
+                    # candidate with a machine-readable reason code.
+                    if getattr(self, 'research_capture', None):
+                        try:
+                            _s = verdict.get('summary') or {}
+                            self.research_capture.on_candidate(
+                                decision_id=None, accepted=False,
+                                reject_code=f'profit_gate:{reason}',
+                                symbol=option.get('symbol'),
+                                underlying=underlying_symbol,
+                                quote={'bid': bid_price,
+                                       'ask': current_option_price.get('ask')},
+                                direction=(option.get('type') or '').upper(),
+                                score=option.get('score'),
+                                p_win=_s.get('probability_of_profit'),
+                                ev=_s.get('expected_value'),
+                                sizing={'qty': order_quantity},
+                                dynamic_levels=dynamic_levels,
+                                extra={'ev_per_dollar_risk':
+                                           _s.get('ev_per_dollar_risk'),
+                                       'orderbook_imbalance': ob_imb,
+                                       **(self._candidate_extra(option) or {})})
+                        except Exception:
+                            pass
+                    return False
+            return True
+        except Exception as e:
+            if getattr(self, 'profitability_gate_dryrun', False):
+                print(f"[PROFIT GATE] error (dry-run, ignored): {e}")
+                return True
+            if getattr(self, 'profitability_gate_fail_open', False):
+                print(f"[PROFIT GATE] error (ignored, fail-open): {e}")
+                return True
+            print(f"[PROFIT GATE] error -> BLOCK (fail-closed): {e}")
+            self.last_block_reason = f"profitability gate evaluation error: {e}"
+            self._capture_gate_error_reject(
+                'profit_gate', e, option, underlying_symbol, bid_price,
+                current_option_price, order_quantity, dynamic_levels)
+            return False
+
     def place_order_with_stops(self, option: Dict, quantity: int = None):
         """Place order with dynamic stop loss and take profit.
 
@@ -2810,181 +3061,30 @@ class SmartOptionsTrader:
             except Exception as e:
                 print(f"[THESIS] error (ignored): {e}")
 
-        # ---- EV entry gate (opt-in, fail-open) --------------------------------
+        # ---- EV entry gate (opt-in, fail-closed on error) ---------------------
         # Runs AFTER sizing so the stamp's premium reflects the final size, and
         # BEFORE the order is sent. Computes the frozen entry-time belief on the
         # pre-trade quote and blocks entries whose expected value per dollar at
         # risk is below the floor. Always logs the value so the floor can be
-        # calibrated from live data. Any error -> no effect (trade proceeds).
+        # calibrated from live data. Evaluation errors block the new entry
+        # (EV_GATE_FAIL_OPEN=1 restores the legacy ignore-and-proceed).
         if getattr(self, 'use_ev_entry_gate', False):
-            try:
-                from entry_ev_stamp import compute_entry_stamp
-                gate_stamp = compute_entry_stamp(
-                    option, dynamic_levels, entry_price, order_quantity,
-                    bid=bid_price, ask=current_option_price['ask'])
-                evpdr = gate_stamp.get('ev_per_dollar_risk') if gate_stamp else None
-                if evpdr is not None:
-                    print(f"[EV GATE] ev/$risk={evpdr:+.4f} "
-                          f"floor={self.min_ev_per_dollar_risk:+.4f} "
-                          f"(EV ${gate_stamp['expected_value']:+.2f} "
-                          f"POP {gate_stamp['probability_of_profit']:.0%})")
-                    if evpdr < self.min_ev_per_dollar_risk:
-                        print(f"[EV GATE] BLOCKED: ev/$risk {evpdr:+.4f} "
-                              f"below floor {self.min_ev_per_dollar_risk:+.4f}")
-                        self.last_block_reason = (
-                            f"EV gate: expected value per dollar at risk "
-                            f"({evpdr:+.4f}) is below the floor "
-                            f"({self.min_ev_per_dollar_risk:+.4f})")
-                        # Research ledger (flag-gated, fail-open): rejected
-                        # candidate with a machine-readable reason code.
-                        if getattr(self, 'research_capture', None):
-                            try:
-                                self.research_capture.on_candidate(
-                                    decision_id=None, accepted=False,
-                                    reject_code='ev_gate:ev_per_dollar_risk_below_floor',
-                                    symbol=option.get('symbol'),
-                                    underlying=underlying_symbol,
-                                    quote={'bid': bid_price,
-                                           'ask': current_option_price.get('ask')},
-                                    direction=(option.get('type') or '').upper(),
-                                    score=option.get('score'),
-                                    p_win=gate_stamp.get('probability_of_profit'),
-                                    ev=gate_stamp.get('expected_value'),
-                                    sizing={'qty': order_quantity},
-                                    dynamic_levels=dynamic_levels,
-                                    extra={'ev_per_dollar_risk': evpdr,
-                                           'floor': self.min_ev_per_dollar_risk,
-                                           **(self._candidate_extra(option) or {})})
-                            except Exception:
-                                pass
-                        return None
-            except Exception as e:
-                print(f"[EV GATE] error (ignored): {e}")
+            if not self._ev_entry_gate_allows(
+                    option, underlying_symbol, dynamic_levels, entry_price,
+                    order_quantity, bid_price, current_option_price):
+                return None
 
         # ---- Profitability gate (hard entry-quality veto) --------------------
         # This is the realized-edge rule set: signal strength, POP, EV, EV/$risk,
         # Oracle no-trade mass and agreement are all checked before the order is
-        # submitted. The dry-run mode logs would-block without vetoing.
+        # submitted. The dry-run mode logs would-block without vetoing. When
+        # enforcing, evaluation errors block the new entry
+        # (PROFITABILITY_GATE_FAIL_OPEN=1 restores the legacy behavior).
         if getattr(self, 'use_profitability_gate', False):
-            try:
-                from profitability_validator import validate_trade
-                try:
-                    from rh_price_book import get_order_book_imbalance
-                    book = get_order_book_imbalance(underlying_symbol) or {}
-                    ob_imb = (book.get('orderbook_imbalance')
-                              if isinstance(book, dict) else None)
-                except Exception:
-                    ob_imb = None
-
-                gate_stamp = {}
-                try:
-                    from entry_ev_stamp import compute_entry_stamp
-                    gate_stamp = compute_entry_stamp(
-                        option, dynamic_levels, entry_price, order_quantity,
-                        bid=bid_price, ask=current_option_price['ask']) or {}
-                except Exception:
-                    gate_stamp = {}
-
-                oracle_probability = {}
-                if isinstance(option.get('oracle_probability'), dict):
-                    oracle_probability = option['oracle_probability']
-                elif getattr(self, 'use_oracle_trade_gate', False):
-                    try:
-                        import oracle_intelligence_reports as oir
-                        gate_ctx = self._build_evidence_ctx(
-                            underlying_symbol, option, dynamic_levels)
-                        head = oir.compute_oracle_explain(
-                            underlying_symbol, ctx=gate_ctx)
-                        oracle_probability = ((head or {}).get('probability') or {})
-                    except Exception:
-                        oracle_probability = {}
-
-                candidate = {
-                    'symbol': option['symbol'],
-                    'direction': option.get('type'),
-                    'side': option.get('type'),
-                    'intended_side': option.get('type'),
-                    'option': {
-                        'type': option.get('type'),
-                        'confidence': option.get('confidence', self.last_signal_strength),
-                    },
-                    'entry_stamp': {
-                        'probability_of_profit': gate_stamp.get('probability_of_profit'),
-                        'expected_value': gate_stamp.get('expected_value'),
-                        'ev_per_dollar_risk': gate_stamp.get('ev_per_dollar_risk'),
-                    },
-                    'oracle_probability': oracle_probability,
-                    'robinhood_book': {'orderbook_imbalance': ob_imb},
-                }
-                verdict = validate_trade(candidate, self.profitability_gate_rules)
-                print(f"[PROFIT GATE] signal={candidate['option'].get('confidence')} "
-                      f"POP={verdict['summary'].get('probability_of_profit')} "
-                      f"EV={verdict['summary'].get('expected_value')} "
-                      f"EV/$risk={verdict['summary'].get('ev_per_dollar_risk')} "
-                      f"P(no-trade)={verdict['summary'].get('p_no_trade')} "
-                      f"agree={verdict['summary'].get('oracle_agreement')} "
-                      f"-> {'ALLOW' if verdict['pass'] else 'BLOCK'}")
-                # Shadow-record the Robinhood book observation alongside the
-                # gate verdict (recording only; cannot affect the verdict).
-                # Default OFF via ENABLE_ORDERBOOK_SHADOW.
-                if ob_imb is not None and getattr(self, 'enable_orderbook_shadow', False):
-                    try:
-                        import json as _json
-                        from datetime import datetime as _dt, timezone as _tz
-                        _row = {
-                            'type': 'orderbook_shadow',
-                            'recorded_at': _dt.now(_tz.utc).isoformat(),
-                            'symbol': underlying_symbol,
-                            'option_symbol': option.get('symbol'),
-                            'side': option.get('type'),
-                            'book': book if isinstance(book, dict) else
-                                    {'orderbook_imbalance': ob_imb},
-                            'would_block_weak': abs(ob_imb) < 0.05,
-                            'veto_active': bool(
-                                self.profitability_gate_rules.get(
-                                    'orderbook_veto', True)),
-                            'gate_pass': verdict['pass'],
-                            'gate_reasons': verdict['reasons'],
-                            'summary': verdict['summary'],
-                        }
-                        with open('orderbook_shadow.jsonl', 'a',
-                                  encoding='utf-8') as _fh:
-                            _fh.write(_json.dumps(_row, default=str) + '\n')
-                    except Exception as _exc:
-                        print(f"[OB SHADOW] append ignored: {_exc}")
-                if not verdict['pass']:
-                    reason = '; '.join(verdict['reasons']) or 'profitability rule set failed'
-                    if getattr(self, 'profitability_gate_dryrun', False):
-                        print(f"[PROFIT GATE] would-block: {reason}")
-                    else:
-                        self.last_block_reason = f"profitability gate: {reason}"
-                        # Research ledger (flag-gated, fail-open): rejected
-                        # candidate with a machine-readable reason code.
-                        if getattr(self, 'research_capture', None):
-                            try:
-                                _s = verdict.get('summary') or {}
-                                self.research_capture.on_candidate(
-                                    decision_id=None, accepted=False,
-                                    reject_code=f'profit_gate:{reason}',
-                                    symbol=option.get('symbol'),
-                                    underlying=underlying_symbol,
-                                    quote={'bid': bid_price,
-                                           'ask': current_option_price.get('ask')},
-                                    direction=(option.get('type') or '').upper(),
-                                    score=option.get('score'),
-                                    p_win=_s.get('probability_of_profit'),
-                                    ev=_s.get('expected_value'),
-                                    sizing={'qty': order_quantity},
-                                    dynamic_levels=dynamic_levels,
-                                    extra={'ev_per_dollar_risk':
-                                               _s.get('ev_per_dollar_risk'),
-                                           'orderbook_imbalance': ob_imb,
-                                           **(self._candidate_extra(option) or {})})
-                            except Exception:
-                                pass
-                        return None
-            except Exception as e:
-                print(f"[PROFIT GATE] error (ignored): {e}")
+            if not self._profitability_gate_allows(
+                    option, underlying_symbol, dynamic_levels, entry_price,
+                    order_quantity, bid_price, current_option_price):
+                return None
 
         # ---- Oracle 3.0: executable EV (opt-in; shadow-first, fail-open) ------
         # Recomputes EV net of realistic execution frictions (crossing the
