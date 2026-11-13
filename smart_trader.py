@@ -4395,14 +4395,31 @@ class SmartOptionsTrader:
 
         return False
 
-    def record_trade_outcome(self, trade: Dict, outcome: str, pnl_percent: float = 0):
-        """Record trade outcome for learning"""
+    def record_trade_outcome(self, trade: Dict, outcome: str, pnl_percent: float = 0,
+                             *, net_pnl_dollars=None, pnl_source=None):
+        """Record trade outcome for learning.
+
+        `pnl_percent` keeps its legacy mark-derived meaning (gross %). When the
+        caller resolved the close from actual broker fills it passes the
+        keyword-only `net_pnl_dollars` (fees-inclusive realized dollars) and
+        `pnl_source` ('fills'); otherwise both default so the record is tagged
+        'mark'. The legacy `pnl` field stays mark-derived — net dollars live in
+        the additive `net_pnl_dollars` field so readers can tell them apart.
+        """
+        net_val = None
+        try:
+            if net_pnl_dollars is not None:
+                net_val = float(net_pnl_dollars)
+        except (TypeError, ValueError):
+            net_val = None
         trade_record = {
             'symbol': trade['symbol'],
             'entry_time': trade['entry_time'],
             'exit_time': datetime.now().isoformat(),
             'outcome': outcome,
             'pnl_percent': pnl_percent,
+            'net_pnl_dollars': net_val,
+            'pnl_source': pnl_source or 'mark',
             'metrics': trade.get('metrics', {})
         }
 
@@ -4463,12 +4480,17 @@ class SmartOptionsTrader:
         # Phase 4: accumulate realized dollar P/L for today's kill-switch input.
         # Side-effect only (writes realized_pnl_log.json); it never blocks a
         # trade and only feeds the switch when USE_REALIZED_PNL_KILLSWITCH is on.
+        # Prefers the fills-based net when the caller supplied it; otherwise
         # Dollar P/L = entry notional * pnl_percent. Never raises.
         try:
             entry_price = trade.get('entry_price')
             qty = trade.get('quantity', 1) or 1
-            if entry_price:
+            realized_dollars = None
+            if net_val is not None:
+                realized_dollars = net_val
+            elif entry_price:
                 realized_dollars = float(entry_price) * 100.0 * float(qty) * (float(pnl_percent) / 100.0)
+            if realized_dollars is not None:
                 from realized_pnl_tracker import RealizedPnLTracker
                 RealizedPnLTracker().add_realized(realized_dollars, trade.get('symbol'))
         except Exception as e:
@@ -4533,17 +4555,30 @@ class SmartOptionsTrader:
         # Research ledger (flag-gated, fail-open): append exit + realized
         # outcome events to the decision's append-only lifecycle. Independent
         # of the shadow recorder; never affects the close that just happened.
-        # pnl_percent here is GROSS; net-of-cost is left to the reconciler.
+        # pnl_percent here is GROSS; net fields are honest-None unless the
+        # caller resolved them from broker fills.
         # exit_price is honest-None when unknown rather than estimated.
         if getattr(self, 'research_capture', None) and trade.get('decision_id'):
             try:
+                net_pct = None
+                if net_val is not None:
+                    try:
+                        notional = (float(trade.get('entry_price') or 0)
+                                    * 100.0
+                                    * float(trade.get('quantity', 1) or 1))
+                        if notional > 0:
+                            net_pct = net_val / notional * 100.0
+                    except (TypeError, ValueError):
+                        net_pct = None
                 self.research_capture.on_exit(
                     trade['decision_id'],
                     order_id=trade.get('order_id'),
                     qty=trade.get('quantity', 1) or 1,
                     exit_price=trade.get('exit_price'),
                     reason=outcome,
-                    gross_pnl_pct=pnl_percent)
+                    gross_pnl_pct=pnl_percent,
+                    net_pnl_pct=net_pct,
+                    net_pnl_dollars=net_val)
             except Exception:
                 pass
 

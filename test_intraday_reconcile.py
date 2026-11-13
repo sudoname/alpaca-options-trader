@@ -36,6 +36,7 @@ class _FakeTrader:
         self.trading_history = {"trades": []}
         self.closed = []
         self.recorded = []
+        self.recorded_kw = []
 
     def get_positions(self):
         return self._positions
@@ -43,8 +44,9 @@ class _FakeTrader:
     def close_position(self, trade, position, reason):
         self.closed.append((trade["symbol"], reason))
 
-    def record_trade_outcome(self, trade, outcome, pnl_percent=0):
+    def record_trade_outcome(self, trade, outcome, pnl_percent=0, **kw):
         self.recorded.append((trade["symbol"], outcome, round(pnl_percent, 4)))
+        self.recorded_kw.append(kw)
         self.trading_history["trades"].append(
             {"symbol": trade["symbol"], "entry_time": trade.get("entry_time"),
              "outcome": outcome, "pnl_percent": pnl_percent})
@@ -58,8 +60,9 @@ class TestRealizedFromFills(unittest.TestCase):
     def test_single_fill(self):
         trade = {"entry_price": 24.9, "quantity": 3}
         fills = [{"qty": 3, "price": 22.15, "transaction_time": "2026-06-09T19:45:23"}]
-        ep, pnl = realized_from_fills(trade, fills)
+        ep, pnl, mq = realized_from_fills(trade, fills)
         self.assertAlmostEqual(ep, 22.15, places=4)
+        self.assertAlmostEqual(mq, 3, places=4)
         self.assertAlmostEqual(pnl, (22.15 - 24.9) / 24.9 * 100, places=4)
 
     def test_split_fills_weighted(self):
@@ -69,7 +72,7 @@ class TestRealizedFromFills(unittest.TestCase):
             {"qty": 1, "price": 18.2, "transaction_time": "2026-06-09T19:45:24"},
             {"qty": 1, "price": 18.2, "transaction_time": "2026-06-09T19:45:23"},
         ]
-        ep, pnl = realized_from_fills(trade, fills)
+        ep, pnl, _ = realized_from_fills(trade, fills)
         self.assertAlmostEqual(ep, 18.2, places=4)
         self.assertAlmostEqual(pnl, (18.2 - 20.6) / 20.6 * 100, places=4)
 
@@ -81,7 +84,7 @@ class TestRealizedFromFills(unittest.TestCase):
             {"qty": 2, "price": 12.0, "transaction_time": "2026-06-09T19:00:00"},
             {"qty": 2, "price": 99.0, "transaction_time": "2026-06-01T10:00:00"},
         ]
-        ep, pnl = realized_from_fills(trade, fills)
+        ep, pnl, _ = realized_from_fills(trade, fills)
         self.assertAlmostEqual(ep, 12.0, places=4)
 
     def test_weighted_average_across_prices(self):
@@ -90,31 +93,32 @@ class TestRealizedFromFills(unittest.TestCase):
             {"qty": 1, "price": 12.0, "transaction_time": "2026-06-09T19:00:02"},
             {"qty": 2, "price": 9.0, "transaction_time": "2026-06-09T19:00:01"},
         ]
-        ep, _ = realized_from_fills(trade, fills)
+        ep, _, _ = realized_from_fills(trade, fills)
         self.assertAlmostEqual(ep, (12.0 * 1 + 9.0 * 2) / 3, places=4)
 
     def test_empty_fills_returns_none(self):
         self.assertEqual(realized_from_fills({"entry_price": 5, "quantity": 1}, []),
-                         (None, None))
+                         (None, None, None))
 
     def test_missing_entry_returns_none(self):
         self.assertEqual(
             realized_from_fills({"quantity": 1},
                                 [{"qty": 1, "price": 2, "transaction_time": "t"}]),
-            (None, None))
+            (None, None, None))
 
     def test_zero_quantity_returns_none(self):
         self.assertEqual(
             realized_from_fills({"entry_price": 5, "quantity": 0},
                                 [{"qty": 1, "price": 2, "transaction_time": "t"}]),
-            (None, None))
+            (None, None, None))
 
     def test_partial_coverage_uses_available(self):
         # Only 1 of 2 contracts has a fill -> book the 1 we can see.
         trade = {"entry_price": 10.0, "quantity": 2}
         fills = [{"qty": 1, "price": 11.0, "transaction_time": "2026-06-09T19:00:00"}]
-        ep, _ = realized_from_fills(trade, fills)
+        ep, _, mq = realized_from_fills(trade, fills)
         self.assertAlmostEqual(ep, 11.0, places=4)
+        self.assertAlmostEqual(mq, 1, places=4)
 
 
 class TestAlreadyBooked(unittest.TestCase):
@@ -255,6 +259,11 @@ class TestReconcileFromFills(_FileBackedCase):
         sym, outcome, pnl = trader.recorded[0]
         self.assertEqual((sym, outcome), ("KO...C", "reconciled_fill_close"))
         self.assertAlmostEqual(pnl, (6.05 - 6.75) / 6.75 * 100, places=2)
+        # Fills-based net dollars threaded through as keyword args.
+        kw = trader.recorded_kw[0]
+        self.assertEqual(kw.get("pnl_source"), "fills")
+        self.assertAlmostEqual(kw.get("net_pnl_dollars"),
+                               (6.05 - 6.75) * 2 * 100, places=2)  # -140.00
         self.assertEqual(self._read(), [])
 
     def test_idempotent_second_pass_no_double_record(self):

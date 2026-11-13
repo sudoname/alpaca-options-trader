@@ -43,7 +43,11 @@ from typing import Dict, List, Optional
 MIN_RESOLVED_PER_GROUP = 5   # below this per group -> insufficient_evidence
 
 # Payload keys tried (in order) for a dollar net outcome on 'outcome' events.
-_OUTCOME_KEYS = ("net_pnl", "net_pnl_usd", "realized_pnl", "pnl")
+# net_pnl_dollars first: it is the fills-based realized net written by
+# research_capture.on_exit / outcome_states (None when unresolved, which
+# _extract_net_outcome already skips).
+_OUTCOME_KEYS = ("net_pnl_dollars", "net_pnl", "net_pnl_usd",
+                 "realized_pnl", "pnl")
 
 
 # --------------------------------------------------------------------------- #

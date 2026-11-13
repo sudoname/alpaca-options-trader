@@ -329,21 +329,24 @@ def _prune_active_trades(closed_syms):
 
 
 def realized_from_fills(trade, fills):
-    """PURE: compute (exit_price, pnl_percent) for `trade` from its SELL `fills`.
+    """PURE: compute (exit_price, pnl_percent, matched_qty) for `trade` from
+    its SELL `fills`.
 
     `fills` is a list of activity dicts ({'qty','price','transaction_time'}) for
     the trade's symbol. Uses a quantity-weighted average over the most-recent
     sells that cover the open quantity, so a position closed in several fills
-    (e.g. 1+1) books at its true average exit. Returns (None, None) when there
-    is no usable entry price / quantity / fill — the caller then leaves the row
-    tracked rather than booking a bogus outcome. No network, unit-testable."""
+    (e.g. 1+1) books at its true average exit. matched_qty is the exit quantity
+    actually matched against the open quantity (may be < quantity on partial
+    coverage). Returns (None, None, None) when there is no usable entry price /
+    quantity / fill — the caller then leaves the row tracked rather than
+    booking a bogus outcome. No network, unit-testable."""
     try:
         entry = float(trade.get("entry_price") or 0)
         want = float(trade.get("quantity") or 0)
     except (TypeError, ValueError):
-        return (None, None)
+        return (None, None, None)
     if entry <= 0 or want <= 0 or not fills:
-        return (None, None)
+        return (None, None, None)
     ordered = sorted(fills, key=lambda a: str(a.get("transaction_time") or ""),
                      reverse=True)
     filled_qty = 0.0
@@ -364,10 +367,10 @@ def realized_from_fills(trade, fills):
         if filled_qty >= want:
             break
     if filled_qty <= 0:
-        return (None, None)
+        return (None, None, None)
     exit_price = proceeds / filled_qty
     pnl_percent = (exit_price - entry) / entry * 100.0
-    return (exit_price, pnl_percent)
+    return (exit_price, pnl_percent, filled_qty)
 
 
 def _fetch_sell_fills_by_symbol(trader):
@@ -554,16 +557,32 @@ class IntradayScheduler:
                 if _already_booked(self.trader, t):
                     closed_syms.add(sym)  # booked elsewhere; just prune it
                     continue
-                exit_price, pnl_percent = realized_from_fills(
+                exit_price, pnl_percent, matched_qty = realized_from_fills(
                     t, fills_by_symbol.get(sym, []))
                 if exit_price is None:
                     log(f"[RECONCILE] no sell fill for {sym}; leaving tracked")
                     continue
+                # Fills-based net dollars (fail-open: a failure here degrades
+                # to the legacy mark-derived booking, never blocks the close).
+                net_dollars = None
+                try:
+                    from outcome_states import net_dollars_from_fills
+                    r = net_dollars_from_fills(
+                        [{"qty": t.get("quantity"),
+                          "price": t.get("entry_price")}],
+                        [{"qty": matched_qty, "price": exit_price}])
+                    if r is not None:
+                        net_dollars = r["net_pnl_dollars"]
+                except Exception:
+                    net_dollars = None
                 log(f"[RECONCILE] booking missed close {sym} "
                     f"exit={exit_price:.2f} pnl={pnl_percent:+.1f}%")
                 try:
                     self.trader.record_trade_outcome(
-                        t, "reconciled_fill_close", pnl_percent)
+                        t, "reconciled_fill_close", pnl_percent,
+                        net_pnl_dollars=net_dollars,
+                        pnl_source="fills" if net_dollars is not None
+                        else None)
                     closed_syms.add(sym)
                 except Exception as e:
                     log(f"[RECONCILE] record failed for {sym}: {e}")
