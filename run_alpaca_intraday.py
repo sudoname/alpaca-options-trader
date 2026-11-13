@@ -51,6 +51,7 @@ import re
 import sys
 import json
 import time
+import uuid
 import argparse
 from datetime import datetime, date, time as dtime
 
@@ -1009,6 +1010,13 @@ class IntradayScheduler:
 
         Returns the (sorted) candidate list so observe-only consumers (shadow
         strategies) can see what the baseline considered this scan."""
+        # Phase 1 research: one scan id per ranking pass so every candidate
+        # group captured during this scan shares a stable correlation key.
+        # Observe-only; the trader just stamps it into ledger rows.
+        try:
+            self.trader.current_scan_id = str(uuid.uuid4())
+        except Exception:
+            pass
         candidates = []
         for sym in self.symbols:
             try:

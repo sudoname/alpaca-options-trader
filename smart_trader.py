@@ -198,6 +198,16 @@ class SmartOptionsTrader:
             except (TypeError, ValueError):
                 return default
 
+        # Phase 1 research: candidate-group capture (observe-only, fail-open,
+        # off the order path). When on, select_best_option records EVERY
+        # contract it considered -- winner, scored losers, and skips -- so
+        # ranking challengers can be replayed offline against the real
+        # candidate set. OFF by default: selection behavior is unchanged.
+        self.enable_group_capture = _flag('ENABLE_GROUP_CAPTURE')
+        self.group_capture_max = _i2('GROUP_CAPTURE_MAX', 60)
+        # Scan correlation id, set per scan by the scheduler before ranking.
+        self.current_scan_id = None
+
         # 1) DTE targeting: prefer contracts near OPTION_TARGET_DTE, gate to the
         #    [OPTION_MIN_DTE, OPTION_MAX_DTE] window. Gated by USE_DTE_TARGETING.
         self.option_min_dte = _i2('OPTION_MIN_DTE', 30)
@@ -1842,7 +1852,8 @@ class SmartOptionsTrader:
         """
         option = option or {}
         extra = {k: option.get(k)
-                 for k in ('greeks_quality', 'quote_ts', 'thesis_review')
+                 for k in ('greeks_quality', 'quote_ts', 'thesis_review',
+                           'scan_id', 'group_id', 'candidate_id')
                  if option.get(k) is not None}
         return extra or None
 
@@ -2239,6 +2250,17 @@ class SmartOptionsTrader:
         best_score = -1
         validated_count = 0
 
+        # Phase 1 research capture: collect one row per considered contract so
+        # the full candidate group (not just the winner) lands in the ledger.
+        # Observe-only and fail-open; _grp stays None when the feature is off
+        # so the loop below pays one `is not None` check per append site.
+        # getattr-guarded: hermetic tests build traders via __new__.
+        _grp = None
+        if (getattr(self, 'enable_group_capture', False)
+                and getattr(self, 'research_capture', None) is not None):
+            _grp = []
+        _grp_skips = {'wrong_type_or_moneyness': 0}
+
         # News ranking nudge (fail-open): fetch once for this underlying and
         # precompute a multiplier that boosts contracts aligned with bullish/
         # bearish coverage and trims those against it. 1.0 when unavailable.
@@ -2276,8 +2298,10 @@ class SmartOptionsTrader:
             if strategy == 'call':
                 # For calls, prefer ITM or near-the-money
                 if strike > current_price * 1.05:  # Skip far OTM calls
+                    _grp_skips['wrong_type_or_moneyness'] += 1
                     continue
                 if contract_type != 'call':
+                    _grp_skips['wrong_type_or_moneyness'] += 1
                     continue
 
                 # Calculate call-specific metrics
@@ -2287,8 +2311,10 @@ class SmartOptionsTrader:
             else:  # strategy == 'put'
                 # For puts, prefer ITM or near-the-money
                 if strike < current_price * 0.95:  # Skip far OTM puts
+                    _grp_skips['wrong_type_or_moneyness'] += 1
                     continue
                 if contract_type != 'put':
+                    _grp_skips['wrong_type_or_moneyness'] += 1
                     continue
 
                 # Calculate put-specific metrics
@@ -2335,6 +2361,9 @@ class SmartOptionsTrader:
                 option_quote = quote_map.get(option_symbol)
                 if not option_quote or option_quote['ask'] <= 0:
                     print(f"[SKIP] No valid quote for {option_symbol} (Strike: ${strike:.2f}, Exp: {expiration})")
+                    if _grp is not None:
+                        _grp.append({'symbol': option_symbol,
+                                     'skip_reason': 'no_quote', 'dte': dte})
                     continue
 
                 ask_price = option_quote['ask']
@@ -2350,6 +2379,11 @@ class SmartOptionsTrader:
                 if spread_pct > self.max_spread_pct:
                     print(f"[SKIP] Spread too wide: {spread_pct:.1f}% "
                           f"(max {self.max_spread_pct:.0f}%)")
+                    if _grp is not None:
+                        _grp.append({'symbol': option_symbol,
+                                     'skip_reason': 'spread_too_wide',
+                                     'bid': bid_price, 'ask': ask_price,
+                                     'quote_ts': quote_ts, 'dte': dte})
                     continue
 
             # Budget filter: skip contracts whose per-contract cost exceeds the
@@ -2358,6 +2392,11 @@ class SmartOptionsTrader:
             contract_cost = ask_price * 100
             if ask_price > 0 and contract_cost > self.max_budget_per_trade:
                 print(f"[SKIP] ${strike:.2f} {contract_type.upper()} exp {expiration} - cost ${contract_cost:.2f} exceeds budget ${self.max_budget_per_trade:.2f}")
+                if _grp is not None:
+                    _grp.append({'symbol': option_symbol,
+                                 'skip_reason': 'over_budget',
+                                 'bid': bid_price, 'ask': ask_price,
+                                 'quote_ts': quote_ts, 'dte': dte})
                 continue
 
             # Calculate option metrics. delta/gamma/theta/vega/iv start as
@@ -2415,6 +2454,15 @@ class SmartOptionsTrader:
                 volume_present=volume_present, oi_present=oi_present)
             if reject_reason:
                 print(f"[REJECT] {option_symbol} reason={reject_reason}")
+                if _grp is not None:
+                    _grp.append({
+                        'symbol': option_symbol,
+                        'skip_reason': f'phase2:{reject_reason}',
+                        'bid': bid_price, 'ask': ask_price,
+                        'quote_ts': quote_ts, 'dte': dte,
+                        'greeks': {k: option_data.get(k) for k in
+                                   ('delta', 'gamma', 'theta', 'vega', 'iv')},
+                    })
                 continue
 
             # Calculate base score
@@ -2452,6 +2500,16 @@ class SmartOptionsTrader:
 
                 print(f"[LIQUIDITY] Vol: {volume_score:.1f}, OI: {oi_score:.1f}, Spread: {spread_score:.1f} = Total: {liquidity_score:.1f}")
 
+            if _grp is not None:
+                _grp.append({
+                    'symbol': option_symbol, 'score': score,
+                    'bid': bid_price, 'ask': ask_price, 'dte': dte,
+                    'quote_ts': quote_ts,
+                    'greeks': {k: option_data.get(k) for k in
+                               ('delta', 'gamma', 'theta', 'vega', 'iv')},
+                    'skip_reason': None,
+                })
+
             if score > best_score:
                 best_score = score
                 best_option = option_data
@@ -2468,12 +2526,60 @@ class SmartOptionsTrader:
             # only when ENABLE_CONVICTION_SIZING is on; otherwise informational).
             best_option['conviction'] = getattr(self, 'last_conviction', None)
 
+        # Phase 1 research: persist the full candidate group (fail-open, off
+        # the order path). Stamps scan/group/candidate IDs onto the winner so
+        # the accepted-candidate capture and gate verdicts join to the group.
+        if _grp is not None and best_option is not None and _grp:
+            try:
+                self._record_candidate_group(
+                    _grp, _grp_skips, best_option, strategy, current_price)
+            except Exception as e:
+                print(f"[GROUP-CAPTURE] record error (ignored): {e}")
+
         if best_option and not best_option.get('mock', False):
             print(f"[BEST OPTION] Strike: ${best_option['strike']:.2f} {best_option['type'].upper()}")
             print(f"[BEST OPTION] Expiration: {best_option['expiration']}")
             print(f"[BEST OPTION] Score: {best_option['score']:.2f}")
 
         return best_option
+
+    def _record_candidate_group(self, rows, skip_counts, best_option,
+                                strategy, current_price):
+        """Write the full candidate group to the research ledger (Phase 1).
+
+        Marks the winner row, stamps the deterministic scan/group/candidate
+        IDs onto the selected option (harvested later by _candidate_extra so
+        the accepted-candidate snapshot and gate verdicts link back to the
+        group), then hands the rows to the fail-open capture hook. The caller
+        wraps this in try/except -- an error here can never affect selection
+        or the order path.
+        """
+        import research_capture as _rc
+        best_symbol = best_option.get('symbol')
+        for row in rows:
+            row['selected'] = (row.get('symbol') == best_symbol
+                               and row.get('skip_reason') is None)
+        scan_id = getattr(self, 'current_scan_id', None)
+        symbols = [r.get('symbol') for r in rows]
+        gid = _rc.group_id_for(scan_id, self.ticker, strategy, symbols)
+        best_option['scan_id'] = scan_id
+        best_option['group_id'] = gid
+        best_option['candidate_id'] = _rc.candidate_id_for(gid, best_symbol)
+        try:
+            intended_qty = self._confidence_to_quantity(
+                self.last_signal_strength)
+        except Exception:
+            intended_qty = None
+        self.research_capture.on_candidate_group(
+            scan_id=scan_id,
+            underlying=self.ticker,
+            direction=strategy,
+            rows=rows,
+            underlying_price=current_price,
+            skip_counts={k: v for k, v in (skip_counts or {}).items() if v},
+            intended_qty=intended_qty,
+            risk_budget=getattr(self, 'max_budget_per_trade', None),
+            max_rows=getattr(self, 'group_capture_max', 60))
 
     def _confidence_to_quantity(self, strength) -> int:
         """Map a directional signal strength to a contract count.

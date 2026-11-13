@@ -18,11 +18,33 @@ The hooks only WRITE research_ledger.db. They never read trading state, never
 mutate the objects they are given, and never talk to a broker.
 """
 
-from typing import Dict, Optional
+import hashlib
+from typing import Dict, List, Optional
 
 FLAG = "ENABLE_DECISION_LEDGER"
 LEDGER_PATH_KEY = "DECISION_LEDGER_PATH"
 DEFAULT_LEDGER_PATH = "research_ledger.db"
+
+GROUP_KIND = "group_candidate"
+
+
+def group_id_for(scan_id, underlying, direction, symbols) -> str:
+    """Deterministic group id for one (scan, underlying, direction) selection.
+
+    Stable across retries of the same scan: the id depends only on the scan id,
+    the underlying, the direction, and the SORTED set of contract symbols the
+    selector considered — not on iteration order or wall-clock time.
+    """
+    basis = "|".join(
+        [str(scan_id or ""), str(underlying or ""), str(direction or "")]
+        + sorted(str(s) for s in (symbols or [])))
+    return "grp-" + hashlib.sha256(basis.encode("utf-8")).hexdigest()[:32]
+
+
+def candidate_id_for(group_id, symbol) -> str:
+    """Deterministic per-contract candidate id within a group."""
+    basis = f"{group_id}|{symbol}"
+    return "cand-" + hashlib.sha256(basis.encode("utf-8")).hexdigest()[:32]
 
 
 def _utc_from_local(ts_iso: Optional[str]) -> Optional[str]:
@@ -140,6 +162,100 @@ class ResearchCapture:
         except Exception:
             self._drop("on_candidate")
             return None
+
+    def on_candidate_group(
+        self, *,
+        scan_id: Optional[str],
+        underlying: Optional[str],
+        direction: Optional[str],
+        rows: List[Dict],
+        underlying_price=None,
+        skip_counts: Optional[Dict] = None,
+        intended_qty=None,
+        risk_budget=None,
+        max_rows: int = 60,
+        strategy_version: str = "smart_trader",
+    ) -> Optional[str]:
+        """Snapshot every contract the selector considered in one scan.
+
+        One ``group_candidate``-kind snapshot per contract, all sharing
+        ``decision_id = group_id`` (deterministic from scan/underlying/
+        direction/symbol-set). Each row's ``snapshot_id`` is the deterministic
+        candidate id, so a retried scan re-writes the same primary keys and
+        the ledger's INSERT OR IGNORE makes the whole group idempotent.
+
+        Row dict keys (all optional except symbol):
+          symbol, selected (bool), skip_reason, score, bid, ask, dte,
+          quote_ts, greeks, rank.
+        Semantics for this kind: ``accepted`` means "selected by the ranker";
+        ``reject_code`` is the in-selector skip reason or 'not_selected'.
+
+        Bounded: at most ``max_rows`` snapshots per group; the selected row is
+        always kept, then scored rows by score desc, then skips. Fail-open:
+        per-row failures are drop-counted and never raise.
+        """
+        if not self._ready() or not rows:
+            return None
+        try:
+            symbols = [r.get("symbol") for r in rows if r.get("symbol")]
+            gid = group_id_for(scan_id, underlying, direction, symbols)
+            n_considered = len(rows)
+
+            def _key(r):
+                sel = bool(r.get("selected"))
+                sc = r.get("score")
+                return (not sel, sc is None, -(sc or 0.0))
+
+            bounded = sorted(rows, key=_key)[:max(1, int(max_rows))]
+            group_extra = {
+                "scan_id": scan_id,
+                "group_id": gid,
+                "n_considered": n_considered,
+                "n_recorded": len(bounded),
+            }
+            if skip_counts:
+                group_extra["skip_counts"] = dict(skip_counts)
+        except Exception:
+            self._drop("on_candidate_group")
+            return None
+
+        wrote = 0
+        for rank, r in enumerate(bounded):
+            try:
+                sym = r.get("symbol")
+                cid = candidate_id_for(gid, sym)
+                selected = bool(r.get("selected"))
+                extra = dict(group_extra)
+                extra.update({
+                    "candidate_id": cid,
+                    "rank": rank,
+                    "dte": r.get("dte"),
+                })
+                self._ledger.record_snapshot(
+                    decision_id=gid,
+                    snapshot_id=cid,
+                    kind=GROUP_KIND,
+                    accepted=selected,
+                    reject_code=(None if selected
+                                 else (r.get("skip_reason") or "not_selected")),
+                    symbol=sym,
+                    underlying=underlying,
+                    quote={"bid": r.get("bid"), "ask": r.get("ask"),
+                           "ts": r.get("quote_ts")},
+                    underlying_price=underlying_price,
+                    greeks=r.get("greeks"),
+                    direction=(direction or "").upper() or None,
+                    score=r.get("score"),
+                    sizing={"intended_qty": intended_qty},
+                    risk={"max_budget_per_trade": risk_budget},
+                    strategy_version=strategy_version,
+                    config=self._config,
+                    extra=extra,
+                )
+                wrote += 1
+            except Exception:
+                self._drop("on_candidate_group")
+        return gid if wrote else None
 
     def on_order_submitted(self, decision_id, order_id, *, qty=None,
                            limit_price=None, event_at=None) -> None:
@@ -280,6 +396,58 @@ def _self_test() -> int:
     if led.get_decision("dec-2")["snapshots"][0]["reject_code"] != "risk_blocked:daily_loss":
         print("FAIL: reject code must persist"); ok = False
 
+    # Candidate group: full group lands, idempotent on retry, bounded.
+    rows = [
+        {"symbol": "SPY261219C00600000", "score": 9.0, "bid": 1.2, "ask": 1.3,
+         "dte": 36, "selected": True, "skip_reason": None},
+        {"symbol": "SPY261219C00605000", "score": 7.5, "bid": 0.9, "ask": 1.0,
+         "dte": 36, "selected": False, "skip_reason": None},
+        {"symbol": "SPY261219C00610000", "skip_reason": "spread_too_wide",
+         "dte": 36},
+    ]
+    gid = cap.on_candidate_group(
+        scan_id="scan-1", underlying="SPY", direction="call",
+        rows=[dict(r) for r in rows], underlying_price=598.0,
+        skip_counts={"wrong_type_or_moneyness": 4}, intended_qty=2,
+        risk_budget=500.0)
+    if not gid or not gid.startswith("grp-"):
+        print("FAIL: group hook must return the group id", gid); ok = False
+    snaps = led.get_decision(gid)["snapshots"]
+    if len(snaps) != 3:
+        print("FAIL: all group rows must land", len(snaps)); ok = False
+    if sum(1 for s in snaps if s["accepted"]) != 1:
+        print("FAIL: exactly one selected row per group"); ok = False
+    codes = {s["reject_code"] for s in snaps}
+    if "spread_too_wide" not in codes or "not_selected" not in codes:
+        print("FAIL: skip reasons must persist", codes); ok = False
+    # Retry with the same scan: deterministic ids -> no duplicate rows.
+    gid2 = cap.on_candidate_group(
+        scan_id="scan-1", underlying="SPY", direction="call",
+        rows=[dict(r) for r in rows], underlying_price=598.0)
+    if gid2 != gid:
+        print("FAIL: retry must produce the same group id"); ok = False
+    if len(led.get_decision(gid)["snapshots"]) != 3:
+        print("FAIL: retried group must not duplicate rows"); ok = False
+    # Bounding: selected row always survives the cap.
+    many = [{"symbol": f"SPY261219C0061{i}000", "score": float(i),
+             "skip_reason": None} for i in range(5)]
+    many.append({"symbol": "SPY261219C00600000", "score": 0.1,
+                 "selected": True, "skip_reason": None})
+    gid3 = cap.on_candidate_group(
+        scan_id="scan-2", underlying="SPY", direction="call",
+        rows=many, max_rows=3)
+    snaps3 = led.get_decision(gid3)["snapshots"]
+    if len(snaps3) != 3:
+        print("FAIL: group must be bounded by max_rows", len(snaps3)); ok = False
+    if sum(1 for s in snaps3 if s["accepted"]) != 1:
+        print("FAIL: bounded group must keep the selected row"); ok = False
+
+    # Disabled -> group hook is a no-op too.
+    cap0 = ResearchCapture(enabled=False)
+    if cap0.on_candidate_group(scan_id="s", underlying="SPY",
+                               direction="call", rows=rows) is not None:
+        print("FAIL: disabled on_candidate_group must return None"); ok = False
+
     # Broken ledger -> drop counted, never raises.
     class _Boom:
         def record_snapshot(self, **kw):
@@ -294,6 +462,11 @@ def _self_test() -> int:
     cap2.on_fill("z", "o", qty=1, price=1.0)
     if cap2.dropped.get("on_candidate") != 1 or cap2.dropped.get("on_fill") != 1:
         print("FAIL: drops must be counted", cap2.dropped); ok = False
+    if cap2.on_candidate_group(scan_id="s", underlying="SPY",
+                               direction="call", rows=rows) is not None:
+        print("FAIL: failing group write must return None"); ok = False
+    if cap2.dropped.get("on_candidate_group") != len(rows):
+        print("FAIL: group drops must be counted per row", cap2.dropped); ok = False
 
     led.close()
     print("research_capture self-test:", "PASS" if ok else "FAIL")

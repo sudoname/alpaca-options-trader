@@ -296,14 +296,21 @@ class ResearchLedger:
         code_rev: Optional[str] = None,
         event_at: Optional[str] = None,
         extra: Optional[Dict] = None,
+        snapshot_id: Optional[str] = None,
     ) -> str:
         """Insert one immutable decision snapshot; returns its decision_id.
 
         ``decision_id`` should be the episode_store id when one exists so the
         row joins the live record; a fresh uuid4 is minted otherwise.
+
+        ``snapshot_id`` (optional) makes the write idempotent: callers that
+        derive a deterministic id (e.g. group-capture candidate ids) can retry
+        safely because the INSERT is OR IGNORE on the primary key. Default
+        callers keep minted uuid4 ids, which never collide, so behavior is
+        unchanged for them.
         """
         did = decision_id or str(uuid.uuid4())
-        sid = str(uuid.uuid4())
+        sid = snapshot_id or str(uuid.uuid4())
         occ = parse_occ_symbol(symbol) if symbol else {}
         opt = dict(occ)
         if isinstance(option, dict):
@@ -322,7 +329,7 @@ class ResearchLedger:
                 return None
 
         self.conn.execute(
-            """INSERT INTO snapshots (
+            """INSERT OR IGNORE INTO snapshots (
                 snapshot_id, decision_id, schema_version, kind, accepted,
                 reject_code, event_at_utc, received_at_utc, symbol, underlying,
                 expiration, strike, option_type, multiplier,
