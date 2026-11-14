@@ -89,7 +89,9 @@ class TestRankingVariants(unittest.TestCase):
 
 
 class TestRankingAccounting(unittest.TestCase):
-    def test_nonfill_counts_zero_at_opportunity_level(self):
+    def test_unlabeled_missing_outcome_is_excluded_not_zero(self):
+        # A bare net=None with no outcome_state is MISSING evidence: it must
+        # be excluded from totals and reported, never counted as $0.
         groups = [
             {"group_id": "g1", "candidates": [_cand("A", 1.0, net=30.0)]},
             {"group_id": "g2", "candidates": [_cand("B", 1.0, net=None)]},
@@ -98,9 +100,32 @@ class TestRankingAccounting(unittest.TestCase):
         v = rep["variants"]["baseline"]
         self.assertEqual(v["n_groups"], 2)
         self.assertEqual(v["n_filled"], 1)
+        self.assertEqual(v["n_evaluable"], 1)
+        self.assertEqual(v["n_missing"], 1)
+        self.assertEqual(v["missing_reasons"], {"unlabeled": 1})
+        self.assertEqual(v["coverage"], 0.5)
+        self.assertEqual(v["fill_rate"], 1.0)  # of evaluable opportunities
+        self.assertEqual(v["total_net"], 30.0)
+        self.assertEqual(v["expectancy_per_opportunity"], 30.0)
+        self.assertEqual(v["expectancy_per_fill"], 30.0)
+
+    def test_confirmed_no_fill_counts_as_zero(self):
+        # Evidence-backed non-fills ARE legitimate $0 opportunities.
+        nf = _cand("B", 1.0, net=None)
+        nf["outcome_state"] = "confirmed_no_fill"
+        groups = [
+            {"group_id": "g1", "candidates": [_cand("A", 1.0, net=30.0)]},
+            {"group_id": "g2", "candidates": [nf]},
+        ]
+        rep = re_mod.evaluate_ranking(groups, variants=("baseline",))
+        v = rep["variants"]["baseline"]
+        self.assertEqual(v["n_filled"], 1)
+        self.assertEqual(v["n_evaluable"], 2)
+        self.assertEqual(v["n_missing"], 0)
+        self.assertEqual(v["coverage"], 1.0)
         self.assertEqual(v["fill_rate"], 0.5)
         self.assertEqual(v["total_net"], 30.0)
-        self.assertEqual(v["expectancy_per_opportunity"], 15.0)  # nonfill = 0
+        self.assertEqual(v["expectancy_per_opportunity"], 15.0)
         self.assertEqual(v["expectancy_per_fill"], 30.0)
 
     def test_profit_factor_and_win_rate(self):
@@ -121,11 +146,44 @@ class TestRankingAccounting(unittest.TestCase):
         self.assertEqual(re_mod._self_test(), 0)
         rep = re_mod.evaluate_ranking(re_mod.fixture_groups())
         self.assertEqual(rep["variants"]["baseline"]["picks"],
-                         ["A1", "B1", "C1", "D1"])
+                         ["A1", "B1", "C1", "D1", "E1"])
         # format_report renders every variant row without raising
         text = re_mod.format_report(rep)
         for name in re_mod.VARIANT_ORDER:
             self.assertIn(name, text)
+
+    def test_pick_tie_break_is_order_independent(self):
+        a, b = _cand("AAA", 5.0, net=1.0), _cand("ZZZ", 5.0, net=2.0)
+        for cands in ([a, b], [b, a]):
+            rep = re_mod.evaluate_ranking(
+                [{"group_id": "g", "candidates": list(cands)}],
+                variants=("baseline",))
+            self.assertEqual(rep["variants"]["baseline"]["picks"], ["AAA"])
+
+    def test_paired_excludes_pairs_with_missing_side(self):
+        groups = re_mod.fixture_groups()
+        paired = re_mod.paired_vs_baseline(groups)
+        obs = paired["observed_only"]
+        # g5 baseline pick E1 is counterfactual_required -> pair excluded
+        self.assertEqual(obs["n_pairs"], 4)
+        self.assertEqual(obs["excluded_reasons"],
+                         {"counterfactual_required": 1})
+        self.assertAlmostEqual(obs["total_diff"], 100.0)
+        self.assertAlmostEqual(obs["pick_change_rate"], 0.25)
+        self.assertEqual(obs["n_sessions"], 2)
+        self.assertAlmostEqual(
+            paired["delta_band"]["total_diff"], 170.0)
+
+    def test_provenance_counts_and_config(self):
+        groups = re_mod.fixture_groups()
+        prov = re_mod.build_provenance(None, groups)
+        self.assertEqual(prov["n_groups"], 5)
+        self.assertEqual(prov["n_multi_candidate"], 4)
+        self.assertEqual(prov["n_single_candidate"], 1)
+        self.assertEqual(prov["session_dates"]["first"], "2026-11-10")
+        self.assertEqual(prov["session_dates"]["last"], "2026-11-11")
+        self.assertIn("ZERO_STATES", prov["config"])
+        self.assertTrue(prov["code_sha256"])
 
     def test_jsonl_round_trip(self):
         import json
