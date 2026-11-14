@@ -150,6 +150,12 @@ def decision_rows(ledger, since=None, until=None, broker_env=None):
     """
     broker_env = broker_env or _broker_env_default()
     events_map = _events_by_decision(ledger)
+    # One bulk read of intent snapshots grouped by decision_id (a per-decision
+    # ledger.snapshots() rescan here was O(n^2) across ~14k decisions).
+    snaps_map = {}
+    for s in ledger.snapshots():
+        if s.get("kind") != "group_candidate":
+            snaps_map.setdefault(s.get("decision_id"), []).append(s)
     seen = set()
     for snap in ledger.snapshots(since=since, until=until):
         if snap.get("kind") == "group_candidate":
@@ -158,9 +164,7 @@ def decision_rows(ledger, since=None, until=None, broker_env=None):
         if not did or did in seen:
             continue
         seen.add(did)
-        snaps = [s for s in ledger.snapshots()
-                 if s.get("decision_id") == did
-                 and s.get("kind") != "group_candidate"]
+        snaps = snaps_map.get(did, [])
         events = events_map.get(did, [])
         outcome = classify_decision(snaps, events)
         fill_sources = sorted({
