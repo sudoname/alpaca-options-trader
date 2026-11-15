@@ -14,6 +14,15 @@ Three variants on the SAME opportunity universe:
   vwap       baseline, but only opportunities whose direction aligns with
              the VWAP-only state (CALL->bullish, PUT->bearish).
   full       baseline, but aligned on VWAP + EMA(20) + RSI(14) vs 50.
+  vwap_contra / full_contra
+             the INVERSE gates: take exactly what the aligned filter skips
+             (misaligned or neutral); signal-unavailable stays excluded, so
+             on common coverage taken(filter) and taken(contra) partition
+             the baseline and their nets sum to it. POST-HOC HYPOTHESIS:
+             added after the aligned filters were observed to select
+             worse-per-trade entries on these same sessions, so the
+             dev/holdout split no longer protects against overfitting here.
+             Results can motivate forward shadow validation only.
 
 Accounting (per the research protocol):
   * taken opportunity  -> its actual recorded mark net P&L (dollars). Entry
@@ -57,7 +66,7 @@ SESSION_END = "21:00"
 DEV_LAST_SESSION = "2026-11-10"
 BOOTSTRAP_N = 10000
 BOOTSTRAP_SEED = 1337
-VARIANTS = ("baseline", "vwap", "full")
+VARIANTS = ("baseline", "vwap", "full", "vwap_contra", "full_contra")
 
 
 # ------------------------------------------------------------------ inputs
@@ -155,11 +164,20 @@ def attach_signals(opps, bars_by_key, warmup="session"):
 
 
 def takes(o, variant):
-    """True/False = variant takes/skips; None = signal missing for filter."""
+    """True/False = variant takes/skips; None = signal missing for filter.
+
+    Contra variants invert the aligned gate on DEFINED signals only: they
+    take exactly the opportunities the aligned filter skips (misaligned or
+    neutral) and remain None when the signal is unavailable, preserving the
+    partition of the baseline on common coverage.
+    """
     if variant == "baseline":
         return True
-    key = "align_vwap" if variant == "vwap" else "align_full"
-    return o[key]
+    key = "align_vwap" if variant.startswith("vwap") else "align_full"
+    a = o[key]
+    if a is None:
+        return None
+    return (not a) if variant.endswith("_contra") else a
 
 
 # ----------------------------------------------------------------- metrics
@@ -325,7 +343,9 @@ def evaluate(opps):
             },
         }
         for a, b in (("vwap", "baseline"), ("full", "baseline"),
-                     ("full", "vwap")):
+                     ("full", "vwap"),
+                     ("vwap_contra", "baseline"),
+                     ("full_contra", "baseline")):
             pd = paired_delta(cc, a, b)
             pd["bootstrap"] = bootstrap_ci(pd.pop("pairs"))
             block["primary_common_coverage"]["deltas"][f"{a}_minus_{b}"] = pd
@@ -529,6 +549,29 @@ def _selftest():
               and m_vwap["winners_skipped"] == 0)
         check("net per opportunity uses full denominator",
               m_vwap["net_per_opportunity"] == round(120.0 / 4, 4))
+
+        # Contra variants: exact inversion of the aligned gate on defined
+        # signals; signal-unavailable stays None (never flipped to taken).
+        check("contra inverts aligned gate",
+              takes(o["a"], "vwap_contra") is False
+              and takes(o["b"], "vwap_contra") is True
+              and takes(o["c"], "full_contra") is False)
+        check("contra preserves missing-signal None",
+              takes(o["d"], "full_contra") is None
+              and takes(o["e"], "vwap_contra") is None)
+        # Complementarity on common coverage: filter + contra partition the
+        # baseline, so their nets sum to the baseline net.
+        m_vc = variant_metrics(cc, "vwap_contra")
+        m_fc = variant_metrics(cc, "full_contra")
+        m_full = variant_metrics(cc, "full")
+        check("contra complements filter (vwap partition)",
+              m_vc["taken"] + m_vwap["taken"] == m_base["taken"]
+              and round(m_vc["net_total"] + m_vwap["net_total"], 2)
+              == m_base["net_total"])
+        check("contra complements filter (full partition)",
+              m_fc["taken"] + m_full["taken"] == m_base["taken"]
+              and round(m_fc["net_total"] + m_full["net_total"], 2)
+              == m_base["net_total"])
 
         # Full-sample view: d rejoins vwap variant (aligned) but is a
         # missing-signal skip for full; e missing for both filters;

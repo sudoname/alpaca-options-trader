@@ -32,6 +32,12 @@ def test_takes_semantics():
     assert vtr.takes(o, "baseline") is True
     assert vtr.takes(o, "vwap") is False
     assert vtr.takes(o, "full") is None
+    # contra: inverted on defined signals, None stays None
+    assert vtr.takes(o, "vwap_contra") is True
+    assert vtr.takes(o, "full_contra") is None
+    o2 = {"align_vwap": True, "align_full": True}
+    assert vtr.takes(o2, "vwap_contra") is False
+    assert vtr.takes(o2, "full_contra") is False
 
 
 def test_variant_metrics_empty_population():
