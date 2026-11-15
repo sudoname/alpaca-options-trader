@@ -3981,8 +3981,9 @@ class SmartOptionsTrader:
                         self.record_trade_outcome(trade, 'roll_take_profit', pnl_percent)
                         continue
                     # No re-entry target found -> fall back to a flat take-profit.
-                    self.close_position(trade, position, 'roll_failed_take_profit')
-                    self.record_trade_outcome(trade, 'roll_failed_take_profit', pnl_percent)
+                    _exit_oid = self.close_position(trade, position, 'roll_failed_take_profit')
+                    self.record_close_with_fills(trade, 'roll_failed_take_profit',
+                                                 pnl_percent, exit_order_id=_exit_oid)
                     continue
 
                 # Dynamic take profit (full exit). When rolling is enabled the
@@ -4002,8 +4003,9 @@ class SmartOptionsTrader:
 
             # Dynamic exit based on market conditions
             if self.should_exit_dynamically(trade, position, current_price):
-                self.close_position(trade, position, 'dynamic_exit')
-                self.record_trade_outcome(trade, 'dynamic_exit', pnl_percent)
+                _exit_oid = self.close_position(trade, position, 'dynamic_exit')
+                self.record_close_with_fills(trade, 'dynamic_exit',
+                                             pnl_percent, exit_order_id=_exit_oid)
                 continue
 
             # Phase F: thesis-decay exit (flag-gated, fail-open). Runs LAST so
@@ -4130,8 +4132,16 @@ class SmartOptionsTrader:
                     order_data['type'] = 'limit'
                     order_data['limit_price'] = f"{_limit:.2f}"
 
-        requests.post(f"{self.base_url}/v2/orders", headers=self.headers, json=order_data)
+        resp = requests.post(f"{self.base_url}/v2/orders", headers=self.headers, json=order_data)
         print(f"[CLOSE] Position closed ({order_data['type']}) - Reason: {reason}")
+        # Fills-based close booking: surface the sell order id so the caller
+        # can resolve the ACTUAL fill (record_close_with_fills). Fail-open:
+        # any parse problem returns None and booking stays mark-derived.
+        try:
+            oid = (resp.json() or {}).get('id')
+            return oid if isinstance(oid, str) and oid else None
+        except Exception:
+            return None
 
     @staticmethod
     def direction_from_occ(occ_symbol: str) -> Optional[str]:
@@ -4394,6 +4404,46 @@ class SmartOptionsTrader:
                 return True
 
         return False
+
+    def record_close_with_fills(self, trade: Dict, outcome: str,
+                                pnl_percent: float = 0, exit_order_id=None):
+        """Book a bot-owned close, upgraded to broker-fill truth when possible.
+
+        Resolves the just-placed sell via _await_fill: on a filled order the
+        trade gets its REAL exit_price (filled_avg_price) and the record gets
+        fills-based net dollars (outcome_states.net_dollars_from_fills,
+        pnl_source='fills') — the same booking reconcile_closed_from_fills
+        already does for orphan closes. Anything unresolved (no order id, not
+        filled within FILL_WAIT_SEC, zero fill fields) degrades to the legacy
+        mark-derived record_trade_outcome call: exit_price stays honest-None,
+        never estimated. `pnl_percent` keeps its legacy mark-derived meaning
+        either way.
+        """
+        net_dollars = None
+        try:
+            if isinstance(exit_order_id, str) and exit_order_id:
+                order = self._await_fill(exit_order_id)
+                if order and order.get('status') == 'filled':
+                    px = float(order.get('filled_avg_price') or 0)
+                    qty = float(order.get('filled_qty') or 0)
+                    if px > 0 and qty > 0:
+                        trade['exit_price'] = px
+                        from outcome_states import net_dollars_from_fills
+                        r = net_dollars_from_fills(
+                            [{'qty': trade.get('quantity'),
+                              'price': trade.get('entry_price')}],
+                            [{'qty': qty, 'price': px}])
+                        if r is not None:
+                            net_dollars = r['net_pnl_dollars']
+                            print(f"[FILL CLOSE] {trade.get('symbol')} "
+                                  f"exit={px:.2f} net=${net_dollars:+.2f} (fills)")
+        except Exception as e:
+            print(f"[FILL CLOSE] resolve skipped ({e}); booking mark-derived")
+            net_dollars = None
+        return self.record_trade_outcome(
+            trade, outcome, pnl_percent,
+            net_pnl_dollars=net_dollars,
+            pnl_source='fills' if net_dollars is not None else None)
 
     def record_trade_outcome(self, trade: Dict, outcome: str, pnl_percent: float = 0,
                              *, net_pnl_dollars=None, pnl_source=None):

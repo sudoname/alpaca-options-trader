@@ -213,8 +213,15 @@ def enforce_exit(trader, trade: Dict, position: Dict, reason_code: str,
         except (TypeError, ValueError, AttributeError):
             current_price = 0.0
     print(format_exit_log(source, trade, current_price, reason_code, pnl_percent))
-    trader.close_position(trade, position, reason_code)
-    trader.record_trade_outcome(trade, reason_code, pnl_percent)
+    exit_order_id = trader.close_position(trade, position, reason_code)
+    # Fills-based booking when the trader supports it (resolves the sell fill
+    # for a REAL exit_price + net dollars); legacy mark-derived path otherwise
+    # so fake/mock traders keep working unchanged.
+    record = getattr(trader, 'record_close_with_fills', None)
+    if callable(record):
+        record(trade, reason_code, pnl_percent, exit_order_id=exit_order_id)
+    else:
+        trader.record_trade_outcome(trade, reason_code, pnl_percent)
 
 
 # --------------------------------------------------------------------------- #
