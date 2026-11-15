@@ -94,3 +94,8 @@ nul
 
 # pushed by the spy-ml shadow trader (runtime data, not source)
 shadow_pnl.json
+
+# research data/outputs (regenerate via research_export.py / fetch_underlying_bars.py / vwap_trend_replay.py)
+export_decisions.jsonl
+export_groups.jsonl
+research_vwap/
