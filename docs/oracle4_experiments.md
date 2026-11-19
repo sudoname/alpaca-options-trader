@@ -123,3 +123,68 @@ achievable.
 - `artifacts/oracle4/dataset_v1.sqlite` + `dataset_v1_manifest.json`
   (local artifacts; not committed — rebuildable from the frozen ledger
   via the CLI, hash-verified).
+
+---
+
+## Phase 2 — Purged session-based walk-forward validation
+
+### Code
+
+- `oracle/lab/purged_validation.py` — session-level expanding-window
+  folds (whole exchange sessions, never row fractions); grouping by
+  `decision_id` with a hard `AssertionError` if any group appears in
+  both train and test; **purging** of train rows whose `label_end` or
+  `label_available_at` reaches into the test window; **embargo** (per
+  horizon: 1 session, 5 for the 5-session horizon) dropping train rows
+  with *unknown* label end near the test block; fold-train-only
+  `Standardizer` (None stays None — no imputation); DTE buckets
+  (0dte / short / swing / unknown); deterministic
+  `metrics_fingerprint`; whole-session paired bootstrap
+  (n=2000, seed 42); **negative controls** (future-feature probe must
+  detect leakage at ≥0.95 accuracy, shuffled labels must collapse to
+  chance) via a dependency-free ridge-logistic probe; **pre-registered
+  write-once holdout** (`register_holdout` refuses any mismatch against
+  the original pledge).
+- CLI: `python -m oracle.lab.purged_validation --dataset ... --horizon
+  60m --label-type direction --holdout-sessions 2 --register-holdout
+  artifacts/oracle4/holdout_registration.json --out ...`.
+
+### Acceptance tests
+
+`tests/test_oracle4_validation.py` — **23 passed** (chronology,
+group-leak assertion, label-end/availability purging, unknown-end
+embargo semantics, standardizer missingness, DTE buckets, fingerprint
+determinism, bootstrap determinism, both negative controls, holdout
+write-then-verify and mismatch refusal, end-to-end CLI with
+registration). Combined oracle4 suite: 56 passed.
+
+### Real-data fold reports (dataset `f7f662e0…`, seed 42)
+
+Holdout pledged **2026-11-12, 2026-11-13** (4,694 samples) in
+`holdout_registration.json` — reserved for one final frozen evaluation;
+never used for training/tuning. Fold sessions: 2026-11-04 … 2026-11-11
+(4 expanding folds, test block = 1 session).
+
+| horizon | label_ok | censored | missing | folds | purged (total) | controls |
+|---|---|---|---|---|---|---|
+| 60m direction | 9,810 | 669 | 3,785 | 4 | 0 | **PASS** (leak probe 1.00; shuffle 0.499 vs base 0.551) |
+| 1s direction | 11,054 | 3,166 | 44 | 4 | 0 | **PASS** (leak probe 1.00; shuffle 0.513 vs base 0.596) |
+| 5s direction | 5,130 | 9,123 | 11 | 4 | 17,138 | **NOT RUN** (0 usable control folds) |
+
+Report fingerprints: 60m `21eb7292…`, 1s `895f21f4…`, 5s `e351a2b1…`.
+27 features per row.
+
+Named finding: the **5-session horizon is not validatable yet** — with
+only 8 sessions of coverage, nearly every train row's 5-session label
+window overlaps the test block, so purging removes 3.3k–5.1k rows per
+fold (train shrinks to 26–4,788) and the negative controls have no
+usable folds. This is the purge working as designed, not a bug; the 5s
+horizon is excluded from challenger evaluation until more sessions
+accrue. 60m and 1-session folds purge zero rows because those label
+windows resolve within the same session.
+
+### Artifacts
+
+- `artifacts/oracle4/folds_{60m,1s,5s}_direction.json`,
+  `holdout_registration.json` (local; regenerable via the CLI —
+  fingerprints recorded above).
