@@ -188,3 +188,116 @@ windows resolve within the same session.
 - `artifacts/oracle4/folds_{60m,1s,5s}_direction.json`,
   `holdout_registration.json` (local; regenerable via the CLI —
   fingerprints recorded above).
+
+---
+
+## Phase 3 — Classical challengers vs naive comparators
+
+### Code
+
+- `oracle/ml/baselines.py` — numpy-only, deterministic, full-batch GD
+  (no sklearn/lightgbm/torch): design matrix with standardized features
+  **plus `*_missing` indicator columns** (missing = 0 after standardize
+  + flag 1; never silently imputed); `RidgeLogisticModel`; Platt
+  recalibration fit on a chronological tail (last train session);
+  reliability bins / ECE; naive comparators returning `(probs, mask)`
+  so every comparison is on the rows where the comparator is actually
+  available — `constant` (train base rate), `momentum` (`ret_60m` sign
+  buckets), `baseline_p_win` (the production Bayesian opinion);
+  `QuantilePinballModel` (τ ladder 0.05–0.95, warm-started at marginal
+  quantiles, per-row sort for non-crossing), pinball + interval
+  coverage; RV forecasters — persistence, per-underlying point-in-time
+  EWMA (λ=0.94, carry-forward never updates state on missing), HAR-lite
+  (ridge-stabilized lstsq, prediction clamped ≥0), QLIKE (skips
+  non-positive); discrete-time competing-risks hazards — person-period
+  expansion over bins (0,30,60,120,240,480,1440,∞] min, multinomial
+  logistic with time-bin dummies, causes stop/target/other_exit with
+  right censoring, cumulative incidence, Laplace-smoothed marginal
+  per-bin table comparator, empirical Aalen–Johansen CIF.
+- `oracle/ml/train.py` — CLI `python -m oracle.ml.train --model
+  {logistic,naive,quantile,rv,hazard,gbm,mlp} --dataset ... --horizon
+  ... --label-type ... --out ... --seed 42 --device auto
+  [--holdout-registration ...]`. Evaluates strictly through the Phase 2
+  harness (purged folds, embargo, fold-train-only standardizer, holdout
+  verified against the write-once pledge on every run). Per-fold
+  challenger/comparator metrics on identical masked rows; per-session
+  loss deltas (comparator − challenger, positive = challenger better)
+  fed to the whole-session paired bootstrap (n=2000, seed 42); per-DTE
+  and per-kind calibration breakdowns; deterministic
+  `report_fingerprint`. `--model gbm` reports LightGBM unavailable
+  honestly; `--model mlp` reports `deferred` (Phase 4).
+
+### Acceptance tests
+
+`tests/test_oracle4_baselines.py` — **37 passed** (design-matrix
+missingness encoding, logistic separability, Platt slope recovery,
+reliability/ECE hand cases, all comparator mask semantics, quantile
+non-crossing/coverage/conditional-beats-marginal, EWMA point-in-time
+order-invariance, HAR exact recovery of a planted model, QLIKE guards,
+person-period expansion hand case, planted-signal hazard model beats
+marginal NLL, CIF monotone/bounded, Aalen–Johansen hand cases, and 9
+end-to-end CLI tests incl. determinism, fold-config override, and
+holdout-tamper refusal). Combined oracle4 suite: 93 passed. Full suite:
+**2175 passed, 3 failed** — same 3 pre-existing failures; zero
+regressions.
+
+### Real-data results (dataset `f7f662e0…`, seed 42, holdout untouched)
+
+All numbers are purged walk-forward test folds (sessions 11-06…11-11);
+the pledged holdout (11-12/13) was verified but never scored. Deltas
+are per-session log-loss (or QLIKE/NLL) improvements over the
+comparator with whole-session paired bootstrap 95% CIs; positive =
+challenger better.
+
+**Direction — 60m (fp `3dfb5ece…`, n=4,174):** challenger (ridge
+logistic + Platt) acc 0.536 / log loss 0.743 / ECE 0.134 does **not**
+beat the constant base rate (ll 0.708; Δ mean −0.032, CI [−0.076,
++0.013]) or momentum (Δ −0.025, CI [−0.121, +0.061]); vs
+`baseline_p_win` (available on 534 rows) Δ +0.025, CI [−0.049, +0.099]
+— inconclusive. Honest read: **no 60m directional edge from these
+features.**
+
+**Direction — 1-session (fp `ead8b5cb…`, n=6,190):** challenger acc
+0.635 vs base rate 0.525, log loss 0.668, ECE 0.077. Beats **all three
+comparators with CIs clear of zero**: vs constant Δ +0.062 [+0.014,
++0.104]; vs momentum Δ +0.053 [+0.016, +0.101]; vs baseline_p_win
+(785 rows) Δ +0.099 [+0.036, +0.178]. Calibration holds across strata
+(candidate ECE 0.073 / shadow 0.085). Only 4 test sessions — promising,
+not promotion evidence.
+
+**Quantile log-return (fps `3f8c9961…` 60m / `1d14007e…` 1s):** the
+conditional model does **not** beat the marginal-quantile comparator
+(60m Δ pinball −0.00041 [−0.00114, +0.00001]; 1s −0.00016 [−0.00074,
++0.00018]) and its intervals under-cover (90% interval: 0.84 vs
+marginal 0.94 at 60m). Marginal quantiles are the better uncertainty
+model on this data so far.
+
+**RV — 60m future_rv (fp `d2bb3d22…`):** EWMA and HAR both crush
+persistence on QLIKE (10.05 → 1.08 / 1.15; Δ ≈ +11.2, CIs [+2.4,
++27.1]). HAR has the best RMSE (0.0019 vs EWMA 0.0029); EWMA the best
+QLIKE. Persistence of a 16-min-cadence session RV is simply a bad
+forecaster — the useful result is that cheap EWMA is already near-HAR.
+
+**Hazards — first_touch (fp `7d41b0d2…`, 1,367 usable subjects; test
+events: stop 367 / other_exit 210 / target 3):** model NLL beats the
+marginal hazard table in all 4 folds (e.g. 0.99 vs 1.85 in fold 0);
+Δ NLL +0.364 [+0.135, +0.683]. Empirical 1-day CIF: stop 0.46 /
+other_exit 0.37 / target 0.01. Caveats, stated plainly: **target
+touches are nearly nonexistent (n=3 in test, 16 overall)** so the
+target cause is unlearnable; censored subjects carry label_end =
+coverage end so the purge removes them from every train window
+(training uses resolved events only — 25 rows affected, noted in the
+report); this models the *bot's own exit process* (stop-dominated), not
+market first-passage.
+
+**GBM (fp `352a7d74…`):** `lightgbm not installed (optional
+dependency); result reported honestly, never faked`.
+
+Not run: 5s horizon (not validatable, Phase 2 finding), `iv_change`
+(0 ok labels), 15m direction (deferred; 68% unresolved labels).
+
+### Artifacts
+
+- `artifacts/oracle4/train_{logistic_60m,logistic_1s,naive_60m,
+  quantile_60m,quantile_1s,rv_60m,hazard,gbm}.json` (local; regenerable
+  via the CLI — fingerprints recorded above).
