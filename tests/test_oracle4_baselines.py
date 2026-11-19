@@ -606,13 +606,17 @@ class TestTrainCli:
         if r["result"]["status"] == "unavailable":
             assert "lightgbm" in r["result"]["why"]
 
-    def test_mlp_deferred_to_phase4(self, tmp_path):
+    def test_mlp_without_torch_reports_unavailable(self, tmp_path,
+                                                   monkeypatch):
+        from oracle.ml import mlp as mlp_mod
+        monkeypatch.setattr(mlp_mod, "TORCH_AVAILABLE", False)
         out = str(tmp_path / "mlp.json")
         assert tr.main(["--model", "mlp", "--dataset", "unused.sqlite",
                         "--out", out]) == 0
         with open(out, encoding="utf-8") as f:
             r = json.load(f)
-        assert r["result"]["status"] == "deferred"
+        assert r["result"]["status"] == "unavailable"
+        assert "torch" in r["result"]["why"]
 
     def test_fold_config_override(self, tmp_path):
         store = str(tmp_path / "ds.sqlite")

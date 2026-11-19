@@ -301,3 +301,101 @@ Not run: 5s horizon (not validatable, Phase 2 finding), `iv_change`
 - `artifacts/oracle4/train_{logistic_60m,logistic_1s,naive_60m,
   quantile_60m,quantile_1s,rv_60m,hazard,gbm}.json` (local; regenerable
   via the CLI — fingerprints recorded above).
+
+## Phase 4 — Multitask MLP challenger (PyTorch, CPU fallback)
+
+### Code
+
+- `oracle/ml/mlp.py` — torch behind a guarded import
+  (`TORCH_AVAILABLE`/`TORCH_WHY`; without torch the CLI reports
+  `unavailable` honestly, never fakes). `MultitaskMLP`: trunk
+  `Linear→128→LayerNorm→GELU→dropout(0.1)→64→GELU→dropout→32` with four
+  heads — (a) 3-class direction CE with **train-only** class weights;
+  (b) return quantiles parameterized as `q05 + cumsum(softplus(gaps))`
+  so the ladder is ordered by construction, pinball loss; (c) log-RV
+  robust (smooth-L1) regression, forecast `exp(clamp(·))` > 0 always;
+  (d) discrete-time competing-risk hazards — softmax over
+  (survive, stop, target, other_exit) per time bin (same bins as Phase
+  3), censored likelihood, `cif_from_hazards` producing nondecreasing
+  cause-specific CIFs that sum ≤ 1. Combined loss = sum of available
+  head losses, each normalized by its valid-label count and a running
+  loss scale; **missing targets are masked, never imputed**. AdamW
+  (lr 1e-3, wd 1e-4), grad clipping, batch 256, max 40 epochs, early
+  stopping on a chronological validation session (patience 5), fixed
+  seeds, CPU fallback + single-CUDA. Post-hoc temperature scaling fit
+  on validation logits only. `save_model`/`load_model`: weights +
+  feature schema + standardizer state + temperature + git SHA + dataset
+  hash in a manifest with SHA-256 checksum; any mismatch (checksum,
+  schema length, d_in, state_dict) raises `ModelIntegrityError` → the
+  caller abstains. `_purge_safe` re-applies the leakage gate to every
+  auxiliary label join (aux labels whose window or availability crosses
+  the test boundary are masked out).
+- `oracle/ml/train.py` — `run_mlp`: same purged fold harness and
+  holdout pledge as Phase 3; validation session = last train session of
+  each fold (never test); direction head evaluated against the same
+  three comparators with whole-session paired bootstrap; quantile vs
+  marginal pinball, RV vs point-in-time EWMA QLIKE, hazards vs the
+  Laplace-smoothed marginal table (pooled only when ≥20 train
+  subjects). After folds, one artifact is trained on fold sessions only
+  (holdout untouched), saved with manifest, and **reloaded for an
+  inference-parity check** recorded in the report.
+
+### Acceptance tests
+
+`tests/test_oracle4_mlp.py` — **26 passed** (direction-class mapping,
+purge-gate truth table, head assembly incl. rv-positivity and censored
+hazards, output shapes/coherence, CIF monotone + bounded, temperature
+flattening, masked-loss training, all-masked → explicit error, class
+weights hand case, deterministic early stopping incl. max-epoch cap,
+CPU seed determinism, planted-signal learnability (fixture only — no
+profitability claim), temperature recovery on synthetic overconfident
+logits, save/load parity, tampered-checksum / missing-file /
+schema-mismatch / unreadable-manifest refusals, CLI label-type
+rejection, and an end-to-end CLI run on a 4-head fixture asserting
+untouched holdout + saved artifact + reload parity). Torch-gated tests
+skip honestly when torch is absent; the no-torch CLI path is covered in
+`test_oracle4_baselines.py`. Oracle4 battery: **119 passed**. Full suite:
+**2103 passed, 1 failed** — the known pre-existing Telegram dispatch
+failure; zero regressions.
+
+### Real-data results (dataset `f7f662e0…`, seed 42, `--device cpu`, holdout untouched)
+
+**60m (fp `f7cf0645…`):** direction n=4,174, acc 0.415 / ll 0.715 /
+ECE 0.106 — does **not** beat constant (Δ −0.008 [−0.024, +0.003]);
+vs baseline_p_win +0.026 [−0.000, +0.053] (borderline, not clear of
+zero). Confirms Phase 3: **no 60m directional edge**. Fold-0
+temperature hit the 20.0 clamp (2-session train fold, severely
+overconfident — reported, not hidden). Quantile head is **worse** than
+marginal (Δ pinball −0.0023 [−0.0039, −0.0009]; 90% interval
+over-covers at 0.995). RV head **loses to EWMA** on QLIKE (1.279 vs
+1.082; Δ −0.237 [−0.386, −0.089]) despite slightly better RMSE. Hazard
+head beats the marginal table: Δ NLL +0.352 [+0.046, +0.873], CIF
+coherent — on par with the Phase 3 classical hazard model (+0.364).
+
+**1s (fp `3b27f66e…`):** direction n=6,190, acc 0.488 / ll 0.690 —
+all comparator deltas have positive means but **CIs cross zero** (vs
+constant +0.038 [−0.011, +0.108]; vs momentum +0.030 [−0.005, +0.089]).
+The Phase 3 ridge logistic (+0.062, CI clear of zero) **remains the
+better 1-session direction challenger.** Quantile head slightly worse
+than marginal (Δ −0.00052 [−0.00058, −0.00044]). RV head: no 1s RV
+labels → reported `null`, never imputed. Hazard head: Δ NLL +0.371
+[+0.082, +0.873], CIF coherent.
+
+Train/val gap reported per fold (60m folds show val < train partly
+because dropout/class weights apply to the train loss; 1s fold 2 shows
+the opposite, +0.49). Early stopping fired in 7/8 folds. Both final
+artifacts saved with manifest + checksum; reload-parity
+`max_abs_diff = 0.0` on both.
+
+Honest read: on six training sessions the multitask MLP **adds no
+directional edge** over the classical challengers, its quantile/RV
+heads underperform the marginal/EWMA comparators, and only the hazard
+head matches (not beats) the classical hazard model. Its value at this
+stage is the registry-ready artifact path (schema-checked save/load
+with abstain-on-mismatch) for Phases 5–7, not predictive skill.
+
+### Artifacts
+
+- `artifacts/oracle4/train_mlp_{60m,1s}.json` +
+  `train_mlp_{60m,1s}_model.pt` / `_manifest.json` (local; regenerable
+  via the CLI — fingerprints above, checksums `a12a77ca…` / `6f10181f…`).

@@ -1,4 +1,4 @@
-"""Oracle 4.0 Phase 3 — classical challenger training/evaluation CLI.
+"""Oracle 4.0 Phases 3–4 — challenger training/evaluation CLI.
 
 Research-only.  Nothing in the production trading path imports this.
 
@@ -21,7 +21,11 @@ Models:
                 vs a marginal per-bin hazard table.
   * gbm       — optional dependency; reports "unavailable" when
                 lightgbm is not installed (never faked).
-  * mlp       — arrives in Phase 4; reports "deferred".
+  * mlp       — Phase 4 multitask MLP (direction / quantile / RV /
+                competing-risk hazard heads, masked losses, early
+                stopping, temperature calibration on validation only,
+                checksummed weight artifacts).  Requires torch; reports
+                "unavailable" honestly otherwise.
 
 Usage:
   python -m oracle.ml.train --model logistic --dataset artifacts/oracle4/
@@ -34,6 +38,7 @@ import argparse
 import json
 import sqlite3
 import subprocess
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -674,8 +679,480 @@ def run_gbm() -> Dict[str, Any]:
                        "result reported honestly, never faked"}
 
 
-def run_mlp() -> Dict[str, Any]:
-    return {"status": "deferred", "why": "multitask MLP arrives in Phase 4"}
+def _session_start_utc(session: str) -> datetime:
+    """Midnight UTC at the start of a YYYY-MM-DD session string."""
+    return datetime.fromisoformat(session).replace(tzinfo=timezone.utc)
+
+
+def _torch_ready() -> bool:
+    """Call-time torch check (tests may monkeypatch mlp.TORCH_AVAILABLE)."""
+    import oracle.ml.mlp as mlp_mod
+    return bool(mlp_mod.TORCH_AVAILABLE)
+
+
+def run_mlp(samples: Sequence[Sample], folds: Sequence[Fold],
+            dataset_path: str, horizon: str, seed: int, n_boot: int,
+            device: str, out_stem: str, holdout: Sequence[str],
+            fold_sessions: Sequence[str]) -> Dict[str, Any]:
+    """Phase 4 multitask MLP evaluated through the purged harness.
+
+    Anchor rows are direction Samples (one per decision); the quantile /
+    RV / hazard heads join their targets by decision_id and mask what is
+    missing (never imputed).  Each fold trains on its train sessions
+    minus a chronological validation tail (the last train session),
+    early-stops and temperature-calibrates on that tail only, then
+    predicts the embargo-protected test block.  Head targets in train
+    and validation are additionally purge-gated against the next split's
+    session start so no label overlaps the evaluation window.
+    """
+    import oracle.ml.mlp as mlp_mod
+
+    dev = mlp_mod.resolve_device(device)
+    by_id = {s.decision_id: s for s in samples}
+    names = _feature_names(samples)
+    causes = _first_touch_causes(dataset_path)
+    und = _underlying_by_id(dataset_path)
+    aux_logret = {s.decision_id: s
+                  for s in load_samples(dataset_path, horizon, "log_return")}
+    rv_samples = load_samples(dataset_path, horizon, "future_rv")
+    aux_rv = {s.decision_id: s for s in rv_samples}
+    aux_event = {s.decision_id: s
+                 for s in load_samples(dataset_path, "event", "first_touch")}
+    # point-in-time EWMA comparator for the RV head (same as run_rv)
+    ewma_f, ewma_m = rv_ewma_forecast(rv_samples, und)
+    ewma_by_id = {s.decision_id: (float(ewma_f[i]), bool(ewma_m[i]))
+                  for i, s in enumerate(rv_samples)}
+    cfg = mlp_mod.MLPConfig()
+    n_bins = len(HAZARD_BIN_EDGES_MIN) - 1
+    n_classes = len(HAZARD_CAUSES) + 1
+
+    fold_rows: List[Dict[str, Any]] = []
+    # direction pools (binary up-vs-not-up for harness parity)
+    dir_s: List[Sample] = []
+    dir_y: List[int] = []
+    dir_p: List[float] = []
+    dir_sess: List[str] = []
+    dir_cls: List[int] = []
+    dir_cls_pred: List[int] = []
+    comp_pool: Dict[str, Dict[str, List[float]]] = {
+        c: {"p": [], "mask": []}
+        for c in ("constant", "momentum", "baseline_p_win")}
+    # quantile pools
+    q_y: List[float] = []
+    q_sess: List[str] = []
+    q_pred: Dict[float, List[float]] = {t: [] for t in cfg.quantiles}
+    q_marg: Dict[float, List[float]] = {t: [] for t in cfg.quantiles}
+    # rv pools
+    rv_y: List[float] = []
+    rv_sess: List[str] = []
+    rv_f_model: List[float] = []
+    rv_f_ewma: List[float] = []
+    rv_m_ewma: List[bool] = []
+    # hazard pools (per-session weighted per-subject NLL, like run_hazard)
+    hz_model_sess: Dict[str, List[Tuple[float, int]]] = {}
+    hz_marg_sess: Dict[str, List[Tuple[float, int]]] = {}
+    hz_event_counts = {c: 0 for c in HAZARD_CAUSES}
+    hz_cens = 0
+    cif_final_rows: List[np.ndarray] = []
+    cif_coherent = True
+
+    for fold in folds:
+        train_rows = [by_id[d] for d in fold.train_ids]
+        test_rows = [by_id[d] for d in fold.test_ids]
+        val_sess = max(fold.train_sessions) if fold.train_sessions else None
+        sub_train = [s for s in train_rows if s.session != val_sess]
+        val_rows = [s for s in train_rows if s.session == val_sess]
+        if not sub_train or not val_rows or not test_rows:
+            fold_rows.append({"fold_id": fold.fold_id, "skipped": True,
+                              "why": "no sub-train/validation/test rows"})
+            continue
+        val_start = _session_start_utc(val_sess)
+        test_start = _session_start_utc(min(fold.test_sessions))
+
+        std = Standardizer().fit([s.features for s in sub_train], names)
+        dm_tr = build_design(sub_train, std, std.feature_names)
+        dm_va = build_design(val_rows, std, std.feature_names)
+        dm_te = build_design(test_rows, std, std.feature_names)
+
+        hd_tr = mlp_mod.assemble_head_data(
+            sub_train, aux_logret, aux_rv, aux_event, causes, val_start)
+        hd_va = mlp_mod.assemble_head_data(
+            val_rows, aux_logret, aux_rv, aux_event, causes, test_start)
+        hd_te = mlp_mod.assemble_head_data(
+            test_rows, aux_logret, aux_rv, aux_event, causes, None,
+            include_censored_hazard=True)
+
+        try:
+            model, history = mlp_mod.train_mlp(
+                dm_tr.x, hd_tr, dm_va.x, hd_va,
+                cfg=cfg, seed=seed, device=dev)
+        except (RuntimeError, ValueError) as exc:
+            fold_rows.append({"fold_id": fold.fold_id, "skipped": True,
+                              "why": f"train_mlp failed: {exc}"})
+            continue
+
+        # temperature from validation direction labels only
+        va_idx = [i for i, c in enumerate(hd_va.direction_cls)
+                  if c is not None]
+        temperature = 1.0
+        if va_idx:
+            va_pred = mlp_mod.predict_heads(model, dm_va.x[va_idx],
+                                            device=dev)
+            temperature = mlp_mod.fit_temperature(
+                va_pred["direction_logits"],
+                np.asarray([hd_va.direction_cls[i] for i in va_idx]))
+        preds = mlp_mod.predict_heads(model, dm_te.x, device=dev,
+                                      temperature=temperature)
+
+        # ---- direction pooling
+        te_dir_idx = [i for i, c in enumerate(hd_te.direction_cls)
+                      if c is not None]
+        dir_train = [s for s in train_rows if _ok(s)]
+        if te_dir_idx and dir_train:
+            d_test = [test_rows[i] for i in te_dir_idx]
+            y_train_bin = [_direction_y(s) for s in dir_train]
+            c_const = constant_base_rate_probs(y_train_bin, len(d_test))
+            c_mom, m_mom = momentum_rule_probs(dir_train, y_train_bin,
+                                               d_test)
+            c_base, m_base = baseline_p_win_probs(d_test)
+            comp_pool["constant"]["p"].extend(c_const.tolist())
+            comp_pool["constant"]["mask"].extend([1.0] * len(d_test))
+            comp_pool["momentum"]["p"].extend(c_mom.tolist())
+            comp_pool["momentum"]["mask"].extend(m_mom.tolist())
+            comp_pool["baseline_p_win"]["p"].extend(c_base.tolist())
+            comp_pool["baseline_p_win"]["mask"].extend(m_base.tolist())
+            dir_s.extend(d_test)
+            dir_y.extend(_direction_y(s) for s in d_test)
+            dir_sess.extend(s.session for s in d_test)
+            dir_p.extend(float(preds["p_up"][i]) for i in te_dir_idx)
+            dir_cls.extend(int(hd_te.direction_cls[i]) for i in te_dir_idx)
+            dir_cls_pred.extend(
+                int(np.argmax(preds["direction_probs"][i]))
+                for i in te_dir_idx)
+
+        # ---- quantile pooling (marginal fit on purge-safe train+val)
+        tr_lr = [v for v in hd_tr.log_return + hd_va.log_return
+                 if v is not None]
+        te_q_idx = [i for i, v in enumerate(hd_te.log_return)
+                    if v is not None]
+        if tr_lr and te_q_idx:
+            marg = {t: float(np.quantile(np.asarray(tr_lr), t))
+                    for t in cfg.quantiles}
+            for i in te_q_idx:
+                q_y.append(float(hd_te.log_return[i]))
+                q_sess.append(test_rows[i].session)
+                for j, t in enumerate(cfg.quantiles):
+                    q_pred[t].append(float(preds["quantiles"][i, j]))
+                    q_marg[t].append(marg[t])
+
+        # ---- rv pooling
+        for i in [k for k, v in enumerate(hd_te.rv) if v is not None]:
+            rv_y.append(float(hd_te.rv[i]))
+            rv_sess.append(test_rows[i].session)
+            rv_f_model.append(float(preds["rv_forecast"][i]))
+            f, m = ewma_by_id.get(test_rows[i].decision_id, (0.0, False))
+            rv_f_ewma.append(f)
+            rv_m_ewma.append(m)
+
+        # ---- hazard pooling (model vs train-marginal table, paired NLL)
+        tr_tc = [(t, c) for t, c in zip(
+                     hd_tr.hazard_time + hd_va.hazard_time,
+                     hd_tr.hazard_cause + hd_va.hazard_cause)
+                 if t is not None]
+        te_hz_idx = [i for i, t in enumerate(hd_te.hazard_time)
+                     if t is not None]
+        hz_fold: Optional[Dict[str, Any]] = None
+        if len(tr_tc) >= 20 and te_hz_idx:
+            pp_tr = expand_person_periods([t for t, _ in tr_tc],
+                                          [c for _, c in tr_tc])
+            table = _marginal_hazard_table(pp_tr, n_bins, n_classes)
+            te_t = [float(hd_te.hazard_time[i]) for i in te_hz_idx]
+            te_c = [hd_te.hazard_cause[i] for i in te_hz_idx]
+            pp_te = expand_person_periods(te_t, te_c)
+            hz_sel = preds["hazards"][te_hz_idx]
+            row_nll = mlp_mod.hazard_row_nll(hz_sel, pp_te)
+            marg_by_row: Dict[int, Tuple[float, int]] = {}
+            for pp in pp_te:
+                s_nll, n_pp = marg_by_row.get(pp.row_index, (0.0, 0))
+                marg_by_row[pp.row_index] = (
+                    s_nll - float(np.log(table[pp.time_bin, pp.outcome])),
+                    n_pp + 1)
+            for ridx, (s_nll, n_pp) in row_nll.items():
+                sess = test_rows[te_hz_idx[ridx]].session
+                hz_model_sess.setdefault(sess, []).append(
+                    (s_nll / n_pp, n_pp))
+            for ridx, (s_nll, n_pp) in marg_by_row.items():
+                sess = test_rows[te_hz_idx[ridx]].session
+                hz_marg_sess.setdefault(sess, []).append(
+                    (s_nll / n_pp, n_pp))
+            for c in te_c:
+                if c is None:
+                    hz_cens += 1
+                else:
+                    hz_event_counts[c] += 1
+            cif = mlp_mod.cif_from_hazards(hz_sel)
+            cif_coherent = cif_coherent and bool(
+                np.all(np.diff(cif, axis=1) >= -1e-9)
+                and np.all(cif.sum(axis=2) <= 1.0 + 1e-9))
+            cif_final_rows.append(cif[:, -1, :])
+            hz_fold = {"n_train_periods": len(pp_tr),
+                       "n_test_periods": len(pp_te),
+                       "n_test_subjects": len(te_hz_idx)}
+
+        row: Dict[str, Any] = {
+            "fold_id": fold.fold_id, "skipped": False,
+            "train_sessions": fold.train_sessions,
+            "test_sessions": fold.test_sessions,
+            "val_session": val_sess,
+            "purged": fold.purged, "embargoed": fold.embargoed,
+            "temperature": float(temperature),
+            "head_counts_train": hd_tr.counts(),
+            "head_counts_val": hd_va.counts(),
+            "head_counts_test": hd_te.counts(),
+            "history": {k: history.get(k) for k in (
+                "epochs_run", "best_epoch", "stopped_early",
+                "train_loss_at_best", "val_loss_at_best",
+                "train_val_gap", "val_head_losses_at_best")},
+        }
+        if hz_fold is not None:
+            row["hazard"] = hz_fold
+        fold_rows.append(row)
+
+    result: Dict[str, Any] = {
+        "folds": fold_rows,
+        "device": dev,
+        "config": {"hidden": list(cfg.hidden), "dropout": cfg.dropout,
+                   "lr": cfg.lr, "weight_decay": cfg.weight_decay,
+                   "batch_size": cfg.batch_size,
+                   "max_epochs": cfg.max_epochs, "patience": cfg.patience,
+                   "grad_clip": cfg.grad_clip,
+                   "quantiles": list(cfg.quantiles)},
+        "note": "multitask heads share one trunk; each head is evaluated "
+                "only on rows whose target exists (masked, never imputed); "
+                "validation tail = last train session, used for early "
+                "stopping and temperature calibration only",
+        "heads": {},
+    }
+
+    # ---- direction head (pooled)
+    if dir_p:
+        pooled = binary_metrics(dir_y, dir_p)
+        bins = reliability_bins(dir_y, dir_p)
+        pooled["ece"] = expected_calibration_error(bins)
+        comparators: Dict[str, Any] = {}
+        deltas: Dict[str, Any] = {}
+        for cname, pool in comp_pool.items():
+            mask = pool["mask"]
+            ys = [y for y, m in zip(dir_y, mask) if m]
+            ps = [p for p, m in zip(pool["p"], mask) if m]
+            met = binary_metrics(ys, ps)
+            met["ece"] = expected_calibration_error(
+                reliability_bins(ys, ps))
+            met["n_unavailable"] = int(len(mask) - sum(mask))
+            comparators[cname] = met
+            comp_sess = _per_session_log_loss(dir_sess, dir_y,
+                                              pool["p"], mask)
+            chall_sess = _per_session_log_loss(dir_sess, dir_y, dir_p,
+                                               mask)  # paired rows
+            deltas[cname] = _delta_report(comp_sess, chall_sess,
+                                          n_boot, seed)
+        result["heads"]["direction"] = {
+            "pooled": pooled,
+            "accuracy_3class": float(np.mean(
+                np.asarray(dir_cls_pred) == np.asarray(dir_cls))),
+            "reliability_bins": bins,
+            "by_dte_bucket": _stratified_binary(
+                dir_s, dir_y, dir_p,
+                lambda s: dte_bucket(s.features.get("dte_days"))),
+            "by_kind": _stratified_binary(dir_s, dir_y, dir_p,
+                                          lambda s: s.kind),
+            "comparators": comparators,
+            "deltas_log_loss": deltas,
+        }
+    else:
+        result["heads"]["direction"] = None
+
+    # ---- quantile head (pooled)
+    if q_y:
+        per_tau = {t: {"pinball_model": pinball_loss(q_y, q_pred[t], t),
+                       "pinball_marginal": pinball_loss(q_y, q_marg[t], t)}
+                   for t in cfg.quantiles}
+
+        def _sess_pinball(pred: Dict[float, List[float]]
+                          ) -> Dict[str, float]:
+            groups: Dict[str, List[int]] = {}
+            for i, sess in enumerate(q_sess):
+                groups.setdefault(sess, []).append(i)
+            out = {}
+            for sess, idx in groups.items():
+                losses = [pinball_loss([q_y[i] for i in idx],
+                                       [pred[t][i] for i in idx], t)
+                          for t in cfg.quantiles]
+                vals = [v for v in losses if v is not None]
+                if vals:
+                    out[sess] = float(np.mean(vals))
+            return out
+
+        result["heads"]["quantile"] = {
+            "n": len(q_y),
+            "per_tau": per_tau,
+            "coverage_90_model": interval_coverage(q_y, q_pred[0.05],
+                                                   q_pred[0.95]),
+            "coverage_90_marginal": interval_coverage(q_y, q_marg[0.05],
+                                                      q_marg[0.95]),
+            "coverage_50_model": interval_coverage(q_y, q_pred[0.25],
+                                                   q_pred[0.75]),
+            "coverage_50_marginal": interval_coverage(q_y, q_marg[0.25],
+                                                      q_marg[0.75]),
+            "deltas_pinball": {"marginal": _delta_report(
+                _sess_pinball(q_marg), _sess_pinball(q_pred),
+                n_boot, seed)},
+        }
+    else:
+        result["heads"]["quantile"] = None
+
+    # ---- rv head (pooled; paired vs point-in-time EWMA)
+    if rv_y:
+        pooled_rv = {"model": {
+            "n": len(rv_y),
+            "rmse": float(np.sqrt(np.mean(
+                (np.asarray(rv_y) - np.asarray(rv_f_model)) ** 2))),
+            "qlike": qlike_loss(rv_y, rv_f_model)}}
+        ys_e = [y for y, m in zip(rv_y, rv_m_ewma) if m]
+        fs_e = [f for f, m in zip(rv_f_ewma, rv_m_ewma) if m]
+        pooled_rv["ewma"] = {
+            "n": len(ys_e),
+            "rmse": (float(np.sqrt(np.mean(
+                (np.asarray(ys_e) - np.asarray(fs_e)) ** 2)))
+                if ys_e else None),
+            "qlike": qlike_loss(ys_e, fs_e),
+            "n_unavailable": int(len(rv_y) - len(ys_e))}
+        g_m: Dict[str, Tuple[List[float], List[float]]] = {}
+        g_e: Dict[str, Tuple[List[float], List[float]]] = {}
+        for y, fm, fe, m, sess in zip(rv_y, rv_f_model, rv_f_ewma,
+                                      rv_m_ewma, rv_sess):
+            if not m:
+                continue        # pair only on EWMA-available rows
+            a, b = g_m.setdefault(sess, ([], []))
+            a.append(y)
+            b.append(fm)
+            a2, b2 = g_e.setdefault(sess, ([], []))
+            a2.append(y)
+            b2.append(fe)
+        sess_m = {s: q for s, (a, b) in g_m.items()
+                  if (q := qlike_loss(a, b)) is not None}
+        sess_e = {s: q for s, (a, b) in g_e.items()
+                  if (q := qlike_loss(a, b)) is not None}
+        result["heads"]["rv"] = {
+            "pooled": pooled_rv,
+            "deltas_qlike": {"model_vs_ewma": _delta_report(
+                sess_e, sess_m, n_boot, seed)},
+        }
+    else:
+        result["heads"]["rv"] = None
+
+    # ---- hazard head (pooled)
+    if hz_model_sess:
+        def _weighted(d: Dict[str, List[Tuple[float, int]]]
+                      ) -> Dict[str, float]:
+            return {sess: sum(v * n for v, n in rows)
+                    / sum(n for _, n in rows)
+                    for sess, rows in d.items()}
+
+        tot_n = sum(n for rows in hz_model_sess.values() for _, n in rows)
+        mean_cif = (np.vstack(cif_final_rows).mean(axis=0)
+                    if cif_final_rows else None)
+        result["heads"]["hazard"] = {
+            "pooled_nll_model": (sum(
+                v * n for rows in hz_model_sess.values()
+                for v, n in rows) / tot_n) if tot_n else None,
+            "pooled_nll_marginal": (sum(
+                v * n for rows in hz_marg_sess.values()
+                for v, n in rows) / tot_n) if tot_n else None,
+            "deltas_nll": {"marginal": _delta_report(
+                _weighted(hz_marg_sess), _weighted(hz_model_sess),
+                n_boot, seed)},
+            "cif_coherent": bool(cif_coherent),
+            "mean_model_cif_final_bin": (
+                {c: float(mean_cif[k])
+                 for k, c in enumerate(HAZARD_CAUSES)}
+                if mean_cif is not None else None),
+            "test_events_by_cause": hz_event_counts,
+            "test_censored": hz_cens,
+        }
+    else:
+        result["heads"]["hazard"] = None
+
+    # ---- final artifact: train on all fold sessions, purged vs holdout
+    fold_set = set(fold_sessions)
+    final_rows = [s for s in samples if s.session in fold_set]
+    f_val_sess = max(fold_sessions) if fold_sessions else None
+    f_sub = [s for s in final_rows if s.session != f_val_sess]
+    f_val = [s for s in final_rows if s.session == f_val_sess]
+    if len(fold_sessions) >= 2 and f_sub and f_val:
+        f_val_start = _session_start_utc(f_val_sess)
+        hold_start = _session_start_utc(min(holdout)) if holdout else None
+        std_f = Standardizer().fit([s.features for s in f_sub], names)
+        dm_sub = build_design(f_sub, std_f, std_f.feature_names)
+        dm_val = build_design(f_val, std_f, std_f.feature_names)
+        hd_sub = mlp_mod.assemble_head_data(
+            f_sub, aux_logret, aux_rv, aux_event, causes, f_val_start)
+        hd_val = mlp_mod.assemble_head_data(
+            f_val, aux_logret, aux_rv, aux_event, causes, hold_start)
+        try:
+            model_f, hist_f = mlp_mod.train_mlp(
+                dm_sub.x, hd_sub, dm_val.x, hd_val,
+                cfg=cfg, seed=seed, device=dev)
+            v_idx = [i for i, c in enumerate(hd_val.direction_cls)
+                     if c is not None]
+            temp_f = 1.0
+            if v_idx:
+                vp = mlp_mod.predict_heads(model_f, dm_val.x[v_idx],
+                                           device=dev)
+                temp_f = mlp_mod.fit_temperature(
+                    vp["direction_logits"],
+                    np.asarray([hd_val.direction_cls[i] for i in v_idx]))
+            manifest = mlp_mod.save_model(
+                model_f, out_stem,
+                feature_columns=dm_sub.columns,
+                standardizer_state=mlp_mod.standardizer_state(std_f),
+                temperature=temp_f,
+                seed=seed,
+                git_sha=_git_sha(),
+                dataset_hash=dataset_meta(dataset_path).get("dataset_hash"),
+                train_sessions=list(fold_sessions),
+                val_session=f_val_sess,
+                extra={"horizon": horizon})
+            loaded, _mf = mlp_mod.load_model(
+                f"{out_stem}_manifest.json", device="cpu")
+            probe = (dm_val.x if len(dm_val.x) else dm_sub.x)[:32]
+            p1 = mlp_mod.predict_heads(model_f, probe, device="cpu",
+                                       temperature=temp_f)
+            p2 = mlp_mod.predict_heads(loaded, probe, device="cpu",
+                                       temperature=temp_f)
+            max_diff = max(float(np.max(np.abs(p1[k] - p2[k])))
+                           for k in p1)
+            result["artifact"] = {
+                "status": "saved",
+                "manifest": f"{out_stem}_manifest.json",
+                "model_file": f"{out_stem}_model.pt",
+                "checksum_sha256": manifest.get("checksum_sha256"),
+                "temperature": float(temp_f),
+                "val_session": f_val_sess,
+                "history": {k: hist_f.get(k) for k in (
+                    "epochs_run", "best_epoch", "stopped_early",
+                    "train_loss_at_best", "val_loss_at_best",
+                    "train_val_gap")},
+                "reload_parity": {"max_abs_diff": max_diff,
+                                  "ok": bool(max_diff < 1e-5)},
+            }
+        except (RuntimeError, ValueError) as exc:
+            result["artifact"] = {"status": "skipped",
+                                  "why": f"final fit failed: {exc}"}
+    else:
+        result["artifact"] = {"status": "skipped",
+                              "why": "fewer than 2 fold sessions with rows"}
+    return result
 
 
 # --------------------------------------------------------------------------- #
@@ -684,7 +1161,7 @@ def run_mlp() -> Dict[str, Any]:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     p = argparse.ArgumentParser(
-        description="Oracle 4.0 Phase 3 classical challengers "
+        description="Oracle 4.0 Phases 3-4 challenger training/evaluation "
                     "(research-only; evaluated through the purged "
                     "walk-forward harness)")
     p.add_argument("--model", required=True, choices=MODELS)
@@ -696,7 +1173,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--out", required=True)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", default="auto",
-                   help="recorded for parity with Phase 4; unused here")
+                   help="torch device for --model mlp: auto|cpu|cuda "
+                        "(recorded in the report)")
     p.add_argument("--n-boot", type=int, default=2000)
     p.add_argument("--fold-config", default=None,
                    help="JSON overrides: test_block_sessions, "
@@ -725,8 +1203,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "fold_config": fold_cfg,
     }
 
-    if args.model in ("gbm", "mlp"):
-        report["result"] = run_gbm() if args.model == "gbm" else run_mlp()
+    if args.model == "mlp" and args.label_type != "direction":
+        p.error("--model mlp anchors rows on direction labels; "
+                "use --label-type direction")
+
+    if args.model == "gbm":
+        report["result"] = run_gbm()
+    elif args.model == "mlp" and not _torch_ready():
+        report["result"] = {
+            "status": "unavailable",
+            "why": "torch not installed (optional dependency); "
+                   "result reported honestly, never faked"}
     else:
         meta = dataset_meta(args.dataset)
         report["dataset_hash"] = meta.get("dataset_hash")
@@ -756,6 +1243,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         elif args.model == "hazard":
             report["result"] = run_hazard(samples, folds, args.dataset,
                                           args.seed, args.n_boot)
+        elif args.model == "mlp":
+            out_stem = (args.out[:-5] if args.out.endswith(".json")
+                        else args.out)
+            report["result"] = run_mlp(samples, folds, args.dataset,
+                                       args.horizon, args.seed,
+                                       args.n_boot, args.device, out_stem,
+                                       holdout, fold_sessions)
 
     clean = _py(report)
     clean["report_fingerprint"] = metrics_fingerprint(clean)
