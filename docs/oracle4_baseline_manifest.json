@@ -1,0 +1,80 @@
+{
+  "manifest_version": 1,
+  "name": "oracle4_frozen_baseline",
+  "generated_at_utc": "2026-11-19T11:30:00Z",
+  "purpose": "Immutable baseline replay manifest for the Oracle 4.0 research program. All challenger experiments must reference this manifest. The production baseline is the code at code_sha with all flags at the defaults below; parity means bit-for-bit identical baseline decisions when replayed through any new harness with all new flags off.",
+  "code": {
+    "sha": "8af6d5bd6d91bfc473ade43a21f1e413c863603e",
+    "branch": "oracle4-research",
+    "reference_commit_matches_master_prompt": true,
+    "commit_date": "2026-11-15 14:15:27 -0600",
+    "notes": "HEAD of oracle4-research == reference commit named in the Oracle 4.0 master prompt. No production file is modified by Phase 0."
+  },
+  "environment": {
+    "python": "3.10 (local venv C:/Users/yomi/arbitrage_bot/arb)",
+    "platform": "win32 (development); linux 3.12 venv (deployment, /var/www/alps)",
+    "ml_libraries_installed": {
+      "torch": false,
+      "sklearn": false,
+      "lightgbm": false,
+      "duckdb": false,
+      "pyarrow": false,
+      "numpy": true,
+      "pandas": true
+    },
+    "credentials": "Alpaca PAPER keys present via .env (names inventoried in docs/oracle4_gap_audit.md; values never read). No live-trading credentials are used by any research path.",
+    "timezone_policy": "all research timestamps UTC"
+  },
+  "baseline_flags": {
+    "comment": "Existing research/shadow flags and their effective defaults at code_sha. New ORACLE4_* flags do not exist at this SHA and are introduced only in Phase 7, default OFF.",
+    "ENABLE_DECISION_LEDGER": "off by default",
+    "SHADOW_RECORDER_ENABLED": "off by default",
+    "ENABLE_ORACLE_LAB": "off by default",
+    "USE_SKIP_ON_WEAK_SIGNAL": "off by default",
+    "USE_NORMALIZED_CONFIDENCE": "off by default",
+    "USE_ORACLE_TRADE_GATE": "off by default",
+    "USE_EV_ENTRY_GATE": "off by default",
+    "EXECUTABLE_EV_SHADOW_MODE": "off by default",
+    "ENABLE_ORACLE4_SHADOW": "not present at baseline (Phase 7, default off)",
+    "ORACLE4_MODEL_ID": "not present at baseline",
+    "ORACLE4_MAX_CANDIDATES": "not present at baseline",
+    "ORACLE4_MAX_SCENARIOS": "not present at baseline"
+  },
+  "data_assets": [
+    {
+      "path": "research_ledger_server_2026-11-13.db",
+      "bytes": 15114240,
+      "sha256": "d8ff8bc3ccbe8693ce336b70d2476803b0af1040943490e465696ef1316d9d89",
+      "description": "Frozen server extract of the research ledger (sqlite). 14,264 snapshots (2,526 candidate + 11,738 shadow_candidate), 88 underlyings, 2026-11-04T14:53Z to 2026-11-13T20:05Z (~8 exchange sessions). 3,654 events: 779 submitted, 779 fill, 754 exit, 1,342 outcome, 0 cancel, 0 reject."
+    },
+    {
+      "path": "export_decisions.jsonl",
+      "bytes": 21469669,
+      "sha256": "c90cf1e47f28ab3fbb9b8dae5c9fef57cb97f1be021dc4421ebcdc001075f34a",
+      "description": "Research export of all ledger decisions (14,264 lines). Known defect: companion export_groups.jsonl is empty (0 lines); group reconstruction must come from the ledger itself."
+    },
+    {
+      "path": "candidate_resolution.jsonl",
+      "bytes": 73332,
+      "sha256": "ed7c9ec559c870b4df9e2345016de53ccf26456c0e67a72be4226b8cb55073bd",
+      "description": "Candidate resolution labels (70 lines). Local working-tree copy is modified relative to git; this hash freezes the copy used for Oracle 4.0 research. Never committed per standing instruction."
+    }
+  ],
+  "data_caveats": [
+    "Outcome provenance is dominated by mark-derived P&L (3,565 mark vs 14 fills-true at freeze time); fills-based booking only began at code_sha.",
+    "Zero cancel/reject events exist, so fill-probability calibration must shrink to conservative priors (Phase 6).",
+    "~8 sessions of coverage << the pre-registered 60-session / 200-resolved-opportunity promotion gates; all empirical gates therefore start PENDING / INSUFFICIENT_EVIDENCE.",
+    "Historical option bid/ask backfill is unavailable; forward quote capture (server cron since 2026-11-15) is the growing fallback."
+  ],
+  "test_baseline": {
+    "command": "python -m pytest -q --ignore=tests/test_safety.py",
+    "result_at_code_sha": "2082 passed, 3 failed",
+    "known_failures": [
+      "tests/test_oracle_intelligence_reports.py::TestTelegramDispatch::test_eight_commands_dispatch (pre-existing)",
+      "test_safety.py::TestEVEntryGate::test_disabled_skips_gate (pre-existing, environment-dependent)",
+      "test_safety.py::TestEVEntryGate::test_passes_when_above_floor (pre-existing, environment-dependent)"
+    ],
+    "notes": "tests/test_safety.py (directory copy) hangs in this environment and is always ignored; the root-level test_safety.py is collected."
+  },
+  "parity_statement": "Baseline parity is defined as: replaying the frozen data assets through any new Oracle 4.0 harness with all new flags off reproduces the baseline's decisions and scores bit-for-bit (same selected contracts, same scores, same gates). Verified as a Phase 2 acceptance criterion. No Phase 0 change touches smart_trader.py, exit_manager.py, scheduler, or any production order path."
+}
