@@ -399,3 +399,101 @@ with abstain-on-mismatch) for Phases 5–7, not predictive skill.
 - `artifacts/oracle4/train_mlp_{60m,1s}.json` +
   `train_mlp_{60m,1s}_model.pt` / `_manifest.json` (local; regenerable
   via the CLI — fingerprints above, checksums `a12a77ca…` / `6f10181f…`).
+
+## Phase 5 — Scenario valuation & all-candidate ranking with abstention
+
+### Code
+
+- `oracle/ml/valuation.py` — research-only, no live-path imports.
+  - **Contract identity:** `parse_occ_symbol` (root/expiry/type/strike);
+    unparseable → abstain, never guessed.
+  - **Scenarios:** `generate_scenarios` — per-(session, underlying,
+    5-min bucket) circular block bootstrap (block 6) of the underlying's
+    own past-only 5-min log returns, rescaled by an EWMA(0.94) vol
+    forecast (scale clamped [0.5, 2.0], clamping flagged `ood`); <30
+    past returns → abstain `insufficient_history`. Path count clamped
+    [256, 2048]; seeds via sha256(seed, underlying, bucket) so every
+    candidate in a scan shares **common random numbers** (paired
+    comparisons, less MC noise in rank deltas).
+  - **Repricing:** IV solved from the observed mid (sticky-strike,
+    constant through the horizon — stated approximation); marks via
+    vectorized BSM (`_bs_price_vec`, parity-tested vs the scalar
+    pricer incl. T=0/σ=0); CRR American reference logged as an entry
+    approximation-error diagnostic. Gates (in order): missing/unusable
+    quote, unparseable symbol, **underlying_mismatch** (OCC root ≠ scan
+    underlying — the scenario paths would be the wrong asset), missing
+    DTE, expired, missing spot, IV unresolved. Expiry inside the sim →
+    intrinsic cash settlement with exit frictions waived.
+  - **Valuation:** `value_candidate` — executable entry = mid + half
+    spread + slippage; stop −10% / target +20% on the entry fill with
+    first-touch precedence (stop wins at a joint touch); costs charged
+    once (spread+slippage embedded in executable prices, OCC fee per
+    leg, ×100 multiplier exactly once); `FillModel` p_fill and partial
+    fraction scale EV (`ev = p_fill × fill_frac × mean_net`); MC se
+    (ddof=1), ES95 (mean of worst 5%), PoP. No fill → abstain.
+  - **Ranking:** `rank_candidates` — explicit **abstention (EV 0) is
+    always on the menu**; gates: non-positive EV, `ev ≤ k·mc_se`
+    (uncertain), spread% > 40%, ES95 beyond capital. Legacy
+    `baseline_score` ordering reported alongside, never blended.
+  - **Runner/CLI:** `run_valuation` revalues every scan at friction
+    multipliers 1.0/1.5/2.0 by reusing the repricing (same paths);
+    report carries counts, abstain histogram, EV/PoP summaries, stress
+    monotonicity check, baseline top-1 agreement, latency, per-scan
+    detail, dataset hash + git SHA + fingerprint. CLI refuses
+    pre-registered holdout sessions (exit 2, no file written).
+
+### Acceptance tests
+
+`tests/test_oracle4_valuation.py` — **59 passed**: OCC parse accept/
+reject table; vectorized-vs-scalar BSM ≤1e-9 (incl. T=0, σ=0);
+scenario determinism/seed-separation/past-only/clamps; every abstain
+reason incl. `underlying_mismatch` and in-sim expiry settling to
+intrinsic; **hand-computed** valuations (entry 2.12 on a 1.90/2.10
+quote; TP net +75.96 → EV 75.2004 at p_fill 0.99; stop −74.04; time
+exit −19.04; expiry settlement +7.98 with exit frictions waived);
+friction stress monotone on the hand case (−19.04/−31.06/−43.08);
+qty=2 doubles net and capital exactly (×100 multiplier once); partial
+fills scale EV (0.5×0.5×75.96); wide-quote p_fill haircut (0.8415);
+no-fill/negative-entry abstention; first-touch and stop-precedence
+exit cases; every ranking gate; tie-break chain; and the master-prompt
+fixture where the **second-best legacy score has higher executable EV
+and the challenger selects it** while the baseline order is reported
+unchanged. End-to-end `run_valuation` fixture asserts counts, abstain
+histogram, CRN seed reproduction, stress monotonicity, determinism
+across runs; CLI test asserts report provenance + holdout refusal.
+Oracle4 battery: **178 passed**. Full suite: **2161 passed, 1 failed**
+— the known pre-existing Telegram dispatch failure; zero regressions.
+
+### Real-data results (dataset `f7f662e0…`, seed 42, 512 paths, fold sessions only, fingerprint `077d2c7c…`)
+
+- 5,900 scans / 9,570 candidate rows → **1,090 valued, 8,480 abstained**.
+  Abstentions are honest, not silent: `missing_quote` 7,441 (label-only
+  rows with no captured quote), `insufficient_history` 991 (early-session
+  scans before 30 past 5-min returns), `iv_unresolved:below_intrinsic`
+  21, `missing_underlying_price` 17, `underlying_mismatch` 10.
+- The mismatch gate was added after the first real-data run: ~0.5% of
+  rows (13/2,526 parsed) carry an OCC root different from the stored
+  scan underlying (upstream logger stored candidates under the scan
+  symbol). The first run's single baseline disagreement was exactly such
+  a row (an NVDA put "repriced" on AMD paths) — an artifact, now gated.
+- Decisions: **254 trade / 5,646 abstain**. Model-implied EV of selected
+  trades: mean $74.8, median $42.0 per contract — **model-implied under
+  stated approximations, not realized P&L; no profitability claim.**
+- Across all valued opportunities EV mean is **−$22.1** (p50 −$17.5):
+  most quoted candidates are negative-EV after frictions, which is why
+  abstention dominates. PoP mean 0.342.
+- Friction stress strictly monotone: EV mean −22.1 → −43.3 → −65.1 at
+  1.0/1.5/2.0× (report flag `True`).
+- Baseline top-1 agreement 254/254 — **trivial**: after gating, every
+  trade scan had exactly one eligible candidate, so this dataset cannot
+  yet distinguish EV ranking from legacy scoring in the field (the
+  capability is proven by the fixture test; a verdict needs denser
+  multi-candidate scans from the quote-capture cron).
+- Latency: 9.4 ms/candidate, 90 s total for six sessions on CPU —
+  comfortably within shadow-mode budgets.
+
+### Artifacts
+
+- `artifacts/oracle4/valuation.json` (local; regenerable via
+  `python -m oracle.ml.valuation --dataset artifacts/oracle4/dataset_v1.sqlite
+  --out artifacts/oracle4/valuation.json --seed 42 --n-paths 512`).
