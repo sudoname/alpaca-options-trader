@@ -497,3 +497,179 @@ Oracle4 battery: **178 passed**. Full suite: **2161 passed, 1 failed**
 - `artifacts/oracle4/valuation.json` (local; regenerable via
   `python -m oracle.ml.valuation --dataset artifacts/oracle4/dataset_v1.sqlite
   --out artifacts/oracle4/valuation.json --seed 42 --n-paths 512`).
+
+## Phase 6 — Execution calibration & paired portfolio replay
+
+### Code
+
+- `oracle/ml/execution.py` — execution-calibration study over
+  `server_data/<date>/execution_calibration.jsonl` +
+  `trading_history.json`. Research-only; no broker/network access.
+  - **Provenance is first-class:** every block carries a `provenance`
+    tag (`paper_resolved`, `paper_limit_orders`,
+    `indicative_kernel_shadow`, `paper_marks`, `unknown`) and the
+    artifact carries a top-level note that **paper fills are NOT proof
+    of attainable live execution** (master-prompt requirement).
+  - **Fill probability with shrinkage:** Jeffreys 95% intervals +
+    Beta shrinkage toward a conservative 0.80 prior (strength 10);
+    spread buckets (tight <2% / normal 2–5% / wide 5–10% /
+    very_wide), buckets with n<20 pooled. The resolved-paper log is
+    explicitly labeled **SURVIVORSHIP** (it only contains resolved,
+    filled realizations). The only genuine nonfill evidence is the
+    limit take-profit ledger (`roll_take_profit` vs
+    `roll_failed_take_profit`).
+  - **Unknown coverage is not zero:** `actual_fill_delay` is null on
+    every record → time-to-fill reported `UNKNOWN_COVERAGE`; no
+    realized-fee field exists → fees `unknown`; mark-vs-fill exit
+    slippage for the 32 `pnl_source='fills'` closes is unknown, not 0.
+  - **Stop-overshoot study** (feeds replay stress): overshoot_pts =
+    configured stop floor minus realized gross, from paper marks.
+  - EV calibration links `execution_estimate` → `execution_realization`
+    by trade_id; OLS slope/intercept, error quantiles, and a paired
+    session bootstrap CI on the error.
+- `oracle/ml/replay.py` — deterministic paired portfolio replay.
+  - **Trade universe = the bot's own recorded `mark_derived` outcomes**
+    (fills + gross P&L from the production logs). Challenger variants
+    can only *drop* trades; counterfactual fills are **never
+    fabricated** — selections without a recorded outcome are counted
+    `outcome_unavailable` (master-prompt rule).
+  - **Event-driven portfolio engine** (`run_portfolio`): entry/exit
+    event queue (335/754 recorded holds exit on a later day), cash and
+    `max_concurrent=5` constraints with skip accounting
+    (`concurrency` / `cash`), per-side friction = `one_way_frac ×
+    premium × mult` charged on entry and exit, exit value floored at 0
+    (long premium can't go below worthless), stop-overshoot stress
+    degrades only `dynamic_stop_loss` exits. MTM limitation stated in
+    the artifact: no daily option marks exist, so open positions are
+    carried at entry cost and all P&L lands on the exit day
+    (drawdown/Sharpe between entry and exit are understated).
+  - **Metrics:** net/gross P&L, win rate, expectancy, profit factor,
+    daily Sharpe ×√252 over *all* session days (zero-trade days are
+    real observations), max drawdown seeded with starting cash,
+    turnover, average exposure, full equity curve.
+  - **Paired variants on identical capital/costs/timestamps:**
+    `baseline_frozen` (all recorded trades), `baseline_quality`
+    (drops has_quote=False or spread>10%), `valuation_ranked` (trade
+    only when the Phase 5 valuation said trade), `classical_gated` /
+    `neural_gated` (direction gate from **out-of-fold** purged
+    walk-forward predictions recomputed in-process — no saved-model
+    leakage; trades without an OOF prediction pass through and are
+    counted `no_prediction`), `combined` (classical gate ∩ valuation).
+    Torch missing → `neural_gated` honestly `unavailable`.
+  - **Acceptance mechanics:** parity check (frictionless, unconstrained
+    engine must equal two independent recomputations of the outcome
+    store to <1e-6); decision-level **holdout refusal** (2026-11-12/13
+    excluded); friction sweep 1.0/1.5/2.0×; stop-overshoot stress from
+    the Phase 6a artifact (p90−p50); paired per-session deltas on
+    P&L-by-exit-day with session block bootstrap CIs; sha256
+    fingerprint over the canonicalized artifact; CLI
+    `python -m oracle.ml.replay`.
+  - Bug fixed during testing: empty holdout produced invalid SQL
+    (`NOT IN ()`); the WHERE clause is now built conditionally.
+
+### Acceptance tests
+
+- `tests/test_oracle4_execution.py` — **16 passed**: loader dedup/
+  validation; Jeffreys interval vs scipy-free closed form; shrinkage
+  math; bucket pooling below min_group; survivorship labeling;
+  limit-TP nonfill rate (hand-computed 60/97); linking; EV-calibration
+  OLS on a hand-built set; stop-overshoot quantiles; unknown-coverage
+  honesty (time-to-fill, fees); fingerprint determinism.
+- `tests/test_oracle4_replay.py` — **27 passed**: hand-computed metric
+  helpers (Sharpe √252 case, drawdown, profit factor, direction gate
+  truth table); portfolio-engine money tests (friction = 2×one_way×
+  premium exactly; premium floor; concurrency skip + re-entry; cash
+  skip; multi-day exit creates the exit day with cost-basis equity;
+  overshoot hits only `dynamic_stop_loss`; drawdown vs starting cash;
+  determinism under input reordering); variant accounting (quality
+  drops, `outcome_unavailable` ghosts, gate pass/fail/no_prediction,
+  combined intersection); sqlite fixture written with the production
+  `_write_store` (policy_skip + missing-fill + holdout rows,
+  separable direction labels); loader counts incl. exit-clamp and
+  friction fallbacks; OOF coverage (no holdout or first-two-session
+  predictions; OOF forecasts agree with the separable labels);
+  end-to-end `run_replay` parity/accounting/friction-monotonicity/
+  stress/paired-CI assertions; deterministic fingerprint; CLI smoke.
+  Combined Phase 6 battery: **43 passed**.
+
+### Real-data results — execution calibration (fingerprint `1f14ed01…`, 5 sessions)
+
+- **The executable-EV model is optimistic even against its own paper
+  fills**: on 284 linked estimate→realization pairs, mean predicted EV
+  **+$51.9** vs mean realized **−$57.8** (mean error −$109.7/trade,
+  MAE $289.8); OLS slope of realized on predicted **−0.27**,
+  correlation **−0.07**; session-bootstrap 95% CI on the error
+  **[−$200.9, −$76.1] excludes zero**. The Phase 5 model-implied EVs
+  must not be read as expected P&L.
+- Fill rates: resolved-paper overall 359/359 — labeled survivorship
+  upper bound (shrunk 0.995). By spread bucket (shrunk): tight 0.970,
+  normal 0.981, wide 0.985, pooled 0.90. The only genuine nonfill
+  evidence: limit take-profits **60/97 filled** (raw 0.619, Jeffreys
+  [0.52, 0.71], shrunk 0.636).
+- Entry slippage vs mid (paper): mean **+1.90%** of mid (p50 +2.04%,
+  p90 +3.93%) — this is the replay's 1.0× one-way friction.
+- Stop overshoot (paper marks): hard stops realize worse than the
+  configured floor in **99.6%** of 527 cases (p50 +2.56 pts,
+  p90 +13.86 pts of premium); trailing stops never breach (n=211).
+  Replay stress uses p90−p50 = **11.30 pts**.
+- 2,460 `order_intent` records are kernel-shadow quotes never
+  submitted to a broker — zero fill evidence, counted as indicative.
+
+### Real-data results — paired replay (dataset `f7f662e0…`, fingerprint `a5bf8a2d…`)
+
+- Universe: **688 mark_derived trades** across 6 sessions
+  (2026-11-04…11-11); holdout refusal excluded 66 decisions
+  (2026-11-12/13). Parity **ok=True, max_abs_diff=0.0** vs two
+  independent recomputations. Missing-data accounting (non-holdout):
+  8,249 counterfactual, 620 policy_skip, 13 missing — none valued.
+- $100k, max 5 concurrent, 1.9% one-way friction. Concurrency binds
+  hard (bot fires bursts): baseline executes only 45/688, skipping 643
+  on concurrency — the replay measures a *capital-constrained
+  portfolio*, not the sum of all signals.
+- All variants lose money at paper-calibrated frictions, consistent
+  with the EV-optimism finding and the live account's realized losses:
+
+  | variant | n | net 1.0× | net 1.5× | net 2.0× | PF | expectancy |
+  |---|---|---|---|---|---|---|
+  | baseline_frozen | 45 | −$3,138 | −$4,183 | −$5,229 | 0.55 | −$69.7 |
+  | baseline_quality | 47 | −$3,421 | −$4,545 | −$5,669 | 0.55 | −$72.8 |
+  | valuation_ranked | 41 | −$1,510 | −$2,454 | −$3,397 | 0.78 | −$36.8 |
+  | classical_gated | 42 | −$2,623 | −$3,592 | −$4,562 | 0.62 | −$62.4 |
+  | neural_gated | 41 | −$2,751 | −$3,679 | −$4,606 | 0.60 | −$67.1 |
+  | combined | 39 | −$1,123 | −$1,992 | −$2,861 | 0.82 | −$28.8 |
+
+- Stop-overshoot stress (+11.3 pts on hard-stop exits) roughly doubles
+  every variant's loss (baseline −$6,683; combined −$4,115) — the stop
+  floor is *not* achievable and challenger EV must not assume it.
+- **Paired per-session deltas vs baseline (2,000-rep session
+  bootstrap): every 95% CI includes zero.** combined mean +$288/day
+  CI [−$472, +$1,369]; valuation_ranked +$233 [−$706, +$1,457];
+  classical_gated +$74 [−$466, +$654]; neural_gated +$48 [−$378,
+  +$554]; baseline_quality −$40 [−$95, 0]. Directionally the
+  valuation/gate overlays cut losses ~45–64%, but with 6–8 session
+  days **no variant clears a promotion gate** — this is
+  INSUFFICIENT_EVIDENCE, not a win.
+- Selection-bias caveat (in the artifact): the universe is the
+  baseline bot's own fills, so challengers can only avoid recorded
+  losers; any upside from trades the bot never took is invisible
+  (valuation_ranked had 71 of 254 selections with no recorded
+  outcome).
+- OOF gates: classical ridge-logistic and the multitask MLP each
+  produced 6,206 out-of-fold predictions over 4 purged folds; 318 of
+  the 688 replay trades predate the first testable fold and pass
+  through as `no_prediction`.
+
+### Artifacts
+
+- `artifacts/oracle4/execution_calibration.json` (regenerable via
+  `python -m oracle.ml.execution --execution-log
+  server_data/2026-11-19/execution_calibration.jsonl --history
+  server_data/2026-11-19/trading_history.json --dataset
+  artifacts/oracle4/dataset_v1.sqlite --out
+  artifacts/oracle4/execution_calibration.json`).
+- `artifacts/oracle4/replay.json` (regenerable via
+  `python -m oracle.ml.replay --dataset
+  artifacts/oracle4/dataset_v1.sqlite --valuation
+  artifacts/oracle4/valuation.json --execution-calibration
+  artifacts/oracle4/execution_calibration.json --out
+  artifacts/oracle4/replay.json`).
