@@ -85,6 +85,36 @@ export function KpiRow() {
         value={kUsable && k?.win_rate != null ? fmtPct(k.win_rate) : DASH}
       />
       <StatCard
+        label='Profit factor'
+        value={
+          kUsable && k?.profit_factor != null
+            ? k.profit_factor.toFixed(2)
+            : kUsable && (k?.closed_green_sum ?? 0) > 0
+              ? '∞'
+              : DASH
+        }
+        sign={
+          kUsable && k?.profit_factor != null ? k.profit_factor - 1 : null
+        }
+        sub={
+          kUsable && k?.profit_factor == null && (k?.closed_green_sum ?? 0) > 0
+            ? 'no losses yet'
+            : 'gross profit / gross loss'
+        }
+      />
+      <StatCard
+        label='Sharpe ratio'
+        value={
+          kUsable && k?.sharpe_ratio != null ? k.sharpe_ratio.toFixed(2) : DASH
+        }
+        sign={kUsable ? k?.sharpe_ratio : null}
+        sub={
+          kUsable && k?.sharpe_ratio != null
+            ? `annualized, ${k?.sharpe_days ?? 0} trading days`
+            : 'needs ≥ 2 trading days'
+        }
+      />
+      <StatCard
         label='Open positions'
         value={kUsable && k?.open_positions != null ? k.open_positions : DASH}
       />

@@ -158,6 +158,7 @@ def compute_single_leg_kpis(
     today_realized = 0.0
     closed_green_sum = 0.0  # sum of realized profits (closed trades)
     closed_red_sum = 0.0    # sum of realized losses (closed trades, negative)
+    daily_pnl: Dict[str, float] = {}  # date -> net realized P/L that day
     for r in realized:
         amt = _coerce_float(r.get("amount"))
         if amt is None:
@@ -169,6 +170,29 @@ def compute_single_leg_kpis(
             closed_red_sum += amt
         if r.get("date") == today:
             today_realized += amt
+        day = r.get("date")
+        if isinstance(day, str) and day:
+            daily_pnl[day] = daily_pnl.get(day, 0.0) + amt
+
+    # Profit factor: gross profit / gross loss (dollars). None when there are
+    # no realized losses yet (ratio is undefined / infinite).
+    profit_factor = (
+        round(closed_green_sum / abs(closed_red_sum), 2)
+        if closed_red_sum < 0
+        else None
+    )
+
+    # Sharpe ratio (annualized) over the daily realized-P/L series: mean/stdev
+    # of daily $ P/L scaled by sqrt(252). Needs >= 2 trading days with spread.
+    sharpe_ratio = None
+    sharpe_days = len(daily_pnl)
+    if sharpe_days >= 2:
+        series = list(daily_pnl.values())
+        mean = sum(series) / sharpe_days
+        var = sum((x - mean) ** 2 for x in series) / (sharpe_days - 1)
+        std = var ** 0.5
+        if std > 0:
+            sharpe_ratio = round(mean / std * (252 ** 0.5), 2)
 
     pcts = [p for p in (_coerce_float(t.get("pnl_percent")) for t in history)
             if p is not None]
@@ -189,6 +213,9 @@ def compute_single_leg_kpis(
         "wins": wins,
         "losses": len(pcts) - wins,
         "avg_return_pct": avg_return_pct,
+        "profit_factor": profit_factor,
+        "sharpe_ratio": sharpe_ratio,
+        "sharpe_days": sharpe_days,
     }
 
 

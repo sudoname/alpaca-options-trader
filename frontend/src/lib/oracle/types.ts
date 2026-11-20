@@ -16,6 +16,9 @@ export type Kpis = ApiEnvelope & {
   closed_trades?: number | null
   closed_green_sum?: number | null
   closed_red_sum?: number | null
+  profit_factor?: number | null
+  sharpe_ratio?: number | null
+  sharpe_days?: number | null
 }
 
 export type Position = {

@@ -62,6 +62,38 @@ class TestKpis(unittest.TestCase):
         self.assertEqual(k["wins"], 2)
         self.assertEqual(k["losses"], 1)
         self.assertAlmostEqual(k["win_rate"], 2.0 / 3.0)
+        # Profit factor = gross profit / gross loss = 1119 / 30.
+        self.assertAlmostEqual(k["profit_factor"], round(1119.0 / 30.0, 2))
+        # Sharpe over daily P/L {today: 90, 2000-01-01: 999}, annualized.
+        daily = [90.0, 999.0]
+        mean = sum(daily) / 2
+        std = (sum((x - mean) ** 2 for x in daily) / 1) ** 0.5
+        self.assertEqual(k["sharpe_days"], 2)
+        self.assertAlmostEqual(k["sharpe_ratio"],
+                               round(mean / std * (252 ** 0.5), 2))
+
+    def test_profit_factor_and_sharpe_undefined_cases(self):
+        # No losses -> profit factor undefined (None); one day -> no Sharpe.
+        real = self._write("r.json", [
+            {"date": self.today, "amount": 50.0},
+            {"date": self.today, "amount": 70.0}])
+        k = slr.compute_single_leg_kpis(
+            active_path=os.path.join(self.d, "no1.json"),
+            history_path=os.path.join(self.d, "no2.json"),
+            realized_path=real, today=self.today)
+        self.assertIsNone(k["profit_factor"])
+        self.assertIsNone(k["sharpe_ratio"])
+        self.assertEqual(k["sharpe_days"], 1)
+        # Two days with identical P/L -> zero stdev -> Sharpe undefined.
+        real2 = self._write("r2.json", [
+            {"date": "2026-01-01", "amount": 10.0},
+            {"date": "2026-01-02", "amount": 10.0}])
+        k2 = slr.compute_single_leg_kpis(
+            active_path=os.path.join(self.d, "no1.json"),
+            history_path=os.path.join(self.d, "no2.json"),
+            realized_path=real2, today=self.today)
+        self.assertIsNone(k2["sharpe_ratio"])
+        self.assertEqual(k2["sharpe_days"], 2)
 
     def test_corrupt_files_fail_open(self):
         p = os.path.join(self.d, "bad.json")
