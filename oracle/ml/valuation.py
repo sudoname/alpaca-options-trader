@@ -14,7 +14,14 @@ eligible same-side candidates):
      numbers), so cross-candidate EV differences are not Monte-Carlo
      noise.  An EWMA vol forecast (RiskMetrics lambda) rescales the
      sampled returns; the scale is clamped and the clamp recorded as an
-     out-of-distribution flag.
+     out-of-distribution flag.  4.0.1-C: when a verified model forecast
+     is supplied, scenarios are *forecast-conditioned* — the model's
+     realized-vol forecast replaces the EWMA scale target and the
+     terminal return distribution is remapped (rank-preserving) onto the
+     forecast quantiles at the forecast horizon; achieved-vs-target
+     quantiles and interval coverage are recorded in the meta.  Without
+     a usable forecast the explicitly labeled EWMA/bootstrap baseline
+     runs byte-identically — no hard-coded directional drift, ever.
   2. **Repricing** — each contract is repriced along every path with the
      European BSM formula at the entry implied vol solved from the
      observed mid (sticky-strike constant IV).  This is a *physical*
@@ -23,9 +30,16 @@ eligible same-side candidates):
      The CRR American premium over BSM at entry is recorded per candidate
      as the approximation error (``american_gap_pct``).
   3. **Exit policy** — the production ``exit_manager`` semantics are
-     simulated on the path marks: stop loss (−10 %) takes precedence over
-     take profit (+20 %), then time exit at the simulation horizon (or
-     expiry → intrinsic settlement).  Triggers use the mark vs the entry
+     simulated on the path marks: stop loss takes precedence over take
+     profit, then time exit at the simulation horizon.  Stop/target/qty
+     come from the immutable candidate snapshot when present; falling
+     back to config defaults is explicitly flagged ``default_assumed``
+     (never silent).  4.0.1-C: physically settled equity/ETF contracts
+     (SPY included) are never "cash settled at intrinsic" — paths that
+     reach expiry are liquidated at the last pre-expiry step with full
+     exit frictions and fees (documented research convention
+     ``pre_expiry_liquidation_research``; the given-up intrinsic delta
+     is recorded as a diagnostic).  Triggers use the mark vs the entry
      fill price exactly like production ``pnl_percent``.  Trailing stops
      start inactive in production and are not simulated (documented
      approximation).  Step granularity means intrabar breaches are seen
@@ -42,8 +56,11 @@ eligible same-side candidates):
      an explicit cost decomposition.
   5. **Opportunity EV** — ``ev_opportunity = p_fill * E[net | filled]``
      with the existing conservative ``FillModel`` prior for p_fill and
-     partial-fill quantity scaling; known non-fills (missing/unusable
-     quotes) contribute exactly zero.
+     partial-fill quantity scaling.  4.0.1-C ``ev_basis`` taxonomy:
+     *confirmed non-fills* (missing/unusable quote, zero fill prob) are
+     exactly 0.0; *unavailable* EV (insufficient history, stale quote,
+     unresolved IV, unparseable symbol, ...) is ``None`` — unknown is
+     never conflated with zero.  Valued rows are ``estimated``.
   6. **Ranking** — every eligible same-side candidate is valued; ranking
      is by expected executable net dollars then capital efficiency with
      deterministic tie-breaks, subject to liquidity / uncertainty /
@@ -126,6 +143,7 @@ class ValuationConfig:
     ewma_lambda: float = 0.94
     vol_scale_bounds: Tuple[float, float] = (0.5, 2.0)
     max_spread_pct: float = 0.40       # liquidity gate
+    max_quote_age_s: float = 120.0     # stale-quote gate (snapshot age)
     uncertainty_k: float = 1.0         # require EV > k * MC standard error
     max_es95_frac_of_capital: float = 1.0   # long premium is the max loss
 
@@ -379,14 +397,63 @@ def scenario_seed(base_seed: int, underlying: str, bucket_key: str) -> int:
     return int.from_bytes(raw[:8], "big") % (2 ** 63 - 1)
 
 
+_HORIZON_MINUTES = {"60m": 60.0, "1s": 390.0}
+
+
+def _horizon_minutes(horizon: Any) -> Optional[float]:
+    """Trading minutes for a known forecast horizon label, else None."""
+    if not horizon:
+        return None
+    return _HORIZON_MINUTES.get(str(horizon))
+
+
+def _usable_forecast(forecast: Optional[Dict[str, Any]],
+                     step_minutes: float, n_steps: int
+                     ) -> Tuple[Optional[Dict[str, Any]],
+                                Optional[Dict[str, Any]]]:
+    """(usable forecast dict, fallback note).  Exactly one is non-None
+    unless no forecast was supplied at all (both None)."""
+    if not forecast:
+        return None, None
+    if not forecast.get("available"):
+        return None, {"fallback_reason": "forecast_unavailable",
+                      "detail": forecast.get("reason")}
+    horizon_min = _horizon_minutes(forecast.get("horizon"))
+    if horizon_min is None:
+        return None, {"fallback_reason": "unknown_horizon",
+                      "detail": forecast.get("horizon")}
+    k_star = int(round(horizon_min / step_minutes))
+    truncated = k_star > n_steps
+    k_star = max(1, min(k_star, n_steps))
+    out = dict(forecast)
+    out["_horizon_minutes"] = horizon_min
+    out["_k_star"] = k_star
+    out["_horizon_truncated"] = truncated
+    return out, None
+
+
 def generate_scenarios(obs: Sequence[Tuple],
                        as_of: datetime, s0: float,
                        config: ValuationConfig,
-                       seed: int) -> Tuple[Optional[ScenarioSet], str]:
+                       seed: int,
+                       forecast: Optional[Dict[str, Any]] = None
+                       ) -> Tuple[Optional[ScenarioSet], str]:
     """(scenarios, reason).  reason != 'ok' means no scenarios.
 
     ``obs`` accepts legacy ``(event_at, price)`` tuples or point-in-time
     ``(event_at, available_at, price)`` tuples (see ``_normalize_obs``).
+
+    4.0.1-C: ``forecast`` is an optional *plain dict* (``Forecast.to_dict``
+    shape from :mod:`oracle.ml.forecast`; torch never required here).
+    When usable, the realized-vol forecast replaces the EWMA scale target
+    and the terminal log-return distribution at the forecast horizon is
+    remapped — rank-preserving, by empirical quantile deltas ramped over
+    the horizon — onto the forecast quantiles.  Dependence between return
+    and volatility inside sampled blocks is preserved (the remap only
+    shifts by rank; it never resamples marginals independently).  The rng
+    is consumed identically with or without a forecast, so common random
+    numbers hold across contracts *and* across forecast variants; a
+    missing/unavailable forecast reproduces the baseline byte-for-byte.
     """
     if s0 is None or s0 <= 0:
         return None, "missing_underlying_price"
@@ -395,17 +462,36 @@ def generate_scenarios(obs: Sequence[Tuple],
     if rets.size < config.min_history_returns:
         return None, "insufficient_history"
 
+    n_steps = config.max_steps
+    fc, fc_fallback = _usable_forecast(forecast, config.step_minutes,
+                                       n_steps)
+
     hist_vol = float(np.std(rets))
     ewma = _ewma_vol(rets, config.ewma_lambda)
     scale, clamped = 1.0, False
-    if ewma is not None and hist_vol > 0:
+    rv_source = "ewma" if ewma is not None else "unavailable_scale_1"
+    rv_fc = None
+    if fc is not None:
+        try:
+            rv_fc = float(fc.get("rv_forecast"))
+        except (TypeError, ValueError):
+            rv_fc = None
+        if rv_fc is not None and not (rv_fc > 0 and math.isfinite(rv_fc)):
+            rv_fc = None
+    lo, hi = config.vol_scale_bounds
+    if rv_fc is not None and hist_vol > 0:
+        # model rv is over the forecast horizon; convert to per-step vol
+        target_step_vol = rv_fc / math.sqrt(fc["_k_star"])
+        raw_scale = target_step_vol / hist_vol
+        scale = min(max(raw_scale, lo), hi)
+        clamped = (scale != raw_scale)
+        rv_source = "model_forecast"
+    elif ewma is not None and hist_vol > 0:
         raw_scale = ewma / hist_vol
-        lo, hi = config.vol_scale_bounds
         scale = min(max(raw_scale, lo), hi)
         clamped = (scale != raw_scale)
 
     n_paths = config.clamped_paths()
-    n_steps = config.max_steps
     rng = np.random.default_rng(seed)
     blk = max(1, int(config.block_len))
     n_blocks = (n_steps + blk - 1) // blk
@@ -416,20 +502,84 @@ def generate_scenarios(obs: Sequence[Tuple],
     sampled = sampled * scale
 
     log_paths = np.cumsum(sampled, axis=1)
+
+    fc_meta: Optional[Dict[str, Any]] = None
+    mode = "baseline_bootstrap_ewma"
+    if fc is not None:
+        k_star = fc["_k_star"]
+        notes: List[str] = []
+        if fc["_horizon_truncated"]:
+            notes.append("horizon_truncated_to_sim")
+        # ---- quantile remap (rank-preserving, ramped to the horizon) ----
+        pairs: List[Tuple[float, float]] = []
+        for qk, qv in (fc.get("quantiles") or {}).items():
+            try:
+                qf, vf = float(qk), float(qv)
+            except (TypeError, ValueError):
+                continue
+            if 0.0 < qf < 1.0 and math.isfinite(vf):
+                pairs.append((qf, vf))
+        pairs.sort()
+        qs = np.asarray([p[0] for p in pairs])
+        vs = np.asarray([p[1] for p in pairs])
+        remapped = False
+        if pairs and np.any(np.diff(vs) < 0):
+            notes.append("nonmonotone_quantiles_remap_skipped")
+        elif len(pairs) >= 2:
+            R = log_paths[:, k_star - 1]
+            emp = np.quantile(R, qs)
+            deltas = vs - emp
+            order = np.argsort(np.argsort(R, kind="stable"), kind="stable")
+            u = (order + 0.5) / n_paths
+            delta_i = np.interp(u, qs, deltas)
+            ramp = np.minimum(np.arange(1, n_steps + 1), k_star) / k_star
+            log_paths = log_paths + delta_i[:, None] * ramp[None, :]
+            remapped = True
+        else:
+            notes.append("insufficient_quantiles_remap_skipped")
+        R_new = log_paths[:, k_star - 1]
+        achieved = ({f"{q:g}": float(a)
+                     for q, a in zip(qs, np.quantile(R_new, qs))}
+                    if len(pairs) else {})
+        cov = None
+        tq = {f"{q:g}": float(v) for q, v in pairs}
+        if "0.05" in tq and "0.95" in tq:
+            cov = float(np.mean((R_new >= tq["0.05"])
+                                & (R_new <= tq["0.95"])))
+        mode = "forecast_conditioned"
+        fc_meta = {
+            "model_id": fc.get("model_id"),
+            "input_digest": fc.get("input_digest"),
+            "horizon": fc.get("horizon"),
+            "horizon_minutes": fc["_horizon_minutes"],
+            "k_star": k_star,
+            "horizon_truncated": fc["_horizon_truncated"],
+            "p_up": fc.get("p_up"),
+            "quantile_remap_applied": remapped,
+            "target_quantiles": tq,
+            "achieved_quantiles": achieved,
+            "interval_coverage_05_95": cov,
+            "notes": notes,
+        }
+    elif fc_fallback is not None:
+        fc_meta = fc_fallback
+
     prices = np.empty((n_paths, n_steps + 1), dtype=np.float64)
     prices[:, 0] = s0
     prices[:, 1:] = s0 * np.exp(log_paths)
     meta = {
+        "mode": mode,
         "n_source_returns": int(rets.size),
         "hist_step_vol": hist_vol,
         "ewma_step_vol": ewma,
         "vol_scale": scale,
         "vol_scale_clamped_ood": clamped,
-        "rv_forecast": ("ewma" if ewma is not None
-                        else "unavailable_scale_1"),
+        "rv_forecast": (rv_source if rv_source != "ewma"
+                        else "ewma"),
         "block_len": blk,
         "seed": int(seed),
         "history": hist_diag,
+        "forecast": fc_meta,
     }
     return ScenarioSet(prices=prices, step_minutes=config.step_minutes,
                        meta=meta), "ok"
@@ -473,6 +623,17 @@ def _bs_price_vec(S: np.ndarray, K: float, T: float, r: float, q: float,
 # --------------------------------------------------------------------------- #
 
 def _abstain(cand: Candidate, reason: str, **extra: Any) -> Dict[str, Any]:
+    """Explicit abstention row.
+
+    ``ev_opportunity`` follows EV = P(fill) * E(net | filled):
+    - confirmed non-fill / confirmed unusable market -> EV is exactly 0.0
+      (``ev_basis="confirmed_nonfill"``);
+    - everything else (missing inputs, stale data, model refusal) means the
+      EV simply could not be estimated -> ``None``
+      (``ev_basis="unavailable"``), never a silent zero.
+    """
+    confirmed = reason.split(":", 1)[0] in (
+        "missing_quote", "unusable_quote", "no_fill_expected")
     out = {
         "decision_id": cand.decision_id,
         "symbol": cand.symbol,
@@ -480,7 +641,8 @@ def _abstain(cand: Candidate, reason: str, **extra: Any) -> Dict[str, Any]:
         "session": cand.session,
         "status": "abstain",
         "reason": reason,
-        "ev_opportunity": 0.0,
+        "ev_opportunity": 0.0 if confirmed else None,
+        "ev_basis": "confirmed_nonfill" if confirmed else "unavailable",
         "baseline_score": cand.features.get("baseline_score"),
     }
     out.update(extra)
@@ -503,6 +665,11 @@ def reprice_candidate(cand: Candidate, scen: ScenarioSet,
     status = classify_quote(bid, ask)
     if status != QUOTE_OK:
         return None, _abstain(cand, f"unusable_quote:{status.lower()}")
+    age = cand.features.get("quote_age_s")
+    if age is not None and float(age) > config.max_quote_age_s:
+        return None, _abstain(cand, "stale_quote",
+                              quote_age_s=float(age),
+                              max_quote_age_s=config.max_quote_age_s)
     if cand.contract is None:
         return None, _abstain(cand, "unparseable_symbol")
     # The scenario paths are generated from the scan's stored underlying.
@@ -570,53 +737,112 @@ def reprice_candidate(cand: Candidate, scen: ScenarioSet,
 
 
 def _simulate_exit(marks: np.ndarray, entry_fill: float,
-                   config: ValuationConfig,
+                   stop_loss_pct: float, take_profit_pct: float,
                    expires_in_sim: bool
                    ) -> Tuple[np.ndarray, np.ndarray, Dict[str, int]]:
     """Vectorized exit policy on the mark path.
 
-    Precedence per production exit_manager: stop > target, else time exit
-    at the horizon (expiry settles at intrinsic in the final mark).
+    Precedence per production exit_manager: stop > target, else time exit at
+    the horizon.  When the contract expires inside the simulation we enforce
+    the documented research convention of PRE-EXPIRY LIQUIDATION: paths that
+    have not triggered stop/target are sold at the last mark BEFORE the
+    expiry column (physically settled equity/ETF options are never held to
+    settlement here, so the intrinsic final mark is diagnostic only).
     Returns (exit_step, exit_mark, reason_counts).
     """
     n_paths, n_cols = marks.shape
+    n_steps = n_cols - 1
     steps = marks[:, 1:]                           # decisions after entry
-    stop_lvl = entry_fill * (1.0 - config.stop_loss_pct / 100.0)
-    tgt_lvl = entry_fill * (1.0 + config.take_profit_pct / 100.0)
-    hit = (steps <= stop_lvl) | (steps >= tgt_lvl)
-    any_hit = hit.any(axis=1)
-    first = np.where(any_hit, hit.argmax(axis=1), n_cols - 2)
+    stop_lvl = entry_fill * (1.0 - stop_loss_pct / 100.0)
+    tgt_lvl = entry_fill * (1.0 + take_profit_pct / 100.0)
+    if expires_in_sim:
+        scan = steps[:, :-1]           # triggers only BEFORE the expiry mark
+        liq_col = max(1, n_steps - 1)  # degenerate 1-step: expiry mark col 1
+    else:
+        scan = steps
+        liq_col = n_steps
+    if scan.shape[1]:
+        hit = (scan <= stop_lvl) | (scan >= tgt_lvl)
+        any_hit = hit.any(axis=1)
+        first = np.where(any_hit, hit.argmax(axis=1), liq_col - 1)
+    else:
+        any_hit = np.zeros(n_paths, dtype=bool)
+        first = np.full(n_paths, liq_col - 1)
     exit_step = first + 1                          # 1-based mark column
     rows = np.arange(n_paths)
     exit_mark = marks[rows, exit_step]
 
     is_stop = any_hit & (exit_mark <= stop_lvl)
     is_tgt = any_hit & ~is_stop
-    time_exit = ~any_hit
     reasons = {
         "stop_loss": int(is_stop.sum()),
         "take_profit": int(is_tgt.sum()),
-        ("expiry" if expires_in_sim else "time_exit"): int(time_exit.sum()),
+        ("pre_expiry_liquidation" if expires_in_sim else "time_exit"):
+            int((~any_hit).sum()),
     }
     return exit_step, exit_mark, reasons
+
+
+def _resolve_policy(cand: Candidate, config: ValuationConfig
+                    ) -> Tuple[float, float, int, str, bool]:
+    """Resolve exit policy + quantity from the immutable candidate snapshot.
+
+    Returns (stop_loss_pct, take_profit_pct, qty, source, defaulted).
+    Snapshot values win; config defaults are used only when the snapshot
+    carries nothing, and that defaulting is flagged so promotion-grade
+    comparisons can exclude silently-defaulted policies.
+    """
+    def _pos(v: Any) -> Optional[float]:
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        return f if f > 0.0 else None
+
+    defaulted = False
+    stop = _pos(cand.features.get("stop_loss_pct"))
+    if stop is None:
+        stop, defaulted = float(config.stop_loss_pct), True
+    tp = _pos(cand.features.get("take_profit_pct"))
+    if tp is None:
+        tp, defaulted = float(config.take_profit_pct), True
+    qty_raw = cand.features.get("qty", cand.features.get("quantity"))
+    qty: Optional[int]
+    try:
+        qty = int(qty_raw) if qty_raw is not None else None
+        if qty is not None and qty <= 0:
+            qty = None
+    except (TypeError, ValueError):
+        qty = None
+    if qty is None:
+        qty, defaulted = max(1, int(config.qty)), True
+    source = "default_assumed" if defaulted else "snapshot"
+    return stop, tp, qty, source, defaulted
 
 
 def value_candidate(cand: Candidate, priced: Dict[str, Any],
                     config: ValuationConfig,
                     friction: float = 1.0,
                     cost_config: Optional[CostConfig] = None,
-                    fill_model: Optional[FillModel] = None
+                    fill_model: Optional[FillModel] = None,
+                    forecast: Optional[Dict[str, Any]] = None
                     ) -> Dict[str, Any]:
     """Cost + exit-policy valuation of one repriced candidate.
 
     Net P&L uses executable entry/exit prices (spread + slippage embedded)
     and subtracts only fees, which are not embedded — costs are charged
     exactly once, with the 100x contract multiplier applied exactly once.
+    Exit policy and quantity come from the candidate snapshot when present
+    (config defaults are flagged).  Expiry-in-sim paths are liquidated at
+    the last pre-expiry mark with full exit frictions (never free cash
+    settlement).  ``forecast`` (optional, already validated upstream) only
+    feeds the hazard diagnostic — it is never double-counted into EV.
     """
     cc = cost_config or CostConfig()
     bid, ask, mid = priced["bid"], priced["ask"], priced["mid"]
     marks: np.ndarray = priced["marks"]
-    qty = max(1, int(config.qty))
+    stop_pct, tp_pct, qty, policy_source, policy_defaulted = \
+        _resolve_policy(cand, config)
 
     spread = max(ask - bid, cc.min_spread_floor)
     half = spread / 2.0 * friction
@@ -629,16 +855,14 @@ def value_candidate(cand: Candidate, priced: Dict[str, Any],
         return _abstain(cand, "nonpositive_entry_fill")
 
     exit_step, exit_mark, reasons = _simulate_exit(
-        marks, entry_fill, config, priced["expires_in_sim"])
-    settled = priced["expires_in_sim"] & \
-        (exit_step == priced["n_steps"])           # expiry: cash settlement
-    exit_frict = np.where(settled, 0.0, half + slip)
-    exit_fill = np.maximum(exit_mark - exit_frict, 0.0)
-    exit_fees = np.where(settled, 0.0, fee_leg)
+        marks, entry_fill, stop_pct, tp_pct, priced["expires_in_sim"])
+    # Every exit is a traded liquidation (pre-expiry liquidation convention):
+    # full exit frictions and the exit fee leg apply on every path.
+    exit_fill = np.maximum(exit_mark - (half + slip), 0.0)
 
     mult = CONTRACT_MULTIPLIER
     gross = (exit_mark - mid) * mult * qty         # frictionless reference
-    fees_total = (fee_leg + exit_fees) * qty
+    fees_total = 2.0 * fee_leg * qty               # entry + exit leg, once
     net = (exit_fill - entry_fill) * mult * qty - fees_total
 
     # fill probability from the existing conservative prior
@@ -662,6 +886,51 @@ def value_candidate(cand: Candidate, priced: Dict[str, Any],
     es95 = float(np.mean(np.sort(net)[:tail_n]))
     capital = entry_fill * mult * qty
     ev_opportunity = p_fill * fill_frac * mean_net
+
+    # horizon bucketing: 0DTE vs swing (promotion evidence is kept separate)
+    dte = cand.features.get("dte_days")
+    horizon_class = "0dte" if (dte is not None and float(dte) < 1.0) \
+        else "swing"
+
+    # settlement diagnostic: how far the enforced pre-expiry liquidation
+    # mark sits from the intrinsic settlement column (research-only note;
+    # physically settled contracts are never held through settlement here)
+    settlement: Optional[Dict[str, Any]] = None
+    if priced["expires_in_sim"]:
+        n_steps = int(priced["n_steps"])
+        n_liq = int(reasons.get("pre_expiry_liquidation", 0))
+        resid: Optional[float] = None
+        if n_steps >= 2:
+            liq_paths = exit_step == (n_steps - 1)
+            if np.any(liq_paths):
+                resid = float(np.mean(
+                    marks[liq_paths, n_steps] - marks[liq_paths, n_steps - 1]))
+        settlement = {
+            "convention": "pre_expiry_liquidation_research",
+            "n_liquidated": n_liq,
+            "mean_intrinsic_minus_liq_mark": resid,
+            "note": ("physically settled contract exits at the last "
+                     "pre-expiry mark with full frictions; intrinsic final "
+                     "mark is diagnostic only"),
+        }
+
+    # hazard diagnostic: forecast CIF vs simulated exit mix — reported for
+    # calibration inspection only, never folded into EV (no double counting)
+    hazard_diag: Optional[Dict[str, Any]] = None
+    if forecast and forecast.get("available") and forecast.get("cif"):
+        try:
+            cif_term = {str(cause): float(bins[-1])
+                        for cause, bins in forecast["cif"].items()
+                        if isinstance(bins, (list, tuple)) and bins}
+        except (TypeError, ValueError):
+            cif_term = {}
+        if cif_term:
+            hazard_diag = {
+                "sim_exit_reasons": reasons,
+                "forecast_cif_terminal": cif_term,
+                "note": "diagnostic only; not used in EV "
+                        "(no double counting)",
+            }
 
     return {
         "decision_id": cand.decision_id,
@@ -689,19 +958,28 @@ def value_candidate(cand: Candidate, priced: Dict[str, Any],
         },
         "costs": {
             "spread_entry": half * mult * qty,
-            "spread_exit_mean": float(np.mean(
-                np.where(settled, 0.0, half))) * mult * qty,
-            "slippage_round_trip_mean": (slip + float(np.mean(
-                np.where(settled, 0.0, slip)))) * mult * qty,
-            "fees_mean": float(np.mean(fees_total)),
+            "spread_exit_mean": half * mult * qty,
+            "slippage_round_trip_mean": 2.0 * slip * mult * qty,
+            "fees_mean": float(fees_total),
             "exit_spread_source": "entry_spread_proxy",
         },
         "fill": {"p_fill": p_fill, "fill_frac": fill_frac,
                  "status": est.status},
         "capital_required": capital,
         "ev_opportunity": ev_opportunity,
+        "ev_basis": "estimated",
         "ev_per_dollar": ev_opportunity / capital if capital > 0 else None,
         "n_paths": int(n),
+        "policy": {
+            "stop_loss_pct": stop_pct,
+            "take_profit_pct": tp_pct,
+            "qty": qty,
+            "source": policy_source,
+            "defaulted": policy_defaulted,
+        },
+        "horizon_class": horizon_class,
+        "settlement": settlement,
+        "hazard_diagnostic": hazard_diag,
         "baseline_score": cand.features.get("baseline_score"),
         "approximations": [
             "sticky_strike_constant_iv",
@@ -825,13 +1103,20 @@ def _scan_key(cand: Candidate, bucket_min: float) -> Tuple[str, str, int]:
 
 def run_valuation(dataset_path: str, sessions: Sequence[str],
                   config: ValuationConfig, seed: int,
-                  bars_db: Optional[str] = None) -> Dict[str, Any]:
+                  bars_db: Optional[str] = None,
+                  registry_path: Optional[str] = None,
+                  model_id: Optional[str] = None) -> Dict[str, Any]:
     """Value every candidate over *sessions*.
 
     4.0.1-A: when ``bars_db`` is given, per-scan history comes from the
     read-only bars cache (actual timestamped completed bars, PIT via the
     completed-bar rule). Unavailability falls back to the dataset's
     ``underlying_obs`` with the structured reason recorded — never silently.
+
+    4.0.1-C: when ``registry_path``/``model_id`` are given, each scan asks
+    the verified ForecastProvider for one forecast (newest candidate's
+    features) and conditions the shared scenario set on it.  Any refusal
+    falls open to the explicitly labeled baseline — never a silent drift.
     """
     from oracle.ml.bars import BarStore, BarsUnavailable
 
@@ -848,6 +1133,18 @@ def run_valuation(dataset_path: str, sessions: Sequence[str],
         except BarsUnavailable as e:
             bars_note = e.to_dict()
 
+    provider = None
+    forecast_note: Optional[Dict[str, Any]] = None
+    if registry_path and model_id:
+        try:
+            from oracle.ml.forecast import get_provider
+            provider = get_provider(registry_path, model_id)
+        except Exception as e:  # ForecastUnavailable or import failure
+            forecast_note = (e.to_dict() if hasattr(e, "to_dict")
+                             else {"available": False,
+                                   "reason": "PROVIDER_ERROR",
+                                   "detail": str(e)})
+
     scans: Dict[Tuple[str, str, int], List[Candidate]] = {}
     for c in cands:
         scans.setdefault(_scan_key(c, config.scan_bucket_min), []).append(c)
@@ -856,6 +1153,7 @@ def run_valuation(dataset_path: str, sessions: Sequence[str],
     cost_cfg = CostConfig()
     scan_rows: List[Dict[str, Any]] = []
     abstain_hist: Dict[str, int] = {}
+    scan_modes: Dict[str, int] = {}
     pooled_ev: List[float] = []
     pooled_pop: List[float] = []
     stress_net: Dict[str, List[float]] = {
@@ -891,8 +1189,19 @@ def run_valuation(dataset_path: str, sessions: Sequence[str],
             except BarsUnavailable as e:
                 bars_fallbacks.setdefault(underlying, e.to_dict())
         bars_source_counts[history_source] += 1
+        fc_dict: Optional[Dict[str, Any]] = None
+        if provider is not None:
+            ref = max(group, key=lambda c: (c.as_of, c.decision_id))
+            try:
+                fc_dict = provider.forecast(ref.features,
+                                            as_of=as_of).to_dict()
+            except Exception as e:  # refusal -> labeled baseline fallback
+                fc_dict = (e.to_dict() if hasattr(e, "to_dict") else None)
         scen, why = generate_scenarios(
-            obs, as_of, s0 or 0.0, config, sc_seed)
+            obs, as_of, s0 or 0.0, config, sc_seed, forecast=fc_dict)
+        if scen is not None:
+            mode = scen.meta.get("mode", "baseline_bootstrap_ewma")
+            scan_modes[mode] = scan_modes.get(mode, 0) + 1
         t_scen += time.perf_counter() - t0
 
         vals: List[Dict[str, Any]] = []
@@ -910,7 +1219,8 @@ def run_valuation(dataset_path: str, sessions: Sequence[str],
             for f in config.friction_multipliers:
                 v = value_candidate(c, priced, config, friction=f,
                                     cost_config=cost_cfg,
-                                    fill_model=fill_model)
+                                    fill_model=fill_model,
+                                    forecast=fc_dict)
                 stressed[f"{f:.1f}"].append(v)
                 if f == 1.0:
                     base = v
@@ -994,6 +1304,12 @@ def run_valuation(dataset_path: str, sessions: Sequence[str],
             "store_note": bars_note,
             "fallbacks": dict(sorted(bars_fallbacks.items())),
         },
+        "forecast": {
+            "registry": registry_path,
+            "model_id": model_id,
+            "provider_note": forecast_note,
+            "scan_modes": dict(sorted(scan_modes.items())),
+        },
         "ev_summary": _stats(pooled_ev),
         "pop_summary": _stats(pooled_pop),
         "friction_stress": stress,
@@ -1033,6 +1349,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                    help="read-only bars cache (oracle.ml.bars); when set, "
                         "scenario history uses actual timestamped completed "
                         "bars with fail-open fallback to dataset obs")
+    p.add_argument("--registry", default=None,
+                   help="model registry JSON (oracle.ml.registry); with "
+                        "--model-id, scenarios are conditioned on verified "
+                        "forecasts, falling open to the labeled baseline")
+    p.add_argument("--model-id", default=None,
+                   help="registered model id to forecast with")
     args = p.parse_args(argv)
 
     config = ValuationConfig(n_paths=args.n_paths,
@@ -1061,8 +1383,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "sessions": {"folds": list(fold_sessions), "holdout": list(holdout),
                      "requested": sessions},
         "bars_db": args.bars_db,
+        "registry": args.registry,
+        "model_id": args.model_id,
         "result": run_valuation(args.dataset, sessions, config, args.seed,
-                                bars_db=args.bars_db),
+                                bars_db=args.bars_db,
+                                registry_path=args.registry,
+                                model_id=args.model_id),
     }
     clean = _py(report)
     from oracle.lab.purged_validation import metrics_fingerprint

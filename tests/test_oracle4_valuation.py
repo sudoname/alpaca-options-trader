@@ -229,7 +229,13 @@ class TestReprice:
         priced, abst = val.reprice_candidate(cand, _FLAT, self.CFG)
         assert priced is None and abst is not None
         assert abst["status"] == "abstain"
-        assert abst["ev_opportunity"] == 0.0
+        # 4.0.1-C EV taxonomy: confirmed nonfill is exactly 0; anything
+        # unknown stays null and is labeled "unavailable" (never conflated).
+        if abst["ev_basis"] == "confirmed_nonfill":
+            assert abst["ev_opportunity"] == 0.0
+        else:
+            assert abst["ev_basis"] == "unavailable"
+            assert abst["ev_opportunity"] is None
         return abst["reason"]
 
     def test_missing_quote(self):
@@ -340,16 +346,22 @@ class TestValueCandidate:
             "stop_loss": 0, "take_profit": 0, "time_exit": 1}
         assert v["status"] == "ok"      # negative EV is reported, not hidden
 
-    def test_expiry_settlement_waives_exit_frictions(self):
+    def test_expiry_liquidation_charges_frictions(self):
+        # 4.0.1-C: physically settled contracts are never cash-settled for
+        # free — the documented research convention liquidates at the last
+        # pre-expiry mark with FULL exit frictions and both fee legs.
         v = val.value_candidate(
             _cand(), _priced([[2.0, 2.2]], expires_in_sim=True), self.CFG)
-        # cash settle: no exit spread/slip/fee -> net (2.2-2.12)*100-0.02
-        assert v["per_fill"]["net_mean"] == pytest.approx(7.98)
+        # exit fill 2.2 - 0.12 = 2.08; net (2.08-2.12)*100 - 0.04 = -4.04
+        assert v["per_fill"]["net_mean"] == pytest.approx(-4.04)
         assert v["per_fill"]["exit_reasons"] == {
-            "stop_loss": 0, "take_profit": 0, "expiry": 1}
-        assert v["costs"]["spread_exit_mean"] == pytest.approx(0.0)
-        assert v["costs"]["slippage_round_trip_mean"] == pytest.approx(2.0)
-        assert v["costs"]["fees_mean"] == pytest.approx(0.02)
+            "stop_loss": 0, "take_profit": 0, "pre_expiry_liquidation": 1}
+        assert v["costs"]["spread_exit_mean"] == pytest.approx(10.0)
+        assert v["costs"]["slippage_round_trip_mean"] == pytest.approx(4.0)
+        assert v["costs"]["fees_mean"] == pytest.approx(0.04)
+        assert v["settlement"]["convention"] == \
+            "pre_expiry_liquidation_research"
+        assert v["settlement"]["n_liquidated"] == 1
 
     def test_friction_stress_monotone_hand_computed(self):
         pr = _priced([[2.0, 2.05]])
@@ -419,30 +431,40 @@ class TestValueCandidate:
 # --------------------------------------------------------------------------- #
 
 class TestSimulateExit:
-    CFG = val.ValuationConfig()
-
     def test_first_touch_wins(self):
         step, mark, reasons = val._simulate_exit(
-            np.array([[2.0, 2.6, 1.5]]), 2.12, self.CFG, False)
+            np.array([[2.0, 2.6, 1.5]]), 2.12, 10.0, 20.0, False)
         assert step[0] == 1 and mark[0] == 2.6
         assert reasons == {"stop_loss": 0, "take_profit": 1, "time_exit": 0}
 
     def test_stop_precedence_at_touch(self):
         step, mark, reasons = val._simulate_exit(
-            np.array([[2.0, 1.9, 3.0]]), 2.12, self.CFG, False)
+            np.array([[2.0, 1.9, 3.0]]), 2.12, 10.0, 20.0, False)
         assert step[0] == 1 and mark[0] == 1.9     # 1.9 <= 1.908 stop
         assert reasons["stop_loss"] == 1
 
     def test_time_exit_at_horizon(self):
         step, mark, reasons = val._simulate_exit(
-            np.array([[2.0, 2.0, 2.0]]), 2.12, self.CFG, False)
+            np.array([[2.0, 2.0, 2.0]]), 2.12, 10.0, 20.0, False)
         assert step[0] == 2 and mark[0] == 2.0
         assert reasons["time_exit"] == 1
 
-    def test_expiry_relabels_time_exit(self):
-        _, _, reasons = val._simulate_exit(
-            np.array([[2.0, 2.0]]), 2.12, self.CFG, True)
-        assert reasons == {"stop_loss": 0, "take_profit": 0, "expiry": 1}
+    def test_expiry_liquidates_before_settlement(self):
+        # 2-column path (1 step): degenerate case still exits at the last
+        # available mark, labeled as the research liquidation convention.
+        step, mark, reasons = val._simulate_exit(
+            np.array([[2.0, 2.0]]), 2.12, 10.0, 20.0, True)
+        assert step[0] == 1 and mark[0] == 2.0
+        assert reasons == {"stop_loss": 0, "take_profit": 0,
+                           "pre_expiry_liquidation": 1}
+
+    def test_expiry_liquidation_column_precedes_intrinsic(self):
+        # 4 columns, 3 steps, no trigger: exit at column 2 (last pre-expiry
+        # mark), NOT at the intrinsic settlement column 3.
+        step, mark, reasons = val._simulate_exit(
+            np.array([[2.0, 2.1, 2.2, 0.0]]), 2.12, 10.0, 20.0, True)
+        assert step[0] == 2 and mark[0] == 2.2
+        assert reasons["pre_expiry_liquidation"] == 1
 
 
 # --------------------------------------------------------------------------- #

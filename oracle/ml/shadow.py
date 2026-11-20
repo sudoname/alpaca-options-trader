@@ -253,7 +253,8 @@ def _run_forecasts(cfg: ShadowConfig,
     """Load the configured registry model (verified) and invoke it once per
     frozen candidate.  Returns ``(inference_info, forecasts)`` where
     ``forecasts`` maps decision_id -> Forecast dict or structured
-    abstention.  Never raises; never touches challenger ranking.
+    abstention.  Never raises.  4.0.1-C: the caller feeds these into
+    scenario generation; any refusal falls open to the labeled baseline.
     """
     info: Dict[str, Any] = {
         "attempted": bool(cfg.model_id),
@@ -396,9 +397,12 @@ def shadow_scan(candidates: Sequence[Dict[str, Any]], *,
     scen_by_u: Dict[str, Any] = {}
     scen_meta: Dict[str, Dict[str, Any]] = {}
     bar_rows_by_u: Dict[str, List[Any]] = {}  # 4.0.1-B: retained for features
+    # ---- pass 1: history per underlying (4.0.1-C: loaded before forecasts
+    # so the verified model can condition the shared scenario set) ----
+    hist_by_u: Dict[str, Dict[str, Any]] = {}
     for c in cands:
         u = c.underlying
-        if not u or u in scen_by_u:
+        if not u or u in hist_by_u:
             continue
         s0 = c.features.get("underlying_price")
         obs: List[Any] = []
@@ -423,17 +427,6 @@ def shadow_scan(candidates: Sequence[Dict[str, Any]], *,
                     bar_rows_by_u[u] = list(bar_rows)
                 except barsmod.BarsUnavailable as e:
                     bars_unavailable = e.to_dict()
-            if bars_unavailable is not None:
-                scen_by_u[u] = None
-                scen_meta[u] = {
-                    "status": "bars_unavailable:"
-                              + str(bars_unavailable.get("reason")),
-                    "bars_unavailable": bars_unavailable,
-                    "n_history_points": 0,
-                    "history_error": None,
-                    "history_source": history_source,
-                }
-                continue
         else:
             history_source = "synthetic_grid"
             closes: Sequence[float] = []
@@ -446,21 +439,61 @@ def shadow_scan(candidates: Sequence[Dict[str, Any]], *,
                 except Exception as e:
                     hist_error = str(e)
             obs = _history_obs(closes or [], now, step_minutes)
-        scen, reason = val.generate_scenarios(
-            obs, now, s0 if s0 else 0.0, vcfg,
-            val.scenario_seed(base_seed, u, scan_id))
-        scen_by_u[u] = scen
-        meta = dict(scen.meta) if scen is not None else {}
-        meta.update({"status": reason, "n_history_points": len(obs),
-                     "history_error": hist_error,
-                     "history_source": history_source})
-        scen_meta[u] = meta
+        hist_by_u[u] = {"obs": obs, "s0": s0, "hist_error": hist_error,
+                        "history_source": history_source,
+                        "bars_unavailable": bars_unavailable}
 
     if bar_store is not None:
         try:
             bar_store.close()
         except Exception:
             pass
+
+    # 4.0.1-B/C: verified model load + actual per-candidate invocation,
+    # run BEFORE scenario generation so forecasts condition the shared
+    # scenario sets.  Fail-open: any refusal is a structured abstention
+    # and scenarios fall back to the explicitly labeled baseline.
+    inference_info, forecasts = _run_forecasts(
+        cfg, frozen_src, cands, bar_rows_by_u, bars_mode, now)
+    fc_by_u: Dict[str, Any] = {}
+    for c in cands:
+        u = c.underlying
+        if not u:
+            continue
+        fc = forecasts.get(c.decision_id)
+        if fc is None:
+            continue
+        cur = fc_by_u.get(u)
+        if cur is None or (not cur.get("available") and fc.get("available")):
+            fc_by_u[u] = fc
+
+    # ---- pass 2: one scenario set per underlying, shared across its
+    # contracts (common random numbers), forecast-conditioned when the
+    # underlying has a usable forecast ----
+    for u, h in hist_by_u.items():
+        bars_unavailable = h["bars_unavailable"]
+        if bars_unavailable is not None:
+            scen_by_u[u] = None
+            scen_meta[u] = {
+                "status": "bars_unavailable:"
+                          + str(bars_unavailable.get("reason")),
+                "bars_unavailable": bars_unavailable,
+                "n_history_points": 0,
+                "history_error": None,
+                "history_source": h["history_source"],
+            }
+            continue
+        s0 = h["s0"]
+        scen, reason = val.generate_scenarios(
+            h["obs"], now, s0 if s0 else 0.0, vcfg,
+            val.scenario_seed(base_seed, u, scan_id),
+            forecast=fc_by_u.get(u))
+        scen_by_u[u] = scen
+        meta = dict(scen.meta) if scen is not None else {}
+        meta.update({"status": reason, "n_history_points": len(h["obs"]),
+                     "history_error": h["hist_error"],
+                     "history_source": h["history_source"]})
+        scen_meta[u] = meta
 
     valuations: List[Dict[str, Any]] = []
     for c in cands:
@@ -474,7 +507,9 @@ def shadow_scan(candidates: Sequence[Dict[str, Any]], *,
         if abstain is not None:
             valuations.append(abstain)
             continue
-        valuations.append(val.value_candidate(c, priced, vcfg, friction=1.0))
+        valuations.append(val.value_candidate(
+            c, priced, vcfg, friction=1.0,
+            forecast=forecasts.get(c.decision_id)))
 
     ranked = val.rank_candidates(valuations, vcfg)
 
@@ -484,12 +519,6 @@ def shadow_scan(candidates: Sequence[Dict[str, Any]], *,
             r = str(v.get("reason"))
             missingness[r] = missingness.get(r, 0) + 1
 
-    # 4.0.1-B: verified model load + actual per-candidate invocation.
-    # Fail-open and strictly additive: challenger ranking above is computed
-    # before and independent of forecasts (forecast-conditioned scenarios
-    # land in Stage C).
-    inference_info, forecasts = _run_forecasts(
-        cfg, frozen_src, cands, bar_rows_by_u, bars_mode, now)
     model_ident = _model_identity(cfg)
     model_ident["inference"] = inference_info
 

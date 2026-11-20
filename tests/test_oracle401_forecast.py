@@ -457,7 +457,18 @@ class TestShadowIntegration:
             out_path=str(tmp_path / "b.jsonl"))
         assert rec_off["challenger"] == rec_bad["challenger"]
         assert rec_off["baseline"] == rec_bad["baseline"]
-        assert rec_off["scenarios"] == rec_bad["scenarios"]
+        # Scenario numbers are byte-identical (CRN fail-open); only the
+        # "forecast" provenance sub-key may differ (None vs unavailable).
+        strip = lambda scen: {
+            u: {k: v for k, v in m.items() if k != "forecast"}
+            for u, m in scen.items()
+        }
+        assert strip(rec_off["scenarios"]) == strip(rec_bad["scenarios"])
+        assert rec_off["scenarios"]["SPY"]["forecast"] is None
+        assert rec_bad["scenarios"]["SPY"]["forecast"] == {
+            "fallback_reason": "forecast_unavailable",
+            "detail": "REGISTRY_ENTRY_MISSING",
+        }
         assert rec_off["model"]["inference"]["reason"] == "MODEL_ID_UNSET"
         assert rec_bad["forecasts"]["same:SPY:0"]["reason"] == \
             "REGISTRY_ENTRY_MISSING"
