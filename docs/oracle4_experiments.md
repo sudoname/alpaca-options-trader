@@ -673,3 +673,111 @@ Oracle4 battery: **178 passed**. Full suite: **2161 passed, 1 failed**
   artifacts/oracle4/valuation.json --execution-calibration
   artifacts/oracle4/execution_calibration.json --out
   artifacts/oracle4/replay.json`).
+
+## Phase 7 — Governance: registry, forward shadow, promotion gates
+
+**Goal.** Make the challenger *observable* in production without letting it
+touch production: an immutable champion/challenger registry, an
+observe-only forward shadow behind a default-OFF flag, and a promotion
+report whose gates were pre-registered before any final holdout — with
+thin samples yielding `INSUFFICIENT_EVIDENCE`, never relaxed thresholds.
+
+### What was built
+
+- **`oracle/ml/registry.py` (7a)** — JSON model registry at
+  `artifacts/oracle4/registry.json`. `register_model` records SHA-256
+  checksums of artifact/manifest plus the repo git SHA; re-registering
+  the same id with identical checksums is an idempotent no-op, with
+  *different* bytes it is rejected (`immutable`). New entries are always
+  `approval_state="unapproved"`, `role="challenger"`.
+  `approve_model`/`set_champion` require a non-empty human
+  `approved_by` (automatic approval is structurally impossible); only
+  approved models can become champion; promoting demotes the prior
+  champion; **rollback is `set_champion` back to the prior id — a
+  reference change, no files move**. Full append-only history
+  (register/approve/demote/set_champion). CLI:
+  `python -m oracle.ml.registry --registry PATH {register|approve|set-champion|show}`.
+- **`oracle/ml/shadow.py` (7b)** — observe-only forward shadow. New
+  default-OFF flags: `ENABLE_ORACLE4_SHADOW`, `ORACLE4_MODEL_ID`,
+  `ORACLE4_MAX_CANDIDATES` (default 16), `ORACLE4_MAX_SCENARIOS`
+  (default 512), plus `ORACLE4_SHADOW_JSONL` / `ORACLE4_REGISTRY`.
+  `maybe_shadow_scan` freezes the *same* candidate list production just
+  ranked (the `_evaluate` output of `_rank_and_enter`), records the
+  baseline's score order next to the challenger's scenario-EV ranking,
+  logs inference ms, model id + registry checksums/approval state,
+  missingness per candidate, and an explicit
+  "no order was submitted" note — one JSON line per scan. Fail-open:
+  any exception is swallowed and logged; disabled ⇒ returns `None` and
+  writes nothing. The module contains **no broker imports**
+  (test-enforced by source scan). Daily-close histories are mapped onto
+  a synthetic uniform grid and flagged `history_grid_assumed: true` in
+  every record. `python -m oracle.ml.shadow --report` summarizes a log
+  (decisions, abstain reasons, baseline-agreement, latency quantiles).
+- **Hook in `run_alpaca_intraday.py`** — 16 lines inside
+  `_rank_and_enter`, after the candidate sort and kernel-shadow block,
+  before the entry loop. Env-gated so the disabled path costs one
+  `os.getenv`; wrapped in its own try/except so a research bug can never
+  block or reorder baseline entries. With the flag off the production
+  path is byte-identical.
+- **`oracle/ml/promotion.py` (7c)** — promotion report over the Phase 6
+  replay + execution artifacts. 14 gates, constants pre-registered in
+  `GATES_PREREGISTERED` and embedded in every report: ≥60 forward
+  sessions, ≥200 resolved opportunities, actual-fill effective n,
+  expectancy session-bootstrap 95% LB > 0 (2,000 iters, seed 7), paired
+  uplift LB > 0, net-positive at 1.5× friction, 2× + stop-overshoot
+  stress *examined*, Sharpe > 1, PF > 1.3, |DD| ≤ 0.20 *and* no worse
+  than baseline, forward calibration improved, coverage disparity
+  ≤ 0.10, evidence basis not mark/synthetic, mandatory invariants
+  (parity, holdout refusal). Verdict lattice: any INSUFFICIENT gate or
+  thin samples ⇒ `INSUFFICIENT_EVIDENCE`; any FAIL with sufficient
+  samples ⇒ `DO_NOT_PROMOTE`; best case is
+  `ELIGIBLE_PENDING_HUMAN_REVIEW` — there is **no PROMOTE output** and
+  no code path that touches the registry, a flag, or trading behavior.
+
+### Real-artifact promotion run (combined vs baseline_frozen)
+
+`python -m oracle.ml.promotion --replay artifacts/oracle4/replay.json
+--execution artifacts/oracle4/execution_calibration.json` ⇒
+**verdict `INSUFFICIENT_EVIDENCE`** (2 PASS, 6 FAIL, 6 INSUFFICIENT):
+
+- INSUFFICIENT: forward_sessions (0 forward; 6 replay sessions are
+  context only), resolved_opportunities (39 replay executions vs 200
+  required), actual_fills (paper marks carry no fill evidence),
+  calibration_improved, coverage_disparity, evidence_basis
+  (688 mark-derived outcomes — promotion may not rest on them).
+- FAIL (for the record; samples are thin anyway): expectancy LB
+  −$833/day, paired uplift CI [−$472, +$1,369] spans zero, net@1.5×
+  −$1,992, Sharpe −1.78, PF 0.82, drawdown −3.8% worse than baseline's
+  −3.1%.
+- PASS: stress_2x examined (−$2,861 at 2×; stop-overshoot −$4,115),
+  mandatory invariants (parity ok, holdout refusal held: 66 decisions
+  excluded on 2026-11-12/13).
+
+This is the honest expected outcome: the challenger directionally cuts
+replay losses but nothing here is promotable evidence.
+
+### Tests (7d)
+
+`tests/test_oracle4_registry.py` (6), `tests/test_oracle4_shadow.py`
+(13), `tests/test_oracle4_promotion.py` (8): defaults-off/no-file,
+fail-open never raises, no broker imports in shadow source, env
+parsing/clamping, record shape + baseline-order preservation,
+truncation and missingness accounting, no-history ⇒ abstain, registry
+immutability/human-approval/demote-and-rollback, three-tier verdicts
+(thin ⇒ INSUFFICIENT_EVIDENCE; sufficient+failing ⇒ DO_NOT_PROMOTE;
+all-pass ⇒ ELIGIBLE_PENDING_HUMAN_REVIEW only), non-live evidence basis
+fails, parity violation fails, bootstrap determinism, CLI round-trip.
+**Full Oracle4 battery: 248 passed** (10 files).
+
+### Artifacts
+
+- `artifacts/oracle4/promotion_report.json` (regenerable via the CLI
+  above; local-only).
+- Shadow log default `oracle4_shadow.jsonl` (none yet — flag is OFF).
+
+### Operator notes
+
+Enabling the shadow is a deliberate human action — see
+`docs/oracle4_runbook.md` for the exact configuration diff, operator
+commands, verification, troubleshooting and rollback. No push/deploy
+was performed; production behavior is unchanged.

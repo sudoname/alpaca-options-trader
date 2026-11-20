@@ -1063,6 +1063,23 @@ class IntradayScheduler:
                 except Exception as e:
                     log(f"[KERNEL-SHADOW] failed for {cand.get('sym')} (ignored): {e}")
 
+        # Oracle4 Phase 7: observe-only challenger shadow (disabled by default).
+        # Env-gated so the disabled path costs one getenv; fail-open so a
+        # research bug can never block or reorder baseline entries. The shadow
+        # logs its own ranking next to the frozen baseline order; it submits
+        # nothing.
+        if os.getenv("ENABLE_ORACLE4_SHADOW", "").strip().lower() == "true":
+            try:
+                from oracle.ml.shadow import maybe_shadow_scan
+                maybe_shadow_scan(
+                    candidates,
+                    scan_id=getattr(self.trader, "current_scan_id", None),
+                    price_history_fn=self.trader.get_price_history,
+                    step_minutes=float(getattr(self.cfg, "scan_interval_min", 5) or 5),
+                )
+            except Exception as e:
+                log(f"[ORACLE4-SHADOW] failed (ignored): {e}")
+
         for cand in candidates:
             if self.cfg.armed and self.trades_today >= self.cfg.max_new_trades_per_day:
                 log(f"[CAP] reached max_new_trades_per_day={self.cfg.max_new_trades_per_day}")
