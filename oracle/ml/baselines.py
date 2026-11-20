@@ -23,6 +23,8 @@ feature that is ever missing.  Nothing is silently invented.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -43,6 +45,12 @@ __all__ = [
     "HAZARD_BIN_EDGES_MIN", "HAZARD_CAUSES",
     "expand_person_periods", "DiscreteTimeCompetingRisks",
     "empirical_cumulative_incidence",
+    # 3-class direction (Oracle 4.0.1 Stage E)
+    "DIRECTION_CLASSES", "MultinomialLogisticModel", "fit_temperature_np",
+    "apply_temperature_np", "multiclass_log_loss", "multiclass_brier",
+    "confusion_matrix", "macro_f1", "per_class_reliability",
+    "constant_class_probs", "momentum_class_probs",
+    "ClassicalIntegrityError", "save_classical", "load_classical",
 ]
 
 
@@ -605,3 +613,264 @@ def empirical_cumulative_incidence(times: Sequence[Optional[float]],
         if n_risk <= 0:
             break
     return cif
+
+
+# --------------------------------------------------------------------------- #
+# 3-class direction: multinomial logistic + metrics (Oracle 4.0.1 Stage E)
+# --------------------------------------------------------------------------- #
+
+# Canonical class order everywhere: 0 = down, 1 = neutral, 2 = up
+# (matches oracle.ml.mlp.direction_class and labels.py's {-1, 0, +1}).
+DIRECTION_CLASSES = ("down", "neutral", "up")
+
+
+def _softmax_rows(z: np.ndarray) -> np.ndarray:
+    z = np.clip(z, -35.0, 35.0)
+    z = z - z.max(axis=1, keepdims=True)
+    e = np.exp(z)
+    return e / e.sum(axis=1, keepdims=True)
+
+
+class MultinomialLogisticModel:
+    """Deterministic full-batch GD ridge softmax over K classes.
+
+    Same optimization recipe as ``DiscreteTimeCompetingRisks.fit`` but on
+    plain (x, class) rows.  Optional per-row ``sample_weight`` applies at
+    FIT time only (class rebalancing on train); evaluation is always on
+    the unweighted true distribution.
+    """
+
+    def __init__(self, n_classes: int = 3, l2: float = 1e-3,
+                 lr: float = 0.5, iters: int = 500) -> None:
+        self.n_classes = n_classes
+        self.l2 = l2
+        self.lr = lr
+        self.iters = iters
+        self.w: Optional[np.ndarray] = None          # (d+1, K); last row bias
+
+    def fit(self, x: np.ndarray, y: Sequence[int],
+            sample_weight: Optional[Sequence[float]] = None
+            ) -> "MultinomialLogisticModel":
+        n, d = x.shape
+        xb = np.hstack([x, np.ones((n, 1))])
+        yv = np.asarray(y, dtype=np.int64)
+        if yv.min() < 0 or yv.max() >= self.n_classes:
+            raise ValueError("class label outside [0, n_classes)")
+        if sample_weight is None:
+            sw = np.ones(n, dtype=np.float64)
+        else:
+            sw = np.asarray(sample_weight, dtype=np.float64)
+            if sw.shape != (n,) or (sw < 0).any():
+                raise ValueError("sample_weight must be n non-negative floats")
+        sw_sum = float(sw.sum()) or 1.0
+        onehot = np.zeros((n, self.n_classes))
+        onehot[np.arange(n), yv] = 1.0
+        w = np.zeros((d + 1, self.n_classes))
+        for _ in range(self.iters):
+            p = _softmax_rows(xb @ w)
+            grad = xb.T @ ((p - onehot) * sw[:, None]) / sw_sum + self.l2 * w
+            w -= self.lr * grad
+        self.w = w
+        return self
+
+    def decision_scores(self, x: np.ndarray) -> np.ndarray:
+        assert self.w is not None, "fit first"
+        xb = np.hstack([x, np.ones((x.shape[0], 1))])
+        return np.clip(xb @ self.w, -35.0, 35.0)
+
+    def predict_proba(self, x: np.ndarray) -> np.ndarray:
+        """(n, K) rows that sum to 1."""
+        return _softmax_rows(self.decision_scores(x))
+
+
+def apply_temperature_np(logits: np.ndarray, temperature: float
+                         ) -> np.ndarray:
+    """Softmax(logits / T) — T from a held-out calibration tail."""
+    t = max(float(temperature), 1e-6)
+    return _softmax_rows(np.asarray(logits, dtype=np.float64) / t)
+
+
+def fit_temperature_np(logits: np.ndarray, y: Sequence[int]) -> float:
+    """Deterministic temperature scaling: NLL grid search, no SGD.
+
+    Grid is log-spaced over [0.05, 20].  Returns 1.0 (identity) when the
+    calibration tail has fewer than 2 distinct classes — there is nothing
+    to calibrate against, and inventing a temperature would be fiction.
+    """
+    yv = np.asarray(y, dtype=np.int64)
+    if len(set(yv.tolist())) < 2:
+        return 1.0
+    lg = np.asarray(logits, dtype=np.float64)
+    best_t, best_nll = 1.0, float("inf")
+    for t in np.exp(np.linspace(math.log(0.05), math.log(20.0), 121)):
+        p = apply_temperature_np(lg, float(t))
+        nll = float(-np.mean(np.log(p[np.arange(len(yv)), yv] + 1e-12)))
+        if nll < best_nll - 1e-12:
+            best_nll, best_t = nll, float(t)
+    return best_t
+
+
+def multiclass_log_loss(y: Sequence[int], p: np.ndarray) -> Optional[float]:
+    if not len(y):
+        return None
+    yv = np.asarray(y, dtype=np.int64)
+    pv = np.asarray(p, dtype=np.float64)
+    return float(-np.mean(np.log(pv[np.arange(len(yv)), yv] + 1e-12)))
+
+
+def multiclass_brier(y: Sequence[int], p: np.ndarray) -> Optional[float]:
+    """Mean squared distance to the one-hot target (sums over classes)."""
+    if not len(y):
+        return None
+    yv = np.asarray(y, dtype=np.int64)
+    pv = np.asarray(p, dtype=np.float64)
+    onehot = np.zeros_like(pv)
+    onehot[np.arange(len(yv)), yv] = 1.0
+    return float(np.mean(np.sum((pv - onehot) ** 2, axis=1)))
+
+
+def confusion_matrix(y: Sequence[int], pred: Sequence[int],
+                     n_classes: int = 3) -> List[List[int]]:
+    """rows = true class, cols = predicted class."""
+    m = [[0] * n_classes for _ in range(n_classes)]
+    for t, pr in zip(y, pred):
+        m[int(t)][int(pr)] += 1
+    return m
+
+
+def macro_f1(y: Sequence[int], pred: Sequence[int],
+             n_classes: int = 3) -> Optional[float]:
+    """Unweighted mean of per-class F1.  Classes absent from BOTH truth
+    and predictions are excluded (undefined), never counted as 0."""
+    if not len(y):
+        return None
+    m = confusion_matrix(y, pred, n_classes)
+    f1s = []
+    for k in range(n_classes):
+        tp = m[k][k]
+        fp = sum(m[r][k] for r in range(n_classes)) - tp
+        fn = sum(m[k][c] for c in range(n_classes)) - tp
+        if tp + fp + fn == 0:
+            continue
+        f1s.append(2 * tp / (2 * tp + fp + fn))
+    return (sum(f1s) / len(f1s)) if f1s else None
+
+
+def per_class_reliability(y: Sequence[int], p: np.ndarray,
+                          n_bins: int = 10) -> Dict[str, Any]:
+    """One-vs-rest reliability bins + ECE per class (canonical order)."""
+    out: Dict[str, Any] = {}
+    yv = np.asarray(y, dtype=np.int64)
+    pv = np.asarray(p, dtype=np.float64)
+    for k, name in enumerate(DIRECTION_CLASSES):
+        yk = (yv == k).astype(np.int64)
+        bins = reliability_bins(yk.tolist(), pv[:, k].tolist(), n_bins)
+        out[name] = {"bins": bins,
+                     "ece": expected_calibration_error(bins)}
+    return out
+
+
+def constant_class_probs(train_cls: Sequence[int], n_test: int,
+                         n_classes: int = 3) -> np.ndarray:
+    """Historical per-class frequency comparator (uniform if no train)."""
+    counts = np.zeros(n_classes)
+    for c in train_cls:
+        counts[int(c)] += 1.0
+    if counts.sum() == 0:
+        base = np.full(n_classes, 1.0 / n_classes)
+    else:
+        base = counts / counts.sum()
+    return np.tile(base, (n_test, 1))
+
+
+def momentum_class_probs(train_samples: Sequence[Sample],
+                         train_cls: Sequence[int],
+                         test_samples: Sequence[Sample],
+                         feature: str = "ret_60m",
+                         n_classes: int = 3,
+                         ) -> Tuple[np.ndarray, np.ndarray]:
+    """Sign-of-trailing-return 3-class comparator.
+
+    P(class | sign bucket) is the train class frequency within that
+    bucket.  Rows where the feature is unavailable are masked out
+    (prediction unavailable), never invented.
+    Returns (probs (n, K), available_mask (n,)).
+    """
+    pos = np.zeros(n_classes)
+    neg = np.zeros(n_classes)
+    for s, c in zip(train_samples, train_cls):
+        v = s.features.get(feature)
+        if v is None or not isinstance(v, (int, float)) or v != v:
+            continue
+        (pos if v >= 0 else neg)[int(c)] += 1.0
+    base = constant_class_probs(train_cls, 1, n_classes)[0]
+    p_pos = pos / pos.sum() if pos.sum() else base
+    p_neg = neg / neg.sum() if neg.sum() else base
+    probs = np.tile(base, (len(test_samples), 1))
+    mask = np.zeros(len(test_samples))
+    for i, s in enumerate(test_samples):
+        v = s.features.get(feature)
+        if v is None or not isinstance(v, (int, float)) or v != v:
+            continue
+        probs[i] = p_pos if v >= 0 else p_neg
+        mask[i] = 1.0
+    return probs, mask
+
+
+# --------------------------------------------------------------------------- #
+# classical artifact save / reload with integrity check
+# --------------------------------------------------------------------------- #
+
+class ClassicalIntegrityError(RuntimeError):
+    """Raised when a classical artifact fails its checksum on reload."""
+
+
+def _classical_payload_bytes(payload: Dict[str, Any]) -> bytes:
+    return json.dumps(payload, sort_keys=True,
+                      separators=(",", ":")).encode("utf-8")
+
+
+def save_classical(path: str, model: MultinomialLogisticModel,
+                   feature_columns: Sequence[str],
+                   temperature: float = 1.0,
+                   meta: Optional[Dict[str, Any]] = None) -> str:
+    """Write a JSON artifact with sha256 over its payload; returns digest."""
+    assert model.w is not None, "fit first"
+    payload = {
+        "kind": "multinomial_logistic",
+        "n_classes": model.n_classes,
+        "l2": model.l2, "lr": model.lr, "iters": model.iters,
+        "weights": [[float(v) for v in row] for row in model.w],
+        "feature_columns": list(feature_columns),
+        "classes": list(DIRECTION_CLASSES[:model.n_classes]),
+        "temperature": float(temperature),
+        "meta": meta or {},
+    }
+    digest = hashlib.sha256(_classical_payload_bytes(payload)).hexdigest()
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"payload": payload, "checksum_sha256": digest}, fh,
+                  sort_keys=True, indent=1)
+    return digest
+
+
+def load_classical(path: str
+                   ) -> Tuple[MultinomialLogisticModel, List[str], float,
+                              Dict[str, Any]]:
+    """Reload and verify; raises ClassicalIntegrityError on any mismatch."""
+    with open(path, "r", encoding="utf-8") as fh:
+        doc = json.load(fh)
+    payload = doc.get("payload")
+    stored = doc.get("checksum_sha256")
+    if not isinstance(payload, dict) or not stored:
+        raise ClassicalIntegrityError(f"malformed classical artifact: {path}")
+    digest = hashlib.sha256(_classical_payload_bytes(payload)).hexdigest()
+    if digest != stored:
+        raise ClassicalIntegrityError(
+            f"classical artifact checksum mismatch: {path}")
+    model = MultinomialLogisticModel(
+        n_classes=int(payload["n_classes"]), l2=float(payload["l2"]),
+        lr=float(payload["lr"]), iters=int(payload["iters"]))
+    model.w = np.asarray(payload["weights"], dtype=np.float64)
+    return (model, list(payload["feature_columns"]),
+            float(payload.get("temperature", 1.0)),
+            dict(payload.get("meta", {})))

@@ -596,15 +596,46 @@ class TestTrainCli:
         assert "note" in res                           # censored-purge caveat
         assert set(res["empirical_cif_1440m_all"]) == set(bl.HAZARD_CAUSES)
 
-    def test_gbm_reports_availability_honestly(self, tmp_path):
+    def test_gbm_reports_availability_honestly(self, tmp_path, monkeypatch):
+        # Dep absent -> honest "unavailable"; the dataset is never opened.
+        from oracle.ml import gbm as gbm_mod
+        monkeypatch.setattr(gbm_mod, "LGBM_AVAILABLE", False)
+        monkeypatch.setattr(gbm_mod, "LGBM_WHY",
+                            "lightgbm not importable: simulated")
         out = str(tmp_path / "gbm.json")
         assert tr.main(["--model", "gbm", "--dataset", "unused.sqlite",
                         "--out", out]) == 0
         with open(out, encoding="utf-8") as f:
             r = json.load(f)
-        assert r["result"]["status"] in ("available", "unavailable")
-        if r["result"]["status"] == "unavailable":
-            assert "lightgbm" in r["result"]["why"]
+        assert r["result"]["status"] == "unavailable"
+        assert "lightgbm" in r["result"]["why"]
+
+    def test_gbm_cli_trains_on_fixture(self, tmp_path):
+        from oracle.ml import gbm as gbm_mod
+        if not gbm_mod.LGBM_AVAILABLE:
+            pytest.skip(f"lightgbm unavailable: {gbm_mod.LGBM_WHY}")
+        store = str(tmp_path / "ds.sqlite")
+        out = str(tmp_path / "gbm.json")
+        _direction_store(store)
+        assert tr.main(["--model", "gbm", "--dataset", store,
+                        "--out", out, "--n-boot", "10"]) == 0
+        with open(out, encoding="utf-8") as f:
+            r = json.load(f)
+        res = r["result"]
+        assert res["status"] == "trained"
+        assert res["classes"] == ["down", "neutral", "up"]
+        assert res["direction"]["native"]["pooled"]["n"] > 0
+        assert res["direction"]["flags"]["pooled"]["n"] == \
+            res["direction"]["native"]["pooled"]["n"]
+        # baseline_p_win is production PoP -> never a direction comparator
+        assert res["comparators"]["baseline_p_win"]["status"] == \
+            "unavailable"
+        # net-P&L model: honest unavailability (fees unknown in ledger)
+        assert res["net_pnl_model"]["status"] == "unavailable"
+        art = res["artifact"]
+        assert art["status"] == "saved"
+        assert os.path.exists(art["path"])
+        assert art["reload_parity_max_abs_diff"] <= 1e-12
 
     def test_mlp_without_torch_reports_unavailable(self, tmp_path,
                                                    monkeypatch):

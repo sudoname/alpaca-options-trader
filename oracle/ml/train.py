@@ -58,29 +58,41 @@ from oracle.lab.purged_validation import (
     register_holdout,
 )
 from oracle.ml.baselines import (
+    DIRECTION_CLASSES,
     HAZARD_BIN_EDGES_MIN,
     HAZARD_CAUSES,
     DiscreteTimeCompetingRisks,
     HarLiteModel,
+    MultinomialLogisticModel,
     QUANTILE_LADDER,
     QuantilePinballModel,
     RidgeLogisticModel,
     apply_platt,
+    apply_temperature_np,
     baseline_p_win_probs,
     build_design,
+    confusion_matrix,
     constant_base_rate_probs,
+    constant_class_probs,
     empirical_cumulative_incidence,
     expand_person_periods,
     expected_calibration_error,
     fit_platt,
+    fit_temperature_np,
     interval_coverage,
+    macro_f1,
+    momentum_class_probs,
     momentum_rule_probs,
+    multiclass_brier,
+    multiclass_log_loss,
+    per_class_reliability,
     pinball_loss,
     qlike_loss,
     reliability_bins,
     rv_ewma_forecast,
     rv_persistence_forecast,
 )
+from oracle.ml.mlp import direction_class
 
 MODELS = ("logistic", "naive", "quantile", "rv", "hazard", "gbm", "mlp")
 
@@ -184,6 +196,209 @@ def _stratified_binary(samples: Sequence[Sample], y: Sequence[int],
 
 def _direction_y(s: Sample) -> int:
     return 1 if s.label_value > 0 else 0        # up vs not-up (harness parity)
+
+
+def _direction_cls(s: Sample) -> int:
+    """True 3-class target: 0=down, 1=neutral, 2=up (Oracle 4.0.1)."""
+    return direction_class(float(s.label_value))
+
+
+_BINARY_VS_3CLASS_NOTE = (
+    "binary (up-vs-not-up) and 3-class metrics are NOT comparable: the "
+    "binary collapse merges neutral and bearish outcomes; compare models "
+    "only within the same class definition")
+
+_BASELINE_PWIN_3CLASS = {
+    "status": "unavailable",
+    "why": "baseline_p_win is the production probability that the OPTION "
+           "TRADE profits (PoP), not P(underlying direction class); it is "
+           "semantically mismatched as a 3-class directional comparator "
+           "and is reported unavailable rather than coerced"}
+
+
+def _mc_metrics(y: Sequence[int], probs: np.ndarray) -> Dict[str, Any]:
+    """Pooled 3-class metrics (log loss, Brier, accuracy, macro F1, CM)."""
+    y = list(y)
+    if not y:
+        return {"n": 0, "log_loss": None, "brier": None, "accuracy": None,
+                "macro_f1": None, "confusion_matrix": None,
+                "class_counts": {c: 0 for c in DIRECTION_CLASSES}}
+    pred = [int(i) for i in np.asarray(probs).argmax(axis=1)]
+    counts = {c: 0 for c in DIRECTION_CLASSES}
+    for yi in y:
+        counts[DIRECTION_CLASSES[yi]] += 1
+    return {
+        "n": len(y),
+        "log_loss": multiclass_log_loss(y, probs),
+        "brier": multiclass_brier(y, probs),
+        "accuracy": float(np.mean([p == t for p, t in zip(pred, y)])),
+        "macro_f1": macro_f1(y, pred),
+        "confusion_matrix": confusion_matrix(y, pred),
+        "class_counts": counts,
+    }
+
+
+def _per_session_mc_log_loss(sessions: Sequence[str], y: Sequence[int],
+                             probs: np.ndarray,
+                             mask: Optional[Sequence[float]] = None
+                             ) -> Dict[str, float]:
+    probs = np.asarray(probs, dtype=float)
+    groups: Dict[str, Tuple[List[int], List[int]]] = {}
+    for i, sess in enumerate(sessions):
+        if mask is not None and not mask[i]:
+            continue
+        ys, idx = groups.setdefault(sess, ([], []))
+        ys.append(y[i])
+        idx.append(i)
+    out: Dict[str, float] = {}
+    for sess, (ys, idx) in groups.items():
+        m = multiclass_log_loss(ys, probs[idx])
+        if m is not None:
+            out[sess] = m
+    return out
+
+
+def _run_direction_three_class(samples: Sequence[Sample],
+                               folds: Sequence[Fold],
+                               seed: int, n_boot: int,
+                               challenger: str = "logistic"
+                               ) -> Dict[str, Any]:
+    """True 3-class direction evaluation (down / neutral / up).
+
+    Fixes the Oracle 4.0 up-vs-not-up collapse (which merged neutral and
+    bearish outcomes).  The multinomial logistic challenger is temperature
+    calibrated on a chronological tail of train (the last train session)
+    with **label-availability purging**: any fit row whose label became
+    available at or after the calibration session start is excluded from
+    the fit split (counted, never silently dropped), so the calibration
+    tail can never leak into the fit.
+    """
+    by_id = {s.decision_id: s for s in samples}
+    names = _feature_names(samples)
+    fold_rows: List[Dict[str, Any]] = []
+
+    pool_y: List[int] = []
+    pool_probs: List[List[float]] = []
+    pool_sess: List[str] = []
+    comp_pool: Dict[str, Dict[str, list]] = {
+        c: {"p": [], "mask": []} for c in ("constant", "momentum")}
+    purge_totals = {"fit_rows_kept": 0, "fit_rows_purged_availability": 0,
+                    "fit_rows_unknown_availability": 0}
+
+    for fold in folds:
+        train = [by_id[d] for d in fold.train_ids if _ok(by_id[d])]
+        test = [by_id[d] for d in fold.test_ids if _ok(by_id[d])]
+        y_train = [_direction_cls(s) for s in train]
+        y_test = [_direction_cls(s) for s in test]
+        if len(set(y_train)) < 2 or not test:
+            fold_rows.append({"fold_id": fold.fold_id, "skipped": True,
+                              "why": "degenerate train or empty test"})
+            continue
+
+        probs_test: Optional[np.ndarray] = None
+        temperature = 1.0
+        calib_used = False
+        purge = {"fit_rows_kept": 0, "fit_rows_purged_availability": 0,
+                 "fit_rows_unknown_availability": 0}
+        if challenger == "logistic":
+            # chronological calibration tail = last train session
+            last_sess = max(s.session for s in train)
+            calib_start = _session_start_utc(last_sess)
+            calib = [s for s in train if s.session == last_sess]
+            fitp: List[Sample] = []
+            for s in train:
+                if s.session == last_sess:
+                    continue
+                # label-availability purge between fit and calibration
+                if s.label_available_at is None:
+                    purge["fit_rows_unknown_availability"] += 1
+                    continue
+                if s.label_available_at >= calib_start:
+                    purge["fit_rows_purged_availability"] += 1
+                    continue
+                fitp.append(s)
+                purge["fit_rows_kept"] += 1
+            y_fit = [_direction_cls(s) for s in fitp]
+            calib_used = len(set(y_fit)) >= 2 and len(calib) >= 2
+            if not calib_used:
+                # fall back to fitting on all train, no calibration
+                fitp, y_fit, calib = list(train), list(y_train), []
+            std = Standardizer().fit([s.features for s in fitp], names)
+            dm_fit = build_design(fitp, std, std.feature_names)
+            model = MultinomialLogisticModel().fit(dm_fit.x, y_fit)
+            dm_test = build_design(test, std, std.feature_names)
+            logits_test = model.decision_scores(dm_test.x)
+            if calib_used:
+                dm_cal = build_design(calib, std, std.feature_names)
+                temperature = fit_temperature_np(
+                    model.decision_scores(dm_cal.x),
+                    [_direction_cls(s) for s in calib])
+            probs_test = apply_temperature_np(logits_test, temperature)
+        for k in purge_totals:
+            purge_totals[k] += purge[k]
+
+        # comparators on this fold's test rows (identical masks/labels)
+        c_const = constant_class_probs(y_train, len(test))
+        c_mom, m_mom = momentum_class_probs(train, y_train, test)
+        comp_pool["constant"]["p"].extend(c_const.tolist())
+        comp_pool["constant"]["mask"].extend([1.0] * len(test))
+        comp_pool["momentum"]["p"].extend(c_mom.tolist())
+        comp_pool["momentum"]["mask"].extend(m_mom.tolist())
+
+        pool_y.extend(y_test)
+        pool_sess.extend([s.session for s in test])
+        row: Dict[str, Any] = {
+            "fold_id": fold.fold_id, "skipped": False,
+            "train_sessions": fold.train_sessions,
+            "test_sessions": fold.test_sessions,
+            "n_train_ok": len(train), "n_test_ok": len(test),
+            "calibration_used": calib_used,
+            "temperature": temperature,
+            "purge_accounting": purge}
+        if probs_test is not None:
+            pool_probs.extend(probs_test.tolist())
+            row["test_metrics"] = _mc_metrics(y_test, probs_test)
+        fold_rows.append(row)
+
+    report: Dict[str, Any] = {
+        "classes": list(DIRECTION_CLASSES),
+        "note": _BINARY_VS_3CLASS_NOTE,
+        "folds": fold_rows,
+        "purge_accounting": purge_totals,
+    }
+
+    comparators: Dict[str, Any] = {}
+    comp_sess_loss: Dict[str, Dict[str, float]] = {}
+    for cname, pool in comp_pool.items():
+        mask = pool["mask"]
+        ys = [y for y, m in zip(pool_y, mask) if m]
+        ps = np.asarray([p for p, m in zip(pool["p"], mask) if m],
+                        dtype=float)
+        met = _mc_metrics(ys, ps if len(ys) else np.zeros((0, 3)))
+        met["n_unavailable"] = int(len(mask) - sum(mask))
+        comparators[cname] = met
+        comp_sess_loss[cname] = _per_session_mc_log_loss(
+            pool_sess, pool_y, np.asarray(pool["p"], dtype=float)
+            if pool["p"] else np.zeros((0, 3)), mask)
+    comparators["baseline_p_win"] = dict(_BASELINE_PWIN_3CLASS)
+    report["comparators"] = comparators
+
+    if challenger == "logistic" and pool_probs:
+        probs = np.asarray(pool_probs, dtype=float)
+        pooled = _mc_metrics(pool_y, probs)
+        report["challenger"] = {
+            "name": "multinomial_logistic_temperature",
+            "pooled": pooled,
+            "per_class_reliability": per_class_reliability(pool_y, probs),
+        }
+        deltas = {}
+        for cname, pool in comp_pool.items():
+            chall_by_sess = _per_session_mc_log_loss(
+                pool_sess, pool_y, probs, pool["mask"])  # paired rows
+            deltas[cname] = _delta_report(comp_sess_loss[cname],
+                                          chall_by_sess, n_boot, seed)
+        report["deltas_log_loss"] = deltas
+    return report
 
 
 def run_direction(samples: Sequence[Sample], folds: Sequence[Fold],
@@ -301,6 +516,12 @@ def run_direction(samples: Sequence[Sample], folds: Sequence[Fold],
             deltas[cname] = _delta_report(comp_sess_loss[cname],
                                           chall_by_sess, n_boot, seed)
         report["deltas_log_loss"] = deltas
+
+    # Oracle 4.0.1: true 3-class evaluation alongside the legacy binary
+    # track (kept for harness parity; never compared across definitions).
+    report["binary_note"] = _BINARY_VS_3CLASS_NOTE
+    report["three_class"] = _run_direction_three_class(
+        samples, folds, seed, n_boot, challenger)
     return report
 
 
@@ -664,24 +885,301 @@ def run_hazard(samples: Sequence[Sample], folds: Sequence[Fold],
 
 
 # --------------------------------------------------------------------------- #
-# optional / deferred models
+# optional models: LightGBM (actual training; honest unavailable path)
 # --------------------------------------------------------------------------- #
-
-def run_gbm() -> Dict[str, Any]:
-    try:
-        import lightgbm  # noqa: F401  (optional dependency)
-        return {"status": "available",
-                "note": "lightgbm detected but no budgeted config is "
-                        "registered yet; rerun once configured"}
-    except ImportError:
-        return {"status": "unavailable",
-                "why": "lightgbm not installed (optional dependency); "
-                       "result reported honestly, never faked"}
-
 
 def _session_start_utc(session: str) -> datetime:
     """Midnight UTC at the start of a YYYY-MM-DD session string."""
     return datetime.fromisoformat(session).replace(tzinfo=timezone.utc)
+
+
+def _lgbm_ready() -> bool:
+    """Call-time lightgbm check (tests may monkeypatch gbm.LGBM_AVAILABLE)."""
+    import oracle.ml.gbm as gbm_mod
+    return bool(gbm_mod.LGBM_AVAILABLE)
+
+
+def _availability_split(train: Sequence[Sample]
+                        ) -> Tuple[List[Sample], List[Sample],
+                                   Dict[str, int]]:
+    """Split train into (fit, val) at the last train session with
+    label-availability purging of the fit side.
+
+    Any fit-candidate row whose label became available at or after the
+    validation session start is purged (counted, never silently dropped);
+    rows with unknown availability are excluded as well.
+    """
+    last_sess = max(s.session for s in train)
+    val_start = _session_start_utc(last_sess)
+    val = [s for s in train if s.session == last_sess]
+    fit: List[Sample] = []
+    acct = {"fit_rows_kept": 0, "fit_rows_purged_availability": 0,
+            "fit_rows_unknown_availability": 0}
+    for s in train:
+        if s.session == last_sess:
+            continue
+        if s.label_available_at is None:
+            acct["fit_rows_unknown_availability"] += 1
+            continue
+        if s.label_available_at >= val_start:
+            acct["fit_rows_purged_availability"] += 1
+            continue
+        fit.append(s)
+        acct["fit_rows_kept"] += 1
+    return fit, val, acct
+
+
+def run_gbm(samples: Sequence[Sample], folds: Sequence[Fold],
+            dataset_path: str, horizon: str, seed: int, n_boot: int,
+            out_stem: str, fold_sessions: Sequence[str],
+            holdout: Sequence[str]) -> Dict[str, Any]:
+    """Actual LightGBM training through the purged walk-forward harness.
+
+    * 3-class direction (multiclass softmax probabilities), early stopped
+      on a chronological validation tail (last train session) with
+      label-availability purging between fit and validation.
+    * Both missingness treatments — native NaN handling vs explicit
+      missingness flags — are trained on identical rows and compared on
+      identical labels.
+    * Class weights (inverse frequency) are applied to the TRAIN split
+      only; evaluation is always on the unweighted true distribution.
+    * Quantile regressors on log returns at the pre-registered ladder,
+      against marginal train quantiles.
+    * Net-P&L model: reported unavailable (the frozen ledger has no
+      qualified monetary labels — fees unknown), never faked.
+    * Final artifact: fit on all fold sessions, saved with checksum and
+      reloaded for a prediction-parity check.
+    """
+    import oracle.ml.gbm as gbm
+
+    if not gbm.LGBM_AVAILABLE:
+        return {"status": "unavailable", "why": gbm.LGBM_WHY}
+
+    cfg = gbm.GBMConfig()            # pre-registered budget (seed 1337)
+    by_id = {s.decision_id: s for s in samples}
+    names = _feature_names(samples)
+    modes = ("native", "flags")
+    fold_rows: List[Dict[str, Any]] = []
+
+    pool_y: List[int] = []
+    pool_sess: List[str] = []
+    pool_probs: Dict[str, List[List[float]]] = {m: [] for m in modes}
+    comp_pool: Dict[str, Dict[str, list]] = {
+        c: {"p": [], "mask": []} for c in ("constant", "momentum")}
+    purge_totals = {"fit_rows_kept": 0, "fit_rows_purged_availability": 0,
+                    "fit_rows_unknown_availability": 0}
+
+    for fold in folds:
+        train = [by_id[d] for d in fold.train_ids if _ok(by_id[d])]
+        test = [by_id[d] for d in fold.test_ids if _ok(by_id[d])]
+        y_train = [_direction_cls(s) for s in train]
+        y_test = [_direction_cls(s) for s in test]
+        if len(set(y_train)) < 2 or not test:
+            fold_rows.append({"fold_id": fold.fold_id, "skipped": True,
+                              "why": "degenerate train or empty test"})
+            continue
+
+        fitp, val, acct = _availability_split(train)
+        y_fit = [_direction_cls(s) for s in fitp]
+        if len(set(y_fit)) < 2:
+            # fall back: fit on all train, no early-stopping tail
+            fitp, y_fit, val = list(train), list(y_train), []
+        for k in purge_totals:
+            purge_totals[k] += acct[k]
+        y_val = [_direction_cls(s) for s in val]
+
+        row: Dict[str, Any] = {
+            "fold_id": fold.fold_id, "skipped": False,
+            "train_sessions": fold.train_sessions,
+            "test_sessions": fold.test_sessions,
+            "n_train_ok": len(train), "n_test_ok": len(test),
+            "purge_accounting": acct, "modes": {}}
+        for mode in modes:
+            x_fit, _ = gbm.build_matrix(fitp, names, mode)
+            x_val, _ = gbm.build_matrix(val, names, mode)
+            x_test, _ = gbm.build_matrix(test, names, mode)
+            booster, info = gbm.fit_direction_gbm(
+                x_fit, np.asarray(y_fit), x_val, np.asarray(y_val),
+                cfg=cfg)
+            probs = gbm.predict_direction_proba(booster, x_test)
+            pool_probs[mode].extend(probs.tolist())
+            row["modes"][mode] = {
+                "fit_info": info,
+                "test_metrics": _mc_metrics(y_test, probs)}
+
+        # comparators on identical test rows / labels / masks
+        c_const = constant_class_probs(y_train, len(test))
+        c_mom, m_mom = momentum_class_probs(train, y_train, test)
+        comp_pool["constant"]["p"].extend(c_const.tolist())
+        comp_pool["constant"]["mask"].extend([1.0] * len(test))
+        comp_pool["momentum"]["p"].extend(c_mom.tolist())
+        comp_pool["momentum"]["mask"].extend(m_mom.tolist())
+        pool_y.extend(y_test)
+        pool_sess.extend([s.session for s in test])
+        fold_rows.append(row)
+
+    report: Dict[str, Any] = {
+        "status": "trained",
+        "lightgbm_version": gbm.LGBM_VERSION,
+        "lightgbm_pinned": gbm.LGBM_PINNED,
+        "version_note": gbm.LGBM_WHY,
+        "config": {k: getattr(cfg, k) for k in (
+            "learning_rate", "num_leaves", "max_depth",
+            "min_data_in_leaf", "feature_fraction", "lambda_l2",
+            "max_estimators", "early_stopping_rounds", "seed")},
+        "classes": list(DIRECTION_CLASSES),
+        "note": _BINARY_VS_3CLASS_NOTE,
+        "folds": fold_rows,
+        "purge_accounting": purge_totals,
+    }
+
+    # pooled comparators (masked rows only)
+    comparators: Dict[str, Any] = {}
+    comp_sess_loss: Dict[str, Dict[str, float]] = {}
+    for cname, pool in comp_pool.items():
+        mask = pool["mask"]
+        ys = [y for y, m in zip(pool_y, mask) if m]
+        ps = np.asarray([p for p, m in zip(pool["p"], mask) if m],
+                        dtype=float)
+        met = _mc_metrics(ys, ps if len(ys) else np.zeros((0, 3)))
+        met["n_unavailable"] = int(len(mask) - sum(mask))
+        comparators[cname] = met
+        comp_sess_loss[cname] = _per_session_mc_log_loss(
+            pool_sess, pool_y, np.asarray(pool["p"], dtype=float)
+            if pool["p"] else np.zeros((0, 3)), mask)
+    comparators["baseline_p_win"] = dict(_BASELINE_PWIN_3CLASS)
+    report["comparators"] = comparators
+
+    # pooled per-mode metrics + deltas (vs comparators and native-vs-flags)
+    mode_sess_loss: Dict[str, Dict[str, float]] = {}
+    if pool_y:
+        report["direction"] = {}
+        for mode in modes:
+            probs = np.asarray(pool_probs[mode], dtype=float)
+            mode_sess_loss[mode] = _per_session_mc_log_loss(
+                pool_sess, pool_y, probs)
+            report["direction"][mode] = {
+                "pooled": _mc_metrics(pool_y, probs),
+                "per_class_reliability": per_class_reliability(
+                    pool_y, probs),
+            }
+        deltas: Dict[str, Any] = {}
+        for mode in modes:
+            for cname, pool in comp_pool.items():
+                chall_by_sess = _per_session_mc_log_loss(
+                    pool_sess, pool_y,
+                    np.asarray(pool_probs[mode], dtype=float),
+                    pool["mask"])
+                deltas[f"{mode}_vs_{cname}"] = _delta_report(
+                    comp_sess_loss[cname], chall_by_sess, n_boot, seed)
+        # positive mean = flags better (delta = native loss − flags loss)
+        deltas["native_vs_flags"] = _delta_report(
+            mode_sess_loss["native"], mode_sess_loss["flags"],
+            n_boot, seed)
+        report["deltas_log_loss"] = deltas
+
+    # ---------------- quantile regressors on log returns ---------------- #
+    lr_samples = load_samples(dataset_path, horizon, "log_return")
+    lr_by_id = {s.decision_id: s for s in lr_samples if _ok(s)}
+    q_pool_y: List[float] = []
+    q_pool_sess: List[str] = []
+    q_pool_pred: Dict[float, List[float]] = {t: [] for t in QUANTILE_LADDER}
+    q_pool_marg: Dict[float, List[float]] = {t: [] for t in QUANTILE_LADDER}
+    q_folds = 0
+    for fold in folds:
+        train = [lr_by_id[d] for d in fold.train_ids if d in lr_by_id]
+        test = [lr_by_id[d] for d in fold.test_ids if d in lr_by_id]
+        if len(train) < 10 or not test:
+            continue
+        fitp, val, _ = _availability_split(train)
+        if len(fitp) < 5:
+            fitp, val = list(train), []
+        y_fit = np.asarray([float(s.label_value) for s in fitp])
+        y_val = np.asarray([float(s.label_value) for s in val])
+        y_tst = [float(s.label_value) for s in test]
+        x_fit, _ = gbm.build_matrix(fitp, names, "flags")
+        x_val, _ = gbm.build_matrix(val, names, "flags")
+        x_tst, _ = gbm.build_matrix(test, names, "flags")
+        boosters, _info = gbm.fit_quantile_gbms(x_fit, y_fit, x_val, y_val,
+                                                cfg=cfg)
+        preds = gbm.predict_quantiles(boosters, x_tst)
+        y_train_all = [float(s.label_value) for s in train]
+        for tau in QUANTILE_LADDER:
+            q_pool_pred[tau].extend(preds[tau].tolist())
+            q_pool_marg[tau].extend(
+                [float(np.quantile(y_train_all, tau))] * len(test))
+        q_pool_y.extend(y_tst)
+        q_pool_sess.extend([s.session for s in test])
+        q_folds += 1
+    if q_pool_y:
+        pin_model = {str(t): pinball_loss(q_pool_y, q_pool_pred[t], t)
+                     for t in QUANTILE_LADDER}
+        pin_marg = {str(t): pinball_loss(q_pool_y, q_pool_marg[t], t)
+                    for t in QUANTILE_LADDER}
+        report["quantiles"] = {
+            "folds_used": q_folds,
+            "n": len(q_pool_y),
+            "pinball_model": pin_model,
+            "pinball_marginal": pin_marg,
+            "coverage_90": interval_coverage(
+                q_pool_y, q_pool_pred[0.05], q_pool_pred[0.95]),
+            "coverage_50": interval_coverage(
+                q_pool_y, q_pool_pred[0.25], q_pool_pred[0.75]),
+        }
+    else:
+        report["quantiles"] = {"status": "unavailable",
+                               "why": "no log_return labels joined the "
+                                      "direction folds"}
+
+    # ---------------- net-P&L model: honest unavailability -------------- #
+    report["net_pnl_model"] = {
+        "status": "unavailable",
+        "why": "no qualified monetary labels: frozen ledger fees are "
+               "unknown (None) and exit prices are sparse; a net-P&L "
+               "objective would be trained on invented costs"}
+
+    # ---------------- final artifact: save / reload / parity ------------ #
+    artifact: Dict[str, Any] = {"status": "skipped",
+                                "why": "no usable folds"}
+    all_ok = [s for s in samples
+              if _ok(s) and s.session in set(fold_sessions)]
+    if all_ok and len({_direction_cls(s) for s in all_ok}) >= 2:
+        fitp, val, acct = _availability_split(all_ok)
+        y_fit = [_direction_cls(s) for s in fitp]
+        if len(set(y_fit)) < 2:
+            fitp, y_fit, val = list(all_ok), \
+                [_direction_cls(s) for s in all_ok], []
+        y_val = [_direction_cls(s) for s in val]
+        x_fit, cols = gbm.build_matrix(fitp, names, "flags")
+        x_val, _ = gbm.build_matrix(val, names, "flags")
+        booster, info = gbm.fit_direction_gbm(
+            x_fit, np.asarray(y_fit), x_val, np.asarray(y_val), cfg=cfg)
+        path = f"{out_stem}_gbm.json"
+        meta = {"git_sha": _git_sha(),
+                "dataset_hash": dataset_meta(dataset_path).get(
+                    "dataset_hash"),
+                "horizon": horizon,
+                "train_sessions": sorted({s.session for s in fitp}),
+                "val_session": sorted({s.session for s in val}),
+                "holdout_excluded": list(holdout)}
+        digest = gbm.save_gbm_direction(path, booster, cols, "flags",
+                                        cfg, meta=meta)
+        re_booster, re_cols, re_mode, _re_meta = gbm.load_gbm_direction(
+            path)
+        probe = x_fit[: min(64, len(x_fit))]
+        parity = float(np.max(np.abs(
+            gbm.predict_direction_proba(booster, probe)
+            - gbm.predict_direction_proba(re_booster, probe)))) \
+            if len(probe) else 0.0
+        artifact = {"status": "saved", "path": path,
+                    "checksum_sha256": digest,
+                    "missingness_mode": re_mode,
+                    "n_features": len(re_cols),
+                    "fit_info": info,
+                    "purge_accounting": acct,
+                    "reload_parity_max_abs_diff": parity}
+    report["artifact"] = artifact
+    return report
 
 
 def _torch_ready() -> bool:
@@ -1206,9 +1704,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.model == "mlp" and args.label_type != "direction":
         p.error("--model mlp anchors rows on direction labels; "
                 "use --label-type direction")
+    if args.model == "gbm" and args.label_type != "direction":
+        p.error("--model gbm anchors rows on direction labels; "
+                "use --label-type direction")
 
-    if args.model == "gbm":
-        report["result"] = run_gbm()
+    if args.model == "gbm" and not _lgbm_ready():
+        import oracle.ml.gbm as gbm_mod
+        report["result"] = {
+            "status": "unavailable",
+            "why": gbm_mod.LGBM_WHY}
     elif args.model == "mlp" and not _torch_ready():
         report["result"] = {
             "status": "unavailable",
@@ -1243,6 +1747,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         elif args.model == "hazard":
             report["result"] = run_hazard(samples, folds, args.dataset,
                                           args.seed, args.n_boot)
+        elif args.model == "gbm":
+            out_stem = (args.out[:-5] if args.out.endswith(".json")
+                        else args.out)
+            report["result"] = run_gbm(samples, folds, args.dataset,
+                                       args.horizon, args.seed,
+                                       args.n_boot, out_stem,
+                                       fold_sessions, holdout)
         elif args.model == "mlp":
             out_stem = (args.out[:-5] if args.out.endswith(".json")
                         else args.out)

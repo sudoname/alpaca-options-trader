@@ -10,10 +10,16 @@ engine, under several paired selection variants:
                              quality gate (wide spread / missing quote).
   * ``valuation_ranked``  -- only trades the Phase 5 scenario valuation
                              independently selected (``decision == 'trade'``).
-  * ``classical_gated``   -- baseline gated by out-of-fold ridge-logistic
-                             direction probabilities (purged session folds).
-  * ``neural_gated``      -- same gate using the Phase 4 multitask MLP
-                             (torch-optional; honest ``unavailable`` without).
+  * ``classical_gated``   -- baseline gated by out-of-fold 3-class
+                             (down/neutral/up) multinomial-logistic direction
+                             probabilities (purged session folds); the gate
+                             abstains when the forecast is neutral-dominant or
+                             the directional edge is below the pre-registered
+                             margin -- neutral is never treated as a put
+                             signal (Oracle 4.0.1).
+  * ``neural_gated``      -- same 3-class gate using the Phase 4 multitask
+                             MLP direction head (torch-optional; honest
+                             ``unavailable`` without).
   * ``combined``          -- valuation AND classical gates.
 
 Rules (master prompt, Phase 6):
@@ -58,7 +64,8 @@ from oracle.lab.purged_validation import (
     metrics_fingerprint,
     paired_session_bootstrap,
 )
-from oracle.ml.baselines import RidgeLogisticModel, build_design
+from oracle.ml.baselines import MultinomialLogisticModel, build_design
+from oracle.ml.mlp import direction_class
 from oracle.ml.schema import parse_utc
 from oracle.ml.valuation import parse_occ_symbol
 
@@ -293,17 +300,55 @@ def load_friction(path: Optional[str]) -> Dict[str, Any]:
 # out-of-fold direction gates
 # --------------------------------------------------------------------------- #
 
-def gate_direction(option_type: Optional[str], p_up: float) -> bool:
-    """A long option passes when the OOF direction forecast agrees with it.
+#: Pre-registered abstention margin for the 3-class direction gate
+#: (Oracle 4.0.1).  Fixed BEFORE any evaluation on this dataset; the gate
+#: endorses a direction only when the forecast's directional edge
+#: (p_favoured - p_opposed) reaches this margin.  Not tuned on outcomes.
+DIRECTION_MARGIN = 0.10
 
-    Calls need the underlying UP (p_up >= 0.5); puts need it not-up.
-    Unknown option type passes (gate only acts on evidence it has).
+
+def gate_direction(option_type: Optional[str],
+                   p_down: float,
+                   p_neutral: float,
+                   p_up: float,
+                   margin: float = DIRECTION_MARGIN) -> str:
+    """3-class direction gate verdict: ``pass`` / ``gated_out`` / ``abstain``.
+
+    Oracle 4.0.1 defect fix: the old binary gate (``p_up < 0.5`` => put)
+    merged neutral and bearish forecasts, so a neutral-dominant forecast
+    was treated as a PUT signal.  Here:
+
+      * a call passes only when UP is the argmax AND ``p_up - p_down``
+        reaches the pre-registered ``margin``;
+      * a put passes only when DOWN is the argmax AND ``p_down - p_up``
+        reaches the margin;
+      * the opposing argmax gates the trade out (direction contradicted);
+      * everything else -- neutral argmax, or a directional argmax with an
+        edge below the margin -- is an explicit ABSTAIN: the model declines
+        to endorse the trade without contradicting it.  Neutral is NEVER a
+        put signal.
+
+    Unknown option type passes (the gate only acts on evidence it has).
+    Counterexample the old gate got wrong: a put with
+    (p_down, p_neutral, p_up) = (0.25, 0.45, 0.30) has p_up < 0.5 and
+    used to pass; the true forecast is "probably goes nowhere", so the
+    correct verdict is abstain (no-trade) despite low upward probability.
     """
+    probs = (p_down, p_neutral, p_up)
+    argmax = max(range(3), key=lambda i: probs[i])
     if option_type == "call":
-        return p_up >= 0.5
+        if argmax == 2 and (p_up - p_down) >= margin:
+            return "pass"
+        if argmax == 0:
+            return "gated_out"
+        return "abstain"
     if option_type == "put":
-        return p_up < 0.5
-    return True
+        if argmax == 0 and (p_down - p_up) >= margin:
+            return "pass"
+        if argmax == 2:
+            return "gated_out"
+        return "abstain"
+    return "pass"
 
 
 def _nonholdout_samples(dataset_path: str, horizon: str,
@@ -321,9 +366,11 @@ def compute_oof_classical(
     dataset_path: str,
     holdout: Sequence[str] = DEFAULT_HOLDOUT,
     horizon: str = "60m",
-) -> Tuple[Dict[str, float], Dict[str, Any]]:
-    """Out-of-fold ridge-logistic P(underlying up) per decision_id.
+) -> Tuple[Dict[str, Tuple[float, float, float]], Dict[str, Any]]:
+    """Out-of-fold 3-class direction probabilities per decision_id.
 
+    Oracle 4.0.1: multinomial logistic over (down, neutral, up) -- the
+    binary up-vs-not-up collapse merged neutral and bearish outcomes.
     Purged session folds (Phase 2 parameters). Only decisions that land in
     some fold's TEST block get a prediction; everything else is honestly
     uncovered -- the replay passes those trades through un-gated and counts
@@ -336,9 +383,10 @@ def compute_oof_classical(
     by_id = {s.decision_id: s for s in samples}
     names = sorted({k for s in samples for k in s.features})
 
-    preds: Dict[str, float] = {}
+    preds: Dict[str, Tuple[float, float, float]] = {}
     report: Dict[str, Any] = {
-        "model": "ridge_logistic",
+        "model": "multinomial_logistic",
+        "classes": ["down", "neutral", "up"],
         "horizon": horizon,
         "folds_total": len(folds),
         "folds_used": 0,
@@ -349,17 +397,18 @@ def compute_oof_classical(
     for fold in folds:
         train = [by_id[d] for d in fold.train_ids if _ok(by_id[d])]
         test = [by_id[d] for d in fold.test_ids]
-        y_train = [1 if s.label_value > 0 else 0 for s in train]
+        y_train = [direction_class(float(s.label_value)) for s in train]
         if len(set(y_train)) < 2 or not test:
             report["folds_skipped"] += 1
             continue
         std = Standardizer().fit([s.features for s in train], names)
-        model = RidgeLogisticModel().fit(
+        model = MultinomialLogisticModel().fit(
             build_design(train, std, std.feature_names).x, y_train)
         dm = build_design(test, std, std.feature_names)
         p = model.predict_proba(dm.x)
-        for s, pi in zip(test, p):
-            preds[s.decision_id] = float(pi)
+        for s, row in zip(test, p):
+            preds[s.decision_id] = (float(row[0]), float(row[1]),
+                                    float(row[2]))
         report["folds_used"] += 1
     report["predictions"] = len(preds)
     return preds, report
@@ -371,9 +420,11 @@ def compute_oof_neural(
     horizon: str = "60m",
     max_epochs: int = 20,
     seed: int = 42,
-) -> Tuple[Dict[str, float], Dict[str, Any]]:
-    """Out-of-fold MLP P(up) per decision_id (direction head only).
+) -> Tuple[Dict[str, Tuple[float, float, float]], Dict[str, Any]]:
+    """Out-of-fold MLP 3-class direction probabilities per decision_id.
 
+    Oracle 4.0.1: the gate consumes the full (down, neutral, up) row from
+    the direction head, not the collapsed ``p_up`` scalar.
     Models are retrained per purged fold -- the saved Phase 4 final model
     would leak its own test sessions.  Aux heads are passed empty (masked),
     so only the direction loss trains; that is the head the gate uses.
@@ -397,9 +448,10 @@ def compute_oof_neural(
     names = sorted({k for s in samples for k in s.features})
     cfg = mlp_mod.MLPConfig(max_epochs=max_epochs)
 
-    preds: Dict[str, float] = {}
+    preds: Dict[str, Tuple[float, float, float]] = {}
     report: Dict[str, Any] = {
         "model": "multitask_mlp",
+        "classes": ["down", "neutral", "up"],
         "status": "ok",
         "horizon": horizon,
         "max_epochs": max_epochs,
@@ -436,8 +488,9 @@ def compute_oof_neural(
         model, _info = mlp_mod.train_mlp(
             x_fit, hd_fit, x_val, hd_val, cfg, seed=seed, device="cpu")
         out = mlp_mod.predict_heads(model, x_test, device="cpu")
-        for s, pi in zip(test, out["p_up"]):
-            preds[s.decision_id] = float(pi)
+        for s, row in zip(test, out["direction_probs"]):
+            preds[s.decision_id] = (float(row[0]), float(row[1]),
+                                    float(row[2]))
         report["folds_used"] += 1
     report["predictions"] = len(preds)
     return preds, report
@@ -649,17 +702,26 @@ def build_variants(
             },
         }
 
-    def _gated(preds: Dict[str, float]) -> Tuple[List[Trade], Dict[str, int]]:
+    def _gated(preds: Dict[str, Tuple[float, float, float]],
+               ) -> Tuple[List[Trade], Dict[str, int]]:
+        # no_prediction (uncovered row -> trade passes through un-gated) is
+        # accounted separately from abstained (the model SAW the row and
+        # explicitly declined to endorse a direction -> trade dropped).
         kept: List[Trade] = []
-        acct = {"gated_out": 0, "no_prediction": 0, "gate_passed": 0}
+        acct = {"gated_out": 0, "no_prediction": 0, "gate_passed": 0,
+                "abstained": 0}
         for t in trades:
             p = preds.get(t.decision_id)
             if p is None:
                 acct["no_prediction"] += 1
                 kept.append(t)  # gate only acts where evidence exists
-            elif gate_direction(t.option_type, p):
+                continue
+            verdict = gate_direction(t.option_type, p[0], p[1], p[2])
+            if verdict == "pass":
                 acct["gate_passed"] += 1
                 kept.append(t)
+            elif verdict == "abstain":
+                acct["abstained"] += 1
             else:
                 acct["gated_out"] += 1
         return kept, acct

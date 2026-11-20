@@ -80,11 +80,27 @@ class TestMetricHelpers:
         assert rp.profit_factor([]) is None
 
     def test_gate_direction(self):
-        assert rp.gate_direction("call", 0.6) is True
-        assert rp.gate_direction("call", 0.4) is False
-        assert rp.gate_direction("put", 0.4) is True
-        assert rp.gate_direction("put", 0.6) is False
-        assert rp.gate_direction(None, 0.0) is True       # no evidence
+        # 3-class verdicts (Oracle 4.0.1): pass / gated_out / abstain.
+        # call passes only when up is argmax AND edge >= margin
+        assert rp.gate_direction("call", 0.1, 0.2, 0.7) == "pass"
+        # argmax down -> opposite direction endorsed -> gated out
+        assert rp.gate_direction("call", 0.7, 0.2, 0.1) == "gated_out"
+        # up argmax but edge below margin -> abstain, not a pass
+        assert rp.gate_direction("call", 0.32, 0.30, 0.38) == "abstain"
+        # neutral argmax -> abstain for a call
+        assert rp.gate_direction("call", 0.2, 0.6, 0.2) == "abstain"
+        # put mirror
+        assert rp.gate_direction("put", 0.7, 0.2, 0.1) == "pass"
+        assert rp.gate_direction("put", 0.1, 0.2, 0.7) == "gated_out"
+        assert rp.gate_direction("put", 0.38, 0.30, 0.32) == "abstain"
+        # DEFECT COUNTEREXAMPLE: the old binary gate (p_up < 0.5 => put ok)
+        # passed this put even though neutral is the most likely outcome.
+        # Correct verdict: abstain (no-trade) despite low upward probability.
+        assert rp.gate_direction("put", 0.25, 0.45, 0.30) == "abstain"
+        # neutral is NEVER a put signal even with a big "not-up" margin
+        assert rp.gate_direction("put", 0.30, 0.60, 0.10) == "abstain"
+        # unknown option type -> gate cannot act, trade passes through
+        assert rp.gate_direction(None, 0.0, 0.0, 0.0) == "pass"
 
 
 # --------------------------------------------------------------------------- #
@@ -218,19 +234,23 @@ class TestBuildVariants:
         assert "never fabricated" in acct["note"]
 
     def test_direction_gate_with_partial_coverage(self):
-        preds = {"good": 0.7, "putx": 0.7, "wide": 0.2}
+        preds = {
+            "good": (0.1, 0.2, 0.7),   # call, up argmax -> pass
+            "putx": (0.2, 0.6, 0.2),   # put, NEUTRAL argmax -> abstain (drop)
+            "wide": (0.7, 0.2, 0.1),   # call, down argmax -> gated_out
+        }
         v = rp.build_variants(self._trades(), None, preds, preds, "ok")
         acct = v["classical_gated"]["accounting"]
         kept = {t.decision_id for t in v["classical_gated"]["trades"]}
-        # good: call 0.7 pass; putx: put 0.7 fail; wide: call 0.2 fail;
-        # noquote: NO prediction -> passes through and is counted.
+        # good passes; putx abstains (neutral is NOT a put signal); wide is
+        # gated out; noquote: NO prediction -> passes through and is counted.
         assert kept == {"good", "noquote"}
-        assert acct == {"n": 2, "gated_out": 2, "no_prediction": 1,
-                        "gate_passed": 1}
+        assert acct == {"n": 2, "gated_out": 1, "no_prediction": 1,
+                        "gate_passed": 1, "abstained": 1}
         assert v["neural_gated"]["accounting"]["n"] == 2
 
     def test_combined_is_intersection(self):
-        preds = {"good": 0.7, "putx": 0.7}
+        preds = {"good": (0.1, 0.2, 0.7), "putx": (0.1, 0.2, 0.7)}
         v = rp.build_variants(self._trades(), {"putx", "good"}, preds, {},
                               "unavailable")
         kept = {t.decision_id for t in v["combined"]["trades"]}
@@ -396,7 +416,8 @@ class TestOOFClassical:
         store = str(tmp_path / "ds.sqlite")
         _write_fixture(store)
         preds, rep = rp.compute_oof_classical(store, holdout=HOLDOUT)
-        assert rep["model"] == "ridge_logistic"
+        assert rep["model"] == "multinomial_logistic"
+        assert rep["classes"] == ["down", "neutral", "up"]
         assert rep["folds_used"] >= 1
         assert rep["predictions"] == len(preds)
         # holdout decisions never receive a prediction
@@ -404,10 +425,14 @@ class TestOOFClassical:
         # min_train=2 => the first two sessions are never testable
         for s in SESSIONS[:2]:
             assert not any(d.startswith(f"d-{s}-") for d in preds)
-        # separable labels: x>0 -> up; the OOF forecast must agree
+        # separable labels: x>0 -> up, x<0 -> down; the OOF forecast must
+        # agree and each (p_down, p_neutral, p_up) tuple must be a simplex
         for did, p in preds.items():
+            assert len(p) == 3
+            assert sum(p) == pytest.approx(1.0, abs=1e-6)
             i = int(did.rsplit("-", 1)[1])
-            assert (p >= 0.5) == (i % 2 == 0), (did, p)
+            argmax = max(range(3), key=lambda k: p[k])
+            assert argmax == (2 if i % 2 == 0 else 0), (did, p)
 
 
 # --------------------------------------------------------------------------- #
