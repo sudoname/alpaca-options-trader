@@ -40,7 +40,11 @@ History sources (4.0.1-A):
 Flags (all optional):
 
 * ``ENABLE_ORACLE4_SHADOW``    — master switch (default ``false``)
-* ``ORACLE4_MODEL_ID``         — registry id to stamp records with
+* ``ORACLE4_MODEL_ID``         — registry id whose pinned artifact is
+  hash-verified, loaded and actually invoked per candidate (4.0.1-B via
+  :mod:`oracle.ml.forecast`); records carry real logits/probabilities,
+  quantiles, RV, CIF, latency and input digest, or a structured
+  abstention reason — identity metadata alone never counts as inference
 * ``ORACLE4_MAX_CANDIDATES``   — truncate each scan's input (default 16)
 * ``ORACLE4_MAX_SCENARIOS``    — MC paths per underlying (default 512)
 * ``ORACLE4_SHADOW_JSONL``     — output path (default oracle4_shadow.jsonl)
@@ -200,6 +204,146 @@ def _model_identity(cfg: ShadowConfig) -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# model inference (4.0.1-B: verified load + actual invocation, fail-open)
+# --------------------------------------------------------------------------- #
+
+def _decision_record(cand: Dict[str, Any], frozen: val.Candidate,
+                     now: datetime) -> Any:
+    """Map a scheduler candidate + its frozen valuation twin to a
+    :class:`oracle.ml.schema.DecisionRecord` so the **exact** point-in-time
+    feature builder (:func:`oracle.ml.features.build_feature_row`) runs on
+    live-shadow inputs — no separate shadow approximation."""
+    from oracle.ml import schema as sch
+    opt = cand.get("opt") or {}
+    contract = frozen.contract or {}
+    expiration = contract.get("expiration") or opt.get("expiration")
+    return sch.DecisionRecord(
+        decision_id=frozen.decision_id,
+        snapshot_id=frozen.decision_id,
+        kind="shadow_candidate",
+        accepted=False,
+        reject_code=None,
+        as_of=now,
+        available_at=now,
+        underlying=frozen.underlying,
+        symbol=frozen.symbol,
+        expiration=str(expiration) if expiration else None,
+        strike=_flt(contract.get("strike")),
+        option_type=contract.get("option_type"),
+        multiplier=_flt(opt.get("multiplier")),
+        quote_bid=_flt(opt.get("bid")),
+        quote_ask=_flt(opt.get("ask")),
+        underlying_price=_flt(cand.get("underlying_price")),
+        iv=_flt(opt.get("iv")),
+        delta=_flt(opt.get("delta")),
+        direction=opt.get("direction") or cand.get("direction"),
+        score=_flt(cand.get("score")),
+        p_win=_flt(cand.get("p_win") or opt.get("p_win")),
+        ev=_flt(cand.get("ev") or opt.get("ev")),
+        signals=dict(cand.get("signals") or {}),
+    )
+
+
+def _run_forecasts(cfg: ShadowConfig,
+                   frozen_src: Sequence[Dict[str, Any]],
+                   cands: Sequence[val.Candidate],
+                   bar_rows_by_u: Dict[str, List[Any]],
+                   bars_mode: bool,
+                   now: datetime) -> tuple:
+    """Load the configured registry model (verified) and invoke it once per
+    frozen candidate.  Returns ``(inference_info, forecasts)`` where
+    ``forecasts`` maps decision_id -> Forecast dict or structured
+    abstention.  Never raises; never touches challenger ranking.
+    """
+    info: Dict[str, Any] = {
+        "attempted": bool(cfg.model_id),
+        "loaded": False,
+        "n_forecasts": 0,
+        "n_abstained": 0,
+        "forecast_ms_total": 0.0,
+    }
+    forecasts: Dict[str, Any] = {}
+    if not cfg.model_id:
+        info["reason"] = "MODEL_ID_UNSET"
+        return info, forecasts
+
+    tf0 = time.perf_counter()
+    try:
+        from oracle.ml import forecast as fcmod
+        from oracle.ml import features as featmod
+        from oracle.ml import schema as sch
+    except Exception as e:
+        info["reason"] = "IMPORT_ERROR"
+        info["detail"] = str(e)
+        info["forecast_ms_total"] = (time.perf_counter() - tf0) * 1000.0
+        return info, forecasts
+
+    try:
+        provider = fcmod.get_provider(cfg.registry_path, cfg.model_id)
+    except fcmod.ForecastUnavailable as e:
+        info["forecast_unavailable"] = e.to_dict()
+        info["n_abstained"] = len(cands)
+        info["forecast_ms_total"] = (time.perf_counter() - tf0) * 1000.0
+        for c in cands:
+            forecasts[c.decision_id] = e.to_dict()
+        return info, forecasts
+    except Exception as e:  # defensive: provider layer must stay fail-open
+        info["reason"] = "PROVIDER_ERROR"
+        info["detail"] = str(e)
+        info["forecast_ms_total"] = (time.perf_counter() - tf0) * 1000.0
+        return info, forecasts
+
+    info.update({
+        "loaded": True,
+        "d_in": 2 * len(provider.feature_names),
+        "temperature": provider.temperature,
+        "horizon": provider.horizon,
+        "checksums": provider.checksums,
+    })
+
+    if not bars_mode:
+        # Legacy synthetic-grid history has no real timestamps: refusing to
+        # fabricate timestamped features (4.0.1-A/B) — abstain per candidate.
+        e = fcmod.ForecastUnavailable(
+            "HISTORY_UNTIMESTAMPED",
+            "legacy synthetic-grid history: refusing to fabricate "
+            "timestamped features", model_id=cfg.model_id)
+        for c in cands:
+            forecasts[c.decision_id] = e.to_dict()
+        info["n_abstained"] = len(cands)
+        info["forecast_ms_total"] = (time.perf_counter() - tf0) * 1000.0
+        return info, forecasts
+
+    obs_by_u: Dict[str, List[Any]] = {}
+    for u, bar_rows in bar_rows_by_u.items():
+        obs_by_u[u] = [
+            sch.UnderlyingObs(
+                underlying=u, event_at=b.end_utc, available_at=b.end_utc,
+                price=float(b.close), source_snapshot_id=f"bars:{u}")
+            for b in bar_rows]
+    index = featmod.ObsIndex(obs_by_u)
+
+    for cand_dict, frozen in zip(frozen_src, cands):
+        try:
+            dec = _decision_record(cand_dict, frozen, now)
+            frow = featmod.build_feature_row(dec, index)
+            fc = provider.forecast(frow.features, as_of=now)
+            forecasts[frozen.decision_id] = fc.to_dict()
+            info["n_forecasts"] += 1
+        except fcmod.ForecastUnavailable as e:
+            forecasts[frozen.decision_id] = e.to_dict()
+            info["n_abstained"] += 1
+        except Exception as e:
+            forecasts[frozen.decision_id] = {
+                "available": False, "reason": "INFERENCE_ERROR",
+                "detail": str(e), "model_id": cfg.model_id}
+            info["n_abstained"] += 1
+
+    info["forecast_ms_total"] = (time.perf_counter() - tf0) * 1000.0
+    return info, forecasts
+
+
+# --------------------------------------------------------------------------- #
 # the shadow scan itself
 # --------------------------------------------------------------------------- #
 
@@ -251,6 +395,7 @@ def shadow_scan(candidates: Sequence[Dict[str, Any]], *,
 
     scen_by_u: Dict[str, Any] = {}
     scen_meta: Dict[str, Dict[str, Any]] = {}
+    bar_rows_by_u: Dict[str, List[Any]] = {}  # 4.0.1-B: retained for features
     for c in cands:
         u = c.underlying
         if not u or u in scen_by_u:
@@ -275,6 +420,7 @@ def shadow_scan(candidates: Sequence[Dict[str, Any]], *,
                         start=now - timedelta(days=7), end=now, as_of=now,
                         rth_only=True, min_bars=vcfg.min_history_returns)
                     obs = [(b.ts_utc, b.end_utc, b.close) for b in bar_rows]
+                    bar_rows_by_u[u] = list(bar_rows)
                 except barsmod.BarsUnavailable as e:
                     bars_unavailable = e.to_dict()
             if bars_unavailable is not None:
@@ -338,13 +484,23 @@ def shadow_scan(candidates: Sequence[Dict[str, Any]], *,
             r = str(v.get("reason"))
             missingness[r] = missingness.get(r, 0) + 1
 
+    # 4.0.1-B: verified model load + actual per-candidate invocation.
+    # Fail-open and strictly additive: challenger ranking above is computed
+    # before and independent of forecasts (forecast-conditioned scenarios
+    # land in Stage C).
+    inference_info, forecasts = _run_forecasts(
+        cfg, frozen_src, cands, bar_rows_by_u, bars_mode, now)
+    model_ident = _model_identity(cfg)
+    model_ident["inference"] = inference_info
+
     inference_ms = (time.perf_counter() - t0) * 1000.0
     record = {
         "schema_version": SCHEMA_VERSION,
         "type": RECORD_TYPE,
         "at": now.isoformat(),
         "scan_id": scan_id,
-        "model": _model_identity(cfg),
+        "model": model_ident,
+        "forecasts": forecasts,
         "flags": {
             "ENABLE_ORACLE4_SHADOW": cfg.enabled,
             "ORACLE4_MODEL_ID": cfg.model_id,
