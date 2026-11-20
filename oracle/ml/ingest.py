@@ -246,7 +246,7 @@ class LedgerEvent:
 
     __slots__ = ("event_key", "decision_id", "event_type", "event_at",
                  "available_at", "broker_order_id", "qty", "price",
-                 "fees", "status", "payload")
+                 "fees", "status", "source", "payload")
 
     def __init__(self, **kw: Any) -> None:
         for name in self.__slots__:
@@ -280,7 +280,7 @@ def load_events(
     cur = conn.execute(
         """SELECT event_key, decision_id, event_type, event_at_utc,
                   received_at_utc, broker_order_id, qty, price, fees,
-                  status, payload_json
+                  status, source, payload_json
              FROM events
             ORDER BY received_at_utc, event_key"""
     )
@@ -317,6 +317,7 @@ def load_events(
                 price=float(row["price"]) if row["price"] is not None else None,
                 fees=float(row["fees"]) if row["fees"] is not None else None,
                 status=row["status"],
+                source=row["source"],
                 payload=_loads(row["payload_json"]),
             )
         )
