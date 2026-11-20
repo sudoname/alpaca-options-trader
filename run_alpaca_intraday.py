@@ -1063,6 +1063,31 @@ class IntradayScheduler:
                 except Exception as e:
                     log(f"[KERNEL-SHADOW] failed for {cand.get('sym')} (ignored): {e}")
 
+        # Oracle4 live bars feed: keeps the shadow's BarStore sqlite current so
+        # bars mode can produce timestamped feature rows. Runs BEFORE the
+        # shadow so it sees the freshest completed bars. Env-gated and
+        # fail-open; research-path only, never alters baseline behavior.
+        if os.getenv("ENABLE_ORACLE4_BARS_FEED", "").strip().lower() == "true":
+            try:
+                from oracle.ml.bars_feed import feed_bars
+                res = feed_bars(
+                    list(self.symbols),
+                    headers=self.trader.headers,
+                    data_url=self.trader.data_url,
+                    db_path=os.getenv(
+                        "ORACLE4_BARS_DB", "artifacts/oracle4/bars/bars.sqlite"),
+                    lookback_min=float(
+                        os.getenv("ORACLE4_BARS_FEED_LOOKBACK_MIN", "480")),
+                )
+                log(f"[ORACLE4-BARS] inserted={res['inserted']} "
+                    f"dup={res['dropped_duplicate_ts']} "
+                    f"fetched={res['fetched']} "
+                    f"forming_skipped={res['skipped_forming']} "
+                    f"bad_close={res['skipped_bad_close']} "
+                    f"pages={res['pages']}")
+            except Exception as e:
+                log(f"[ORACLE4-BARS] failed (ignored): {e}")
+
         # Oracle4 Phase 7: observe-only challenger shadow (disabled by default).
         # Env-gated so the disabled path costs one getenv; fail-open so a
         # research bug can never block or reorder baseline entries. The shadow
