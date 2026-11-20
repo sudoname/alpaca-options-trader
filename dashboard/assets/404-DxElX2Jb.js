@@ -1,0 +1,1 @@
+import{s as e}from"./index-C96-dyDa.js";var t=e;export{t as component};

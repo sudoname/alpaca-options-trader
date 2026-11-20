@@ -47,12 +47,17 @@ _TICKER_RE = re.compile(r"^[A-Z.]{1,8}$")
 class DashboardConfig:
     """Resolved dashboard settings (shell env > .env > code default)."""
 
-    def __init__(self, host, port, cache_ttl, basic_auth_user, basic_auth_pass):
+    def __init__(self, host, port, cache_ttl, basic_auth_user, basic_auth_pass,
+                 training_enabled: bool = False):
         self.host = host
         self.port = port
         self.cache_ttl = cache_ttl
         self.basic_auth_user = basic_auth_user
         self.basic_auth_pass = basic_auth_pass
+        # Opt-in: when True (DASHBOARD_ENABLE_TRAINING) create_app registers
+        # the /api/actions blueprint from oracle_dashboard_actions. Default
+        # False keeps this app all-GET with zero action logic imported.
+        self.training_enabled = training_enabled
 
     @property
     def auth_enabled(self) -> bool:
@@ -72,6 +77,7 @@ class DashboardConfig:
             cache_ttl=c.get_int("DASHBOARD_CACHE_TTL", 60),
             basic_auth_user=c.get_str("DASHBOARD_BASIC_AUTH_USER", ""),
             basic_auth_pass=c.get_str("DASHBOARD_BASIC_AUTH_PASS", ""),
+            training_enabled=c.get_bool("DASHBOARD_ENABLE_TRAINING", False),
         )
 
 
@@ -950,6 +956,17 @@ def create_app(config: "DashboardConfig" = None) -> Flask:
         if os.path.isfile(full):
             return send_from_directory(_DASHBOARD_DIR, filename)
         return send_from_directory(_DASHBOARD_DIR, "index.html")
+
+    # -- opt-in training actions ------------------------------------------ #
+    # Registered ONLY when DASHBOARD_ENABLE_TRAINING is truthy. With the
+    # default config this app has zero non-GET routes and never imports the
+    # actions module; see oracle_dashboard_actions for the governance rules
+    # (unapproved-challenger ceiling, model-name whitelist, one job at a
+    # time). The before_request basic-auth hook above covers /api/actions/*
+    # like every other /api path.
+    if getattr(cfg, "training_enabled", False):
+        from oracle_dashboard_actions import create_actions_blueprint
+        app.register_blueprint(create_actions_blueprint())
 
     return app
 
