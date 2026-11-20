@@ -222,13 +222,49 @@ def build_labels(
     return labels
 
 
+# Exit reason -> (hazard cause, fine-grained mechanism). Keys are the live
+# bot's actual outcome vocabulary (matched lowercased, EXACT -- 4.0.1-A fix:
+# the old substring rules classified TIME_STOP and dynamic_trailing_stop as
+# price stops and roll_failed_take_profit as a profit-target touch). The
+# coarse cause stays within HAZARD_CAUSES = ('stop','target','other_exit');
+# the detail preserves the true mechanism for finer models (Stage E).
+_TOUCH_BY_REASON: Dict[str, Tuple[str, str]] = {
+    # configured price stop-loss
+    "dynamic_stop_loss": ("stop", "stop"),
+    "stop_loss": ("stop", "stop"),
+    "stop": ("stop", "stop"),
+    # trailing stop locks in gains; it is NOT the configured loss barrier
+    "dynamic_trailing_stop": ("other_exit", "trailing_stop"),
+    "trailing_stop": ("other_exit", "trailing_stop"),
+    # time-based exits
+    "time_stop": ("other_exit", "time_stop"),
+    "eod_close": ("other_exit", "eod_close"),
+    # profit target
+    "take_profit": ("target", "target"),
+    "profit_target": ("target", "target"),
+    "roll_take_profit": ("target", "roll_target"),
+    "target": ("target", "target"),
+    # explicit non-barrier exits
+    "roll_failed_take_profit": ("other_exit", "roll_failed_target"),
+    "dynamic_exit": ("other_exit", "dynamic_exit"),
+    "stale_carryover": ("other_exit", "stale_carryover"),
+    "closed": ("other_exit", "manual_close"),
+    "reconciled_closed": ("other_exit", "reconciled"),
+    "reconciled_fill_close": ("other_exit", "reconciled"),
+    "expired": ("other_exit", "expiry"),
+}
+
+
 def _first_touch_label(decision: DecisionRecord, events: List[LedgerEvent],
                        coverage_end: datetime) -> LabelRow:
     """Which barrier resolved the trade first, and after how long (minutes).
 
     value = minutes from decision to exit/outcome; meta['touch'] in
-    {'target','stop','other_exit'}. Censored when a filled trade has no exit
-    inside coverage; MISSING when the decision never traded (no fill path).
+    {'target','stop','other_exit'} via the exact-match reason map
+    (meta['touch_detail'] keeps the finer mechanism; unmapped reasons get
+    meta['reason_unmapped']). Simulated-class outcomes resolve to status
+    SIMULATED, never OK. Censored when a filled trade has no exit inside
+    coverage; MISSING when the decision never traded (no fill path).
     """
     by_type: Dict[str, LedgerEvent] = {}
     for e in events:
@@ -243,17 +279,20 @@ def _first_touch_label(decision: DecisionRecord, events: List[LedgerEvent],
         reason = ""
         if outcome is not None:
             reason = str(outcome.payload.get("reason") or "")
-        touch = ("stop" if "stop" in reason.lower() else
-                 "target" if ("profit" in reason.lower()
-                              or "target" in reason.lower()) else
-                 "other_exit")
+        mapped = _TOUCH_BY_REASON.get(reason.strip().lower())
+        touch, detail = mapped if mapped else ("other_exit", "unknown")
+        simulated = (str(outcome.payload.get("class")) == "simulated"
+                     if outcome is not None else False)
         minutes = (resolved.event_at - decision.as_of).total_seconds() / 60.0
-        meta = {"touch": touch, "reason": reason or None,
-                "simulated": str(outcome.payload.get("class")) == "simulated"
-                if outcome is not None else False}
+        meta: Dict[str, object] = {
+            "touch": touch, "touch_detail": detail,
+            "reason": reason or None, "simulated": simulated}
+        if mapped is None and reason:
+            meta["reason_unmapped"] = True
         return LabelRow(
             decision_id=decision.decision_id, horizon="event",
-            label_type="first_touch", value=minutes, status=LabelStatus.OK,
+            label_type="first_touch", value=minutes,
+            status=LabelStatus.SIMULATED if simulated else LabelStatus.OK,
             label_end=resolved.event_at, available_at=resolved.available_at,
             meta=meta)
 

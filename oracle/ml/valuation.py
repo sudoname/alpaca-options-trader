@@ -67,7 +67,7 @@ import sqlite3
 import subprocess
 import time
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -120,6 +120,7 @@ class ValuationConfig:
     take_profit_pct: float = 20.0
     qty: int = 1
     scan_bucket_min: float = 5.0
+    max_gap_steps: float = 3.0         # history gap tolerance (x step)
     friction_multipliers: Tuple[float, ...] = (1.0, 1.5, 2.0)
     crr_steps: int = 200
     ewma_lambda: float = 0.94
@@ -226,18 +227,26 @@ def load_candidates(dataset_path: str,
 
 
 def load_underlying_obs(dataset_path: str
-                        ) -> Dict[str, List[Tuple[datetime, float]]]:
+                        ) -> Dict[str, List[Tuple[datetime, datetime, float]]]:
+    """Load ``(event_at, available_at, price)`` per underlying.
+
+    4.0.1-A fix: ``available_at`` is loaded and used for point-in-time
+    filtering (the 4.0 loader selected only ``event_at``, so a late-arriving
+    observation could leak into history built "as of" an earlier time).
+    Missing ``available_at`` falls back to ``event_at``.
+    """
     conn = sqlite3.connect(f"file:{dataset_path}?mode=ro", uri=True)
     try:
-        out: Dict[str, List[Tuple[datetime, float]]] = {}
+        out: Dict[str, List[Tuple[datetime, datetime, float]]] = {}
         cur = conn.execute(
-            "SELECT underlying, event_at, price FROM underlying_obs "
-            "ORDER BY underlying, event_at")
-        for u, event_at, price in cur:
+            "SELECT underlying, event_at, available_at, price "
+            "FROM underlying_obs ORDER BY underlying, event_at")
+        for u, event_at, available_at, price in cur:
             t = _parse_utc(event_at)
             if t is None or price is None or price <= 0:
                 continue
-            out.setdefault(u, []).append((t, float(price)))
+            a = _parse_utc(available_at) or t
+            out.setdefault(u, []).append((t, a, float(price)))
         return out
     finally:
         conn.close()
@@ -258,43 +267,101 @@ class ScenarioSet:
         return self.prices.shape[1] - 1
 
 
-def _step_returns(obs: Sequence[Tuple[datetime, float]], as_of: datetime,
-                  step_minutes: float) -> np.ndarray:
-    """Past-only step log returns, LOCF-resampled per session day.
+def _normalize_obs(
+    obs: Sequence[Tuple],
+) -> List[Tuple[datetime, datetime, float]]:
+    """Normalize observations to ``(event_at, available_at, price)``.
 
-    Overnight gaps are excluded (returns never span session boundaries),
-    so sampled paths describe intrasession evolution only.
+    Accepts legacy ``(event_at, price)`` 2-tuples (availability assumed at
+    event time, the pre-4.0.1 convention) and point-in-time 3-tuples.
+    Invalid prices are dropped; output is sorted by event time.
     """
-    by_day: Dict[str, List[Tuple[datetime, float]]] = {}
-    for t, p in obs:
-        if t > as_of:
-            break                       # obs are time-ordered
-        by_day.setdefault(t.strftime("%Y-%m-%d"), []).append((t, p))
+    out: List[Tuple[datetime, datetime, float]] = []
+    for o in obs:
+        if len(o) == 2:
+            t, p = o
+            a = t
+        else:
+            t, a, p = o
+        if t is None or p is None or p <= 0:
+            continue
+        out.append((t, a or t, float(p)))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def _step_returns(obs: Sequence[Tuple], as_of: datetime,
+                  step_minutes: float,
+                  max_gap_steps: float = 3.0,
+                  ) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Past-only step log returns from *actual* observation timestamps.
+
+    4.0.1-A rewrite.  The 4.0 version resampled whatever observations
+    existed onto a synthetic uniform grid with LOCF, which (a) fabricated
+    flat returns when observations were sparse (vol deflation) and
+    (b) silently treated daily closes as intraday steps (vol inflation
+    downstream).  This version:
+
+      * filters point-in-time on ``available_at <= as_of`` (never event
+        time alone), so late-arriving observations are excluded;
+      * emits a return only between two real observations whose actual
+        spacing is in ``[step, max_gap_steps * step]`` — a gap wider than
+        tolerance breaks the chain (counted, never bridged with invented
+        values) and daily-on-intraday data yields *no* returns rather
+        than rescaled ones;
+      * never spans session boundaries (America/New_York sessions), so
+        overnight gaps are structurally excluded.
+
+    Returns ``(returns, diagnostics)``; diagnostics make abstention
+    auditable (n_obs_pit, n_sessions, n_returns, n_gap_bridged,
+    n_chain_breaks, median_spacing_s).
+    """
+    from oracle.ml.bars import session_date_of
+
+    norm = _normalize_obs(obs)
+    by_session: Dict[str, List[Tuple[datetime, float]]] = {}
+    n_pit = 0
+    for t, a, p in norm:
+        if a > as_of or t > as_of:
+            continue
+        n_pit += 1
+        by_session.setdefault(session_date_of(t), []).append((t, p))
 
     step_s = step_minutes * 60.0
+    tol_s = max_gap_steps * step_s
     rets: List[float] = []
-    for day in sorted(by_day):
-        series = by_day[day]
-        t0 = series[0][0]
-        grid_vals: List[float] = []
-        idx = 0
-        k = 0
-        last: Optional[float] = None
-        end = series[-1][0]
-        while True:
-            t_k = t0.timestamp() + k * step_s
-            if t_k > end.timestamp():
-                break
-            while idx < len(series) and series[idx][0].timestamp() <= t_k:
-                last = series[idx][1]
-                idx += 1
-            if last is not None and last > 0:
-                grid_vals.append(last)
-            k += 1
-        for a, b in zip(grid_vals, grid_vals[1:]):
-            if a > 0 and b > 0:
-                rets.append(math.log(b / a))
-    return np.asarray(rets, dtype=np.float64)
+    spacings: List[float] = []
+    n_bridged = 0
+    n_breaks = 0
+    for day in sorted(by_session):
+        series = by_session[day]
+        anchor_t, anchor_p = series[0]
+        for t, p in series[1:]:
+            dt_s = (t - anchor_t).total_seconds()
+            if dt_s < step_s:
+                continue                      # not yet a full step ahead
+            if dt_s > tol_s:
+                n_breaks += 1                 # gap too wide: re-anchor
+                anchor_t, anchor_p = t, p
+                continue
+            if dt_s > 1.5 * step_s:
+                n_bridged += 1                # tolerated, counted gap
+            rets.append(math.log(p / anchor_p))
+            spacings.append(dt_s)
+            anchor_t, anchor_p = t, p
+
+    diag = {
+        "n_obs_pit": n_pit,
+        "n_sessions": len(by_session),
+        "n_returns": len(rets),
+        "n_gap_bridged": n_bridged,
+        "n_chain_breaks": n_breaks,
+        "median_spacing_s": (float(np.median(spacings))
+                             if spacings else None),
+        "step_minutes": float(step_minutes),
+        "max_gap_steps": float(max_gap_steps),
+    }
+    return np.asarray(rets, dtype=np.float64), diag
 
 
 def _ewma_vol(returns: np.ndarray, lam: float) -> Optional[float]:
@@ -312,14 +379,19 @@ def scenario_seed(base_seed: int, underlying: str, bucket_key: str) -> int:
     return int.from_bytes(raw[:8], "big") % (2 ** 63 - 1)
 
 
-def generate_scenarios(obs: Sequence[Tuple[datetime, float]],
+def generate_scenarios(obs: Sequence[Tuple],
                        as_of: datetime, s0: float,
                        config: ValuationConfig,
                        seed: int) -> Tuple[Optional[ScenarioSet], str]:
-    """(scenarios, reason).  reason != 'ok' means no scenarios."""
+    """(scenarios, reason).  reason != 'ok' means no scenarios.
+
+    ``obs`` accepts legacy ``(event_at, price)`` tuples or point-in-time
+    ``(event_at, available_at, price)`` tuples (see ``_normalize_obs``).
+    """
     if s0 is None or s0 <= 0:
         return None, "missing_underlying_price"
-    rets = _step_returns(obs, as_of, config.step_minutes)
+    rets, hist_diag = _step_returns(obs, as_of, config.step_minutes,
+                                    max_gap_steps=config.max_gap_steps)
     if rets.size < config.min_history_returns:
         return None, "insufficient_history"
 
@@ -357,6 +429,7 @@ def generate_scenarios(obs: Sequence[Tuple[datetime, float]],
                         else "unavailable_scale_1"),
         "block_len": blk,
         "seed": int(seed),
+        "history": hist_diag,
     }
     return ScenarioSet(prices=prices, step_minutes=config.step_minutes,
                        meta=meta), "ok"
@@ -751,9 +824,29 @@ def _scan_key(cand: Candidate, bucket_min: float) -> Tuple[str, str, int]:
 
 
 def run_valuation(dataset_path: str, sessions: Sequence[str],
-                  config: ValuationConfig, seed: int) -> Dict[str, Any]:
+                  config: ValuationConfig, seed: int,
+                  bars_db: Optional[str] = None) -> Dict[str, Any]:
+    """Value every candidate over *sessions*.
+
+    4.0.1-A: when ``bars_db`` is given, per-scan history comes from the
+    read-only bars cache (actual timestamped completed bars, PIT via the
+    completed-bar rule). Unavailability falls back to the dataset's
+    ``underlying_obs`` with the structured reason recorded — never silently.
+    """
+    from oracle.ml.bars import BarStore, BarsUnavailable
+
     cands = load_candidates(dataset_path, sessions=sessions)
     obs_by_u = load_underlying_obs(dataset_path)
+
+    bar_store: Optional[BarStore] = None
+    bars_note: Optional[Dict[str, Any]] = None
+    bars_fallbacks: Dict[str, Dict[str, Any]] = {}
+    bars_source_counts: Dict[str, int] = {"bars": 0, "dataset_obs": 0}
+    if bars_db:
+        try:
+            bar_store = BarStore(bars_db, readonly=True)
+        except BarsUnavailable as e:
+            bars_note = e.to_dict()
 
     scans: Dict[Tuple[str, str, int], List[Candidate]] = {}
     for c in cands:
@@ -782,8 +875,24 @@ def run_valuation(dataset_path: str, sessions: Sequence[str],
                    if c.features.get("underlying_price")), None)
         t0 = time.perf_counter()
         sc_seed = scenario_seed(seed, underlying, str(bucket))
+        history_source = "dataset_obs"
+        obs: Sequence[Tuple] = obs_by_u.get(underlying, [])
+        if bar_store is not None:
+            try:
+                bars = bar_store.load_bars(
+                    underlying, 60,
+                    start=as_of - timedelta(days=7), end=as_of,
+                    as_of=as_of, rth_only=True,
+                    min_bars=config.min_history_returns)
+                # (event_at, available_at, price): a bar is available at
+                # its END (completed-bar rule), priced at its close.
+                obs = [(b.ts_utc, b.end_utc, b.close) for b in bars]
+                history_source = "bars"
+            except BarsUnavailable as e:
+                bars_fallbacks.setdefault(underlying, e.to_dict())
+        bars_source_counts[history_source] += 1
         scen, why = generate_scenarios(
-            obs_by_u.get(underlying, []), as_of, s0 or 0.0, config, sc_seed)
+            obs, as_of, s0 or 0.0, config, sc_seed)
         t_scen += time.perf_counter() - t0
 
         vals: List[Dict[str, Any]] = []
@@ -838,9 +947,13 @@ def run_valuation(dataset_path: str, sessions: Sequence[str],
                 "symbol": rank["selected_symbol"],
                 "ev_opportunity": rank["selected_ev"]},
             "baseline_top_decision_id": rank["baseline_top_decision_id"],
+            "history_source": history_source,
             "scenario": None if scen is None else scen.meta,
         })
         t_total += time.perf_counter() - t0
+
+    if bar_store is not None:
+        bar_store.close()
 
     def _stats(xs: List[float]) -> Optional[Dict[str, float]]:
         if not xs:
@@ -875,6 +988,12 @@ def run_valuation(dataset_path: str, sessions: Sequence[str],
                 1 for r in scan_rows if r["decision"] == "abstain"),
         },
         "abstain_reasons": dict(sorted(abstain_hist.items())),
+        "history": {
+            "bars_db": bars_db,
+            "source_counts": bars_source_counts,
+            "store_note": bars_note,
+            "fallbacks": dict(sorted(bars_fallbacks.items())),
+        },
         "ev_summary": _stats(pooled_ev),
         "pop_summary": _stats(pooled_pop),
         "friction_stress": stress,
@@ -910,6 +1029,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--max-steps", type=int, default=78)
     p.add_argument("--sessions", nargs="*", default=None,
                    help="explicit sessions (must not include holdout)")
+    p.add_argument("--bars-db", default=None,
+                   help="read-only bars cache (oracle.ml.bars); when set, "
+                        "scenario history uses actual timestamped completed "
+                        "bars with fail-open fallback to dataset obs")
     args = p.parse_args(argv)
 
     config = ValuationConfig(n_paths=args.n_paths,
@@ -937,7 +1060,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "cost_config": asdict(CostConfig()),
         "sessions": {"folds": list(fold_sessions), "holdout": list(holdout),
                      "requested": sessions},
-        "result": run_valuation(args.dataset, sessions, config, args.seed),
+        "bars_db": args.bars_db,
+        "result": run_valuation(args.dataset, sessions, config, args.seed,
+                                bars_db=args.bars_db),
     }
     clean = _py(report)
     from oracle.lab.purged_validation import metrics_fingerprint

@@ -69,6 +69,8 @@ class LabelStatus(str, Enum):
     OK = "ok"                 # label fully resolved from real observations
     CENSORED = "censored"     # horizon end beyond available data
     MISSING = "missing"       # required inputs absent (never imputed)
+    SIMULATED = "simulated"   # resolved only by a simulated/counterfactual
+                              # outcome -- never trainable as real (4.0.1-A)
 
 
 # --------------------------------------------------------------------------- #
