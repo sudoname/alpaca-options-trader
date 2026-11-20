@@ -63,6 +63,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+from oracle.ml import books as bk
 from oracle.ml import valuation as val
 
 SCHEMA_VERSION = 1
@@ -522,6 +523,16 @@ def shadow_scan(candidates: Sequence[Dict[str, Any]], *,
     model_ident = _model_identity(cfg)
     model_ident["inference"] = inference_info
 
+    # Strategy-book assignment (Stage G): observe-only annotation, never a
+    # gate.  Fail-open so a books error can never break the shadow record.
+    try:
+        book_assignments = bk.assign_books(
+            cands, now=now, scan_id=scan_id,
+            bars_mode="bars" if bars_mode else "synthetic_grid")
+        books_summary = bk.summarize_books(book_assignments)
+    except Exception:  # pragma: no cover - defensive fail-open
+        book_assignments, books_summary = {}, {}
+
     inference_ms = (time.perf_counter() - t0) * 1000.0
     record = {
         "schema_version": SCHEMA_VERSION,
@@ -563,6 +574,15 @@ def shadow_scan(candidates: Sequence[Dict[str, Any]], *,
             "top_score": (baseline_order[0]["score"]
                           if baseline_order else None),
             "order": baseline_order,
+        },
+        "books": {
+            "by_decision": book_assignments,
+            "summary": books_summary,
+        },
+        "outcome": {
+            "state": "unresolved",
+            "resolved_at": None,
+            "resolver": None,
         },
         "note": ("observe-only shadow: no order was submitted; paper/live "
                  "entries remain the baseline's alone"),
@@ -622,6 +642,10 @@ def summarize_log(path: str) -> Dict[str, Any]:
     agree = disagree = 0
     clamped = unclamped = 0
     truncated_scans = 0
+    books_candidates: Dict[str, int] = {}
+    books_paired_groups = 0
+    books_annotations: Dict[str, int] = {}
+    outcome_states: Dict[str, int] = {}
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
@@ -660,6 +684,17 @@ def summarize_log(path: str) -> Dict[str, Any]:
                 if ((rec.get("input") or {}).get(
                         "n_candidates_truncated") or 0) > 0:
                     truncated_scans += 1
+                bks = rec.get("books") or {}
+                summ = bks.get("summary") or {}
+                for b, c in (summ.get("candidates_by_book") or {}).items():
+                    books_candidates[b] = books_candidates.get(b, 0) + int(c)
+                books_paired_groups += int(summ.get("paired_groups") or 0)
+                for info in (bks.get("by_decision") or {}).values():
+                    for a in (info or {}).get("annotations") or []:
+                        books_annotations[a] = \
+                            books_annotations.get(a, 0) + 1
+                st = (rec.get("outcome") or {}).get("state") or "(absent)"
+                outcome_states[st] = outcome_states.get(st, 0) + 1
     denom = agree + disagree
     vol_denom = clamped + unclamped
     return {
@@ -675,6 +710,12 @@ def summarize_log(path: str) -> Dict[str, Any]:
         "n_trade_decisions_compared": denom,
         "vol_scale_clamp_rate": (clamped / vol_denom if vol_denom else None),
         "scans_truncated": truncated_scans,
+        "books": {
+            "candidates_by_book": books_candidates,
+            "paired_groups": books_paired_groups,
+            "annotations": books_annotations,
+        },
+        "outcome_states": outcome_states,
         "note": "read-only summary of observe-only shadow records",
     }
 

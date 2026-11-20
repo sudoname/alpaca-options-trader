@@ -401,5 +401,29 @@ export type Oracle4 = ApiEnvelope & {
     n_trade?: number | null
     n_abstain?: number | null
     last_scan_utc?: string | null
+    last_scan_age_s?: number | null
+    candidates_by_book?: Record<string, number> | null
+    paired_groups?: number | null
+    outcome_states?: Record<string, number> | null
   }
+  forward?: {
+    status?: NodeHealth
+    books?: Oracle4ForwardBook[]
+  }
+}
+
+export type Oracle4ForwardBook = {
+  file?: string | null
+  book?: string | null
+  model_id?: string | null
+  generated_utc?: string | null
+  window?: { start?: string | null; end?: string | null } | null
+  forward_sessions?: number | null
+  resolved_opportunities?: number | null
+  actual_fills?: number | null
+  live_fill_based?: boolean | null
+  resolution_rate?: number | null
+  n_unresolved?: number | null
+  validation?: string | null
+  validation_errors?: number | null
 }

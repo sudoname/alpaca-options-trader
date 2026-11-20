@@ -818,7 +818,9 @@ def create_app(config: "DashboardConfig" = None) -> Flask:
 
             # -- forward shadow log (observe-only JSONL) ------------------- #
             shadow = {"status": "offline", "n_scans": None, "n_trade": None,
-                      "n_abstain": None, "last_scan_utc": None}
+                      "n_abstain": None, "last_scan_utc": None,
+                      "last_scan_age_s": None, "candidates_by_book": {},
+                      "paired_groups": 0, "outcome_states": {}}
             shadow_path = os.getenv("ORACLE4_SHADOW_JSONL",
                                     "oracle4_shadow.jsonl")
             if os.path.isfile(shadow_path):
@@ -826,6 +828,9 @@ def create_app(config: "DashboardConfig" = None) -> Flask:
                 try:
                     n_scans = n_trade = n_abstain = 0
                     last_ts = None
+                    by_book = {}
+                    paired_groups = 0
+                    outcome_states = {}
                     with open(shadow_path, "r", encoding="utf-8") as f:
                         for line in f:
                             line = line.strip()
@@ -844,17 +849,82 @@ def create_app(config: "DashboardConfig" = None) -> Flask:
                             ts = rec.get("at") or rec.get("timestamp")
                             if ts:
                                 last_ts = ts
+                            summ = (rec.get("books") or {}).get("summary") or {}
+                            for b, c in (summ.get("candidates_by_book")
+                                         or {}).items():
+                                by_book[b] = by_book.get(b, 0) + int(c)
+                            paired_groups += int(
+                                summ.get("paired_groups") or 0)
+                            st = (rec.get("outcome") or {}).get("state")
+                            if st:
+                                outcome_states[st] = \
+                                    outcome_states.get(st, 0) + 1
+                    age_s = None
+                    if last_ts:
+                        try:
+                            from datetime import datetime as _dt
+                            from datetime import timezone as _tz
+                            dt = _dt.fromisoformat(
+                                str(last_ts).replace("Z", "+00:00"))
+                            if dt.tzinfo is None:
+                                dt = dt.replace(tzinfo=_tz.utc)
+                            age_s = max(0.0, (_dt.now(_tz.utc)
+                                              - dt).total_seconds())
+                        except Exception:
+                            age_s = None
                     shadow.update({"status": "online", "n_scans": n_scans,
                                    "n_trade": n_trade,
                                    "n_abstain": n_abstain,
-                                   "last_scan_utc": last_ts})
+                                   "last_scan_utc": last_ts,
+                                   "last_scan_age_s": age_s,
+                                   "candidates_by_book": by_book,
+                                   "paired_groups": paired_groups,
+                                   "outcome_states": outcome_states})
                 except Exception:
                     shadow["status"] = "stale"
+
+            # -- per-book forward evidence (read-only validation) ---------- #
+            forward = {"status": "offline", "books": []}
+            fwd_files = sorted(
+                _glob.glob(os.path.join(art, "forward_evidence_*.json")),
+                key=os.path.getmtime)
+            if fwd_files:
+                any_source = True
+                forward["status"] = "online"
+                for p in fwd_files[-8:]:
+                    entry = {"file": os.path.basename(p)}
+                    try:
+                        doc = _load(p)
+                        cov = doc.get("coverage") or {}
+                        entry.update({
+                            "book": doc.get("book"),
+                            "model_id": doc.get("model_id"),
+                            "generated_utc": doc.get("generated_utc"),
+                            "window": doc.get("window"),
+                            "forward_sessions": doc.get("forward_sessions"),
+                            "resolved_opportunities": doc.get(
+                                "resolved_opportunities"),
+                            "actual_fills": doc.get("actual_fills"),
+                            "live_fill_based": doc.get("live_fill_based"),
+                            "resolution_rate": cov.get("resolution_rate"),
+                            "n_unresolved": cov.get("n_unresolved"),
+                        })
+                        try:
+                            from oracle.ml import evidence as _ev
+                            errs = _ev.validate_forward_evidence(doc)
+                            entry["validation"] = ("valid" if not errs
+                                                   else "invalid")
+                            entry["validation_errors"] = len(errs)
+                        except Exception:
+                            entry["validation"] = "unchecked"
+                    except Exception:
+                        entry["validation"] = "unreadable"
+                    forward["books"].append(entry)
 
             verdict = "OK" if any_source else VERDICT_INSUFFICIENT
             out = {"verdict": verdict, "registry": registry,
                    "promotion": promotion, "training": training,
-                   "shadow": shadow}
+                   "shadow": shadow, "forward": forward}
             if not any_source:
                 out["hint"] = ("no Oracle4 artifacts found — run "
                                "scripts/train_oracle4.sh or deploy the "

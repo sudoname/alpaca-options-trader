@@ -119,12 +119,30 @@ function ts(v: string | null | undefined): string {
   return v ? String(v).slice(0, 16).replace('T', ' ') : '—'
 }
 
+function age(s: number | null | undefined): string {
+  if (s == null || Number.isNaN(s)) return '—'
+  if (s < 90) return `${Math.round(s)}s`
+  if (s < 5400) return `${Math.round(s / 60)}m`
+  if (s < 172800) return `${(s / 3600).toFixed(1)}h`
+  return `${(s / 86400).toFixed(1)}d`
+}
+
+function books(b: Record<string, number> | null | undefined): string {
+  const entries = Object.entries(b ?? {})
+  if (!entries.length) return '—'
+  return entries
+    .sort((x, y) => x[0].localeCompare(y[0]))
+    .map(([k, v]) => `${k}:${v}`)
+    .join(' ')
+}
+
 export function Oracle4Status() {
   const { data, isLoading } = useOracle4()
   const reg = data?.registry
   const promo = data?.promotion
   const training = data?.training
   const shadow = data?.shadow
+  const forward = data?.forward
 
   const champion = reg?.champion_id ?? null
   const approved =
@@ -178,6 +196,15 @@ export function Oracle4Status() {
                       : `${shadow.n_trade ?? 0} / ${shadow.n_abstain ?? 0}`,
                 },
                 { label: 'Last scan', value: ts(shadow?.last_scan_utc) },
+                { label: 'Prediction age', value: age(shadow?.last_scan_age_s) },
+                { label: 'Books', value: books(shadow?.candidates_by_book) },
+                {
+                  label: 'Paired / unresolved',
+                  value:
+                    shadow?.n_scans == null
+                      ? '—'
+                      : `${shadow.paired_groups ?? 0} / ${shadow.outcome_states?.unresolved ?? 0}`,
+                },
                 { label: 'Orders sent', value: '0 (by design)' },
               ]}
             />
@@ -234,6 +261,80 @@ export function Oracle4Status() {
                         </td>
                         <td className='text-muted-foreground text-left'>
                           {m.fingerprint12 ?? '—'}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          ) : null}
+
+          {forward?.books?.length ? (
+            <div className='border-border flex flex-col gap-2 border p-3'>
+              <div className='flex items-center justify-between gap-2'>
+                <span className='font-mono text-xs font-medium tracking-[0.18em] uppercase'>
+                  Forward evidence (per book)
+                </span>
+                <HealthTag status={forward?.status} />
+              </div>
+              <div className='overflow-x-auto'>
+                <table className='w-full font-mono text-xs'>
+                  <thead>
+                    <tr className='text-muted-foreground text-[10px] tracking-[0.1em] uppercase'>
+                      <th className='pr-3 text-left'>Book</th>
+                      <th className='pr-3 text-left'>Window</th>
+                      <th className='pr-3 text-right'>Sessions</th>
+                      <th className='pr-3 text-right'>Resolved</th>
+                      <th className='pr-3 text-right'>Fills</th>
+                      <th className='pr-3 text-right'>Res. rate</th>
+                      <th className='pr-3 text-left'>Live-fill</th>
+                      <th className='text-left'>Validation</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {forward.books.map((b, i) => (
+                      <tr key={`${b.file ?? b.book ?? 'fwd'}-${i}`}>
+                        <td className='pr-3 text-left'>{b.book ?? '—'}</td>
+                        <td className='pr-3 text-left'>
+                          {b.window?.start
+                            ? `${String(b.window.start).slice(0, 10)} → ${String(b.window.end ?? '').slice(0, 10)}`
+                            : '—'}
+                        </td>
+                        <td className='pr-3 text-right tabular-nums'>
+                          {b.forward_sessions ?? '—'}
+                        </td>
+                        <td className='pr-3 text-right tabular-nums'>
+                          {b.resolved_opportunities ?? '—'}
+                        </td>
+                        <td className='pr-3 text-right tabular-nums'>
+                          {b.actual_fills ?? '—'}
+                        </td>
+                        <td className='pr-3 text-right tabular-nums'>
+                          {b.resolution_rate == null
+                            ? '—'
+                            : `${(b.resolution_rate * 100).toFixed(0)}%`}
+                        </td>
+                        <td className='pr-3 text-left'>
+                          {b.live_fill_based == null
+                            ? '—'
+                            : b.live_fill_based
+                              ? 'yes'
+                              : 'no'}
+                        </td>
+                        <td className='text-left'>
+                          <span
+                            className={cn(
+                              'border px-1.5 py-0.5 text-[9px] tracking-[0.1em] uppercase',
+                              b.validation === 'valid'
+                                ? HEALTH_STYLES.online
+                                : b.validation === 'invalid'
+                                  ? HEALTH_STYLES.offline
+                                  : HEALTH_STYLES.stale
+                            )}
+                          >
+                            {b.validation ?? '—'}
+                          </span>
                         </td>
                       </tr>
                     ))}
