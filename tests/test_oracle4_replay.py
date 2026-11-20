@@ -265,14 +265,17 @@ def _occ(opt: str) -> str:
     return "SPY260220%s00500000" % ("C" if opt == "call" else "P")
 
 
-def _write_fixture(path: str, n_per_session: int = 16):
+def _write_fixture(path: str, n_per_session: int = 16, no_trade_sessions=()):
     """Separable fixture: label sign == sign(feature x).
 
     Calls get x>0 (up) and puts x<0 (down), so every traded option agrees
     with a perfect direction forecast.  One decision per session per index.
+    ``no_trade_sessions`` get features/labels but only policy_skip outcomes
+    (a genuine no-trade day that must stay on the session calendar).
     """
     feats, labels, outcomes = [], [], []
-    sessions = SESSIONS + HOLDOUT
+    sessions = SESSIONS + HOLDOUT + list(no_trade_sessions)
+    skip_all = set(no_trade_sessions)
     for session in sessions:
         for i in range(n_per_session):
             did = f"d-{session}-{i}"
@@ -291,7 +294,7 @@ def _write_fixture(path: str, n_per_session: int = 16):
                 decision_id=did, horizon="60m", label_type="direction",
                 value=1.0 if x > 0 else -1.0, status=LabelStatus.OK,
                 label_end=end, available_at=end, meta={}))
-            if i == 3:   # a policy skip: no outcome P&L recorded
+            if i == 3 or session in skip_all:   # policy skip: no P&L
                 outcomes.append(OutcomeRecord(
                     decision_id=did, status=OutcomeStatus.POLICY_SKIP,
                     gross_pnl_pct=None, net_pnl_dollars=None,
@@ -485,12 +488,57 @@ class TestRunReplay:
         stress = v["baseline_frozen"]["stop_overshoot_stress"]
         assert stress["delta_vs_unstressed"] < 0
 
-        # paired deltas exist for every available challenger
+        # paired deltas exist for every available challenger and carry the
+        # Stage F clustered-uncertainty fields (effective sample size)
         paired = art["paired_vs_baseline"]
         assert set(paired) == {"baseline_quality", "valuation_ranked",
                                "classical_gated", "combined"}
         for p in paired.values():
             assert p["bootstrap"]["n_sessions"] >= 1
+            assert p["n_nonzero_delta_sessions"] >= 0
+            assert p["ess_abs_delta"] >= 0.0
+
+        # Stage F: session calendar covers every dataset session; this
+        # fixture trades on all of them, so no_trade_sessions is empty
+        cal = art["session_calendar"]
+        assert cal["n_sessions"] == len(SESSIONS)
+        assert cal["n_traded_sessions"] == len(SESSIONS)
+        assert cal["no_trade_sessions"] == []
+
+        # Stage F: input crosschecks ran before use; the fixture valuation
+        # carries no dataset_hash and there is no calibration artifact, so
+        # both provenance checks are honestly "unknown", never fabricated
+        xc = art["input_crosschecks"]
+        assert xc["ok"] is True
+        st = {c["name"]: c["status"] for c in xc["checks"]}
+        assert st["valuation_dataset_hash_vs_dataset"] == "unknown"
+        assert st["execution_calibration_fingerprint_recorded"] == "unknown"
+
+        # Stage F: matched prediction/quote-eligible cohort accounting.
+        # min_train=2 -> the first two sessions never get predictions
+        # (14 trades each); per predicted session the wide-spread (i==1)
+        # and no-quote (i==2) trades are quote-ineligible.
+        mc = art["matched_cohort"]
+        assert mc["status"] == "ok"
+        assert mc["excluded_no_prediction"] == 14 * 2
+        assert mc["excluded_quote_ineligible"] == 2 * 3
+        assert mc["n_cohort"] == 14 * len(SESSIONS) - 14 * 2 - 2 * 3
+        gate = mc["challenger_gate"]
+        assert sum(gate.values()) == mc["n_cohort"]
+        assert gate["gated_out"] == 0   # separable fixture: never contradicted
+        for key in ("baseline_on_cohort", "challenger_on_cohort"):
+            assert set(mc[key]) == {"n_executed", "net_pnl", "profit_factor",
+                                    "sharpe_daily_ann", "max_drawdown",
+                                    "pnl_by_exit_day"}
+        assert mc["paired"]["n_nonzero_delta_sessions"] >= 0
+        assert mc["paired"]["ess_abs_delta"] >= 0.0
+
+        # Stage F: risk metrics flagged limited (no daily marks, <30
+        # sessions) and deterministic event ordering documented
+        rml = art["risk_metrics_limited"]
+        assert rml["limited"] is True
+        assert any("short sample" in r for r in rml["reasons"])
+        assert "same-timestamp cash reuse" in art["event_ordering_note"]
 
         # missing data accounted, never zeroed
         mda = art["missing_data_accounting"]
@@ -531,3 +579,74 @@ class TestRunReplay:
         assert "parity ok=True" in text
         assert "fingerprint=" in text
         assert os.path.exists(out)
+
+
+# --------------------------------------------------------------------------- #
+# Stage F (Oracle 4.0.1): session calendar + input crosschecks
+# --------------------------------------------------------------------------- #
+
+class TestStageF:
+    def test_load_session_calendar_excludes_holdout(self, tmp_path):
+        store = str(tmp_path / "ds.sqlite")
+        _write_fixture(store)
+        assert rp.load_session_calendar(store, HOLDOUT) == SESSIONS
+
+    def test_calendar_includes_no_trade_sessions(self, tmp_path):
+        # a session with features but zero executed trades must stay on the
+        # calendar and show up as a no-trade day in the replay artifact
+        store = str(tmp_path / "ds.sqlite")
+        extra = "2026-01-02"
+        _write_fixture(store, no_trade_sessions=[extra])
+        cal = rp.load_session_calendar(store, HOLDOUT)
+        assert cal == sorted([extra] + SESSIONS)
+
+        art = rp.run_replay(
+            dataset_path=store, valuation_path=None,
+            execution_calibration_path=None, holdout=HOLDOUT,
+            n_boot=10, include_neural=False)
+        sc = art["session_calendar"]
+        assert sc["n_sessions"] == len(SESSIONS) + 1
+        assert sc["n_traded_sessions"] == len(SESSIONS)
+        assert sc["no_trade_sessions"] == [extra]
+        assert extra in art["sessions_replayed"]
+        # parity is unaffected by a zero-trade day
+        assert art["parity"]["ok"] is True
+
+    def test_crosscheck_match_unknown_and_mismatch(self):
+        meta = {"dataset_hash": "abc"}
+        ok = rp.crosscheck_inputs(meta, {"dataset_hash": "abc"}, {})
+        assert ok["ok"] is True
+        st = {c["name"]: c["status"] for c in ok["checks"]}
+        assert st["valuation_dataset_hash_vs_dataset"] == "match"
+        # artifact predating provenance fields -> unknown, never guessed
+        unk = rp.crosscheck_inputs(meta, {"dataset_hash": None}, {})
+        st = {c["name"]: c["status"] for c in unk["checks"]}
+        assert st["valuation_dataset_hash_vs_dataset"] == "unknown"
+        # no valuation at all -> the check is simply absent
+        none = rp.crosscheck_inputs(meta, None, {})
+        assert "valuation_dataset_hash_vs_dataset" not in {
+            c["name"] for c in none["checks"]}
+        # positive mismatch refuses, loudly
+        with pytest.raises(ValueError, match="refusing to mix artifacts"):
+            rp.crosscheck_inputs(meta, {"dataset_hash": "WRONG"}, {})
+
+    def test_crosscheck_records_friction_fingerprint(self):
+        out = rp.crosscheck_inputs(
+            {"dataset_hash": "abc"}, None, {"source_fingerprint": "fp"})
+        st = {c["name"]: c["status"] for c in out["checks"]}
+        assert st["execution_calibration_fingerprint_recorded"] == "recorded"
+
+    def test_run_replay_refuses_mismatched_valuation(self, tmp_path):
+        # end-to-end: a valuation selection computed on a DIFFERENT dataset
+        # must be refused before any replay computation, not silently merged
+        store = str(tmp_path / "ds.sqlite")
+        val = str(tmp_path / "val.json")
+        _write_fixture(store)
+        with open(val, "w", encoding="utf-8") as fh:
+            json.dump({"report_fingerprint": "valfp",
+                       "dataset_hash": "WRONG-DATASET",
+                       "result": {"scans": []}}, fh)
+        with pytest.raises(ValueError, match="refusing to mix artifacts"):
+            rp.run_replay(dataset_path=store, valuation_path=val,
+                          execution_calibration_path=None,
+                          holdout=HOLDOUT, n_boot=10, include_neural=False)

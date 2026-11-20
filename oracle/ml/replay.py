@@ -65,6 +65,7 @@ from oracle.lab.purged_validation import (
     paired_session_bootstrap,
 )
 from oracle.ml.baselines import MultinomialLogisticModel, build_design
+from oracle.ml.evidence import kish_ess
 from oracle.ml.mlp import direction_class
 from oracle.ml.schema import parse_utc
 from oracle.ml.valuation import parse_occ_symbol
@@ -73,7 +74,9 @@ __all__ = [
     "Trade",
     "load_traded_outcomes",
     "load_valuation_selection",
+    "load_session_calendar",
     "load_friction",
+    "crosscheck_inputs",
     "gate_direction",
     "compute_oof_classical",
     "compute_oof_neural",
@@ -253,11 +256,35 @@ def load_valuation_selection(path: str) -> Tuple[Set[str], Dict[str, Any]]:
     report = {
         "path": path,
         "report_fingerprint": doc.get("report_fingerprint"),
+        "dataset_hash": doc.get("dataset_hash"),
+        "git_sha": doc.get("git_sha"),
         "scans": len(scans),
         "trade_scans": n_trade,
         "selected_ids": len(selected),
     }
     return selected, report
+
+
+def load_session_calendar(
+    dataset_path: str,
+    holdout: Sequence[str] = DEFAULT_HOLDOUT,
+) -> List[str]:
+    """Every distinct feature session in the dataset, minus holdout.
+
+    Master prompt (Oracle 4.0.1 Stage F): replay must use the SAME session
+    calendar including no-trade days -- risk metrics computed only over
+    traded sessions overstate Sharpe and understate drawdown duration.
+    Zero-trade sessions contribute a 0 equity return in ``run_portfolio``.
+    """
+    holdout_set = set(holdout)
+    conn = sqlite3.connect(f"file:{dataset_path}?mode=ro", uri=True)
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT session FROM features ORDER BY session")
+        return [r[0] for r in rows
+                if r[0] is not None and r[0] not in holdout_set]
+    finally:
+        conn.close()
 
 
 def load_friction(path: Optional[str]) -> Dict[str, Any]:
@@ -293,6 +320,62 @@ def load_friction(path: Optional[str]) -> Dict[str, Any]:
         "note": ("one_way_frac = mean paper entry-vs-mid slippage; paper "
                  "fills bound internal consistency only, so the 1.5x/2.0x "
                  "sweeps are the live-cost hedge"),
+    }
+
+
+def crosscheck_inputs(
+    meta: Dict[str, Any],
+    valuation_report: Optional[Dict[str, Any]],
+    friction: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Validate input artifacts against each other BEFORE they are used.
+
+    Master prompt (Oracle 4.0.1 Stage F): artifact hashes and dataset /
+    model / config provenance must be cross-checked; a valuation selection
+    computed on a DIFFERENT dataset must be refused, not silently merged.
+
+    Raises ``ValueError`` on a positive mismatch.  Artifacts that simply do
+    not carry the field (older fixtures) are reported as ``unknown`` --
+    absence of evidence is surfaced, not punished retroactively.
+    """
+    checks: List[Dict[str, Any]] = []
+    ds_hash = meta.get("dataset_hash")
+
+    if valuation_report is not None:
+        v_hash = valuation_report.get("dataset_hash")
+        if v_hash is None or ds_hash is None:
+            status = "unknown"
+        elif str(v_hash) == str(ds_hash):
+            status = "match"
+        else:
+            status = "mismatch"
+        checks.append({
+            "name": "valuation_dataset_hash_vs_dataset",
+            "expected": ds_hash,
+            "observed": v_hash,
+            "status": status,
+        })
+
+    checks.append({
+        "name": "execution_calibration_fingerprint_recorded",
+        "expected": None,
+        "observed": friction.get("source_fingerprint"),
+        "status": ("unknown" if friction.get("source_fingerprint") is None
+                   else "recorded"),
+    })
+
+    mismatches = [c for c in checks if c["status"] == "mismatch"]
+    if mismatches:
+        raise ValueError(
+            "input crosscheck failed; refusing to mix artifacts: "
+            + "; ".join(
+                f"{c['name']} expected={c['expected']} observed={c['observed']}"
+                for c in mismatches))
+    return {
+        "checks": checks,
+        "ok": True,
+        "note": ("mismatched artifacts raise before any replay computation; "
+                 "'unknown' means the artifact predates provenance fields"),
     }
 
 
@@ -780,14 +863,22 @@ def run_replay(
     mlp_epochs: int = 20,
 ) -> Dict[str, Any]:
     trades, trade_report = load_traded_outcomes(dataset_path, holdout)
-    sessions = sorted({t.session for t in trades})
+    traded_sessions = sorted({t.session for t in trades})
+    calendar = load_session_calendar(dataset_path, holdout)
+    # full feature-session calendar including no-trade days (Stage F);
+    # fall back to traded sessions only when the dataset carries none.
+    sessions = calendar or traded_sessions
     friction = load_friction(execution_calibration_path)
+    meta = dataset_meta(dataset_path)
 
     valuation_ids: Optional[Set[str]] = None
     valuation_report: Optional[Dict[str, Any]] = None
     if valuation_path and os.path.exists(valuation_path):
         valuation_ids, valuation_report = load_valuation_selection(
             valuation_path)
+
+    # refuse mismatched artifacts BEFORE any computation (raises ValueError)
+    input_crosschecks = crosscheck_inputs(meta, valuation_report, friction)
 
     classical_preds, classical_report = compute_oof_classical(
         dataset_path, holdout)
@@ -873,13 +964,90 @@ def run_replay(
             continue
         days = res["by_friction_mult"]["1.0"]["pnl_by_exit_day"]
         delta = _per_session_delta(days, base_days)
+        nonzero = [abs(v) for v in delta.values() if v != 0.0]
         paired[name] = {
             "per_session_delta": {k: round(v, 6) for k, v in delta.items()},
             "bootstrap": paired_session_bootstrap(
                 delta, n_boot=n_boot, seed=seed),
+            # clustered-uncertainty honesty: sessions where the challenger
+            # made no different choice carry zero delta and inflate apparent
+            # n; the Kish ESS over |delta| shows the effective sample.
+            "n_nonzero_delta_sessions": len(nonzero),
+            "ess_abs_delta": round(kish_ess(nonzero), 4),
         }
 
-    meta = dataset_meta(dataset_path)
+    # --- matched cohort: identical prediction/quote-eligible trades
+    # (Stage F) -- separates "no prediction fallback" from challenger
+    # abstention, so the model comparison is apples-to-apples instead of
+    # being obscured by rows the challenger never saw.
+    cohort = [t for t in trades
+              if t.decision_id in classical_preds and _quality_pass(t)]
+    excluded_no_prediction = sum(
+        1 for t in trades if t.decision_id not in classical_preds)
+    excluded_quote_ineligible = sum(
+        1 for t in trades
+        if t.decision_id in classical_preds and not _quality_pass(t))
+    cohort_kept: List[Trade] = []
+    cohort_acct = {"gate_passed": 0, "abstained": 0, "gated_out": 0}
+    for t in cohort:
+        p = classical_preds[t.decision_id]
+        verdict = gate_direction(t.option_type, p[0], p[1], p[2])
+        if verdict == "pass":
+            cohort_acct["gate_passed"] += 1
+            cohort_kept.append(t)
+        elif verdict == "abstain":
+            cohort_acct["abstained"] += 1
+        else:
+            cohort_acct["gated_out"] += 1
+
+    def _slim(m: Dict[str, Any]) -> Dict[str, Any]:
+        return {k: m[k] for k in (
+            "n_executed", "net_pnl", "profit_factor", "sharpe_daily_ann",
+            "max_drawdown", "pnl_by_exit_day")}
+
+    matched_cohort: Dict[str, Any]
+    if cohort:
+        base_m = run_portfolio(
+            cohort, sessions, starting_cash=starting_cash,
+            max_concurrent=max_concurrent,
+            one_way_frac=friction["one_way_frac"], friction_mult=1.0)
+        chal_m = run_portfolio(
+            cohort_kept, sessions, starting_cash=starting_cash,
+            max_concurrent=max_concurrent,
+            one_way_frac=friction["one_way_frac"], friction_mult=1.0)
+        c_delta = _per_session_delta(chal_m["pnl_by_exit_day"],
+                                     base_m["pnl_by_exit_day"])
+        c_nonzero = [abs(v) for v in c_delta.values() if v != 0.0]
+        matched_cohort = {
+            "status": "ok",
+            "n_cohort": len(cohort),
+            "excluded_no_prediction": excluded_no_prediction,
+            "excluded_quote_ineligible": excluded_quote_ineligible,
+            "challenger_gate": cohort_acct,
+            "baseline_on_cohort": _slim(base_m),
+            "challenger_on_cohort": _slim(chal_m),
+            "paired": {
+                "per_session_delta": {k: round(v, 6)
+                                      for k, v in c_delta.items()},
+                "bootstrap": paired_session_bootstrap(
+                    c_delta, n_boot=n_boot, seed=seed),
+                "n_nonzero_delta_sessions": len(c_nonzero),
+                "ess_abs_delta": round(kish_ess(c_nonzero), 4),
+            },
+            "note": ("baseline and challenger evaluated on the IDENTICAL "
+                     "prediction-covered, quote-eligible cohort at 1.0x "
+                     "friction; no-prediction fallback rows are excluded "
+                     "here (counted), so challenger abstention is not "
+                     "conflated with coverage gaps"),
+        }
+    else:
+        matched_cohort = {
+            "status": "empty",
+            "n_cohort": 0,
+            "excluded_no_prediction": excluded_no_prediction,
+            "excluded_quote_ineligible": excluded_quote_ineligible,
+            "note": "no prediction-covered quote-eligible trades",
+        }
     artifact: Dict[str, Any] = {
         "generated_for": "oracle4_phase6_paired_replay",
         "phase": 6,
@@ -906,6 +1074,16 @@ def run_replay(
         },
         "trade_universe": trade_report,
         "sessions_replayed": sessions,
+        "session_calendar": {
+            "n_sessions": len(sessions),
+            "n_traded_sessions": len(traded_sessions),
+            "no_trade_sessions": sorted(set(sessions)
+                                        - set(traded_sessions)),
+            "note": ("replay runs over the full feature-session calendar; "
+                     "zero-trade sessions contribute a 0 equity return to "
+                     "Sharpe/drawdown instead of being dropped"),
+        },
+        "input_crosschecks": input_crosschecks,
         "mtm_note": MTM_NOTE,
         "missing_data_accounting": {
             "outcome_status_counts_nonholdout":
@@ -929,6 +1107,27 @@ def run_replay(
         "parity": parity,
         "variants": results,
         "paired_vs_baseline": paired,
+        "matched_cohort": matched_cohort,
+        "risk_metrics_limited": {
+            "limited": True,
+            "reasons": [
+                ("positions are carried at entry cost between entry and "
+                 "exit (no daily option marks), so intraday/overnight "
+                 "drawdown and Sharpe volatility are UNDERSTATED"),
+            ] + ([
+                ("short sample: fewer than 30 sessions, so sqrt(252) "
+                 "annualised Sharpe is an extrapolation, not an estimate"),
+            ] if len(sessions) < 30 else []),
+            "note": ("drawdown/Sharpe here are LIMITED estimates and are "
+                     "not sufficient for promotion on their own; promotion "
+                     "requires a validated forward-evidence artifact"),
+        },
+        "event_ordering_note": (
+            "events are replayed in deterministic (timestamp, "
+            "entry-before-exit, decision_id) order; because entries sort "
+            "BEFORE exits at equal timestamps, cash credited by a "
+            "same-timestamp exit can never fund that entry -- no "
+            "same-timestamp cash reuse (conservative)"),
         "provenance_note": (
             "All P&L derives from PAPER marks recorded by the production "
             "bot; no counterfactual fills were fabricated and no broker or "
