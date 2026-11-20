@@ -8,9 +8,13 @@ import {
 import { apiGet } from './api'
 import { REFRESH_MS, useRefreshStore } from './refresh-store'
 import {
+  type AgentContributions,
   type Agents,
   type ApiEnvelope,
   type CalibrationPop,
+  type DecisionFunnel,
+  type DecisionScope,
+  type Decisions,
   type EvAttribution,
   type Episodes,
   type Explain,
@@ -80,6 +84,18 @@ export const useTradeLog = () =>
   useOracleQuery<TradeLog>('trade-log', 'trade-log')
 export const useOracle4 = () =>
   useOracleQuery<Oracle4>('oracle4', 'oracle4')
+export const useDecisions = (scope: DecisionScope) =>
+  useOracleQuery<Decisions>(
+    `decisions:${scope}`,
+    `decisions?filter=${scope}&limit=100`
+  )
+export const useDecisionFunnel = () =>
+  useOracleQuery<DecisionFunnel>('decision-funnel', 'decision-funnel')
+export const useAgentContributions = () =>
+  useOracleQuery<AgentContributions>(
+    'agent-contributions',
+    'agent-contributions'
+  )
 
 // Explain-a-Ticker: lazy, enabled only when a validated ticker is provided.
 export function useExplain(ticker: string | null) {

@@ -14,6 +14,7 @@ import { Route as AuthenticatedIndexRouteImport } from './routes/_authenticated/
 import { Route as AuthenticatedTradingRouteImport } from './routes/_authenticated/trading'
 import { Route as AuthenticatedResearchRouteImport } from './routes/_authenticated/research'
 import { Route as AuthenticatedMlRouteImport } from './routes/_authenticated/ml'
+import { Route as AuthenticatedDecisionsRouteImport } from './routes/_authenticated/decisions'
 import { Route as errors503RouteImport } from './routes/(errors)/503'
 import { Route as errors500RouteImport } from './routes/(errors)/500'
 import { Route as errors404RouteImport } from './routes/(errors)/404'
@@ -46,6 +47,11 @@ const AuthenticatedResearchRoute = AuthenticatedResearchRouteImport.update({
 const AuthenticatedMlRoute = AuthenticatedMlRouteImport.update({
   id: '/ml',
   path: '/ml',
+  getParentRoute: () => AuthenticatedRouteRoute,
+} as any)
+const AuthenticatedDecisionsRoute = AuthenticatedDecisionsRouteImport.update({
+  id: '/decisions',
+  path: '/decisions',
   getParentRoute: () => AuthenticatedRouteRoute,
 } as any)
 const errors503Route = errors503RouteImport.update({
@@ -105,6 +111,7 @@ export interface FileRoutesByFullPath {
   '/404': typeof errors404Route
   '/500': typeof errors500Route
   '/503': typeof errors503Route
+  '/decisions': typeof AuthenticatedDecisionsRoute
   '/ml': typeof AuthenticatedMlRoute
   '/research': typeof AuthenticatedResearchRoute
   '/trading': typeof AuthenticatedTradingRoute
@@ -119,6 +126,7 @@ export interface FileRoutesByTo {
   '/404': typeof errors404Route
   '/500': typeof errors500Route
   '/503': typeof errors503Route
+  '/decisions': typeof AuthenticatedDecisionsRoute
   '/ml': typeof AuthenticatedMlRoute
   '/research': typeof AuthenticatedResearchRoute
   '/trading': typeof AuthenticatedTradingRoute
@@ -136,6 +144,7 @@ export interface FileRoutesById {
   '/(errors)/404': typeof errors404Route
   '/(errors)/500': typeof errors500Route
   '/(errors)/503': typeof errors503Route
+  '/_authenticated/decisions': typeof AuthenticatedDecisionsRoute
   '/_authenticated/ml': typeof AuthenticatedMlRoute
   '/_authenticated/research': typeof AuthenticatedResearchRoute
   '/_authenticated/trading': typeof AuthenticatedTradingRoute
@@ -154,6 +163,7 @@ export interface FileRouteTypes {
     | '/404'
     | '/500'
     | '/503'
+    | '/decisions'
     | '/ml'
     | '/research'
     | '/trading'
@@ -168,6 +178,7 @@ export interface FileRouteTypes {
     | '/404'
     | '/500'
     | '/503'
+    | '/decisions'
     | '/ml'
     | '/research'
     | '/trading'
@@ -184,6 +195,7 @@ export interface FileRouteTypes {
     | '/(errors)/404'
     | '/(errors)/500'
     | '/(errors)/503'
+    | '/_authenticated/decisions'
     | '/_authenticated/ml'
     | '/_authenticated/research'
     | '/_authenticated/trading'
@@ -238,6 +250,13 @@ declare module '@tanstack/react-router' {
       path: '/ml'
       fullPath: '/ml'
       preLoaderRoute: typeof AuthenticatedMlRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
+    '/_authenticated/decisions': {
+      id: '/_authenticated/decisions'
+      path: '/decisions'
+      fullPath: '/decisions'
+      preLoaderRoute: typeof AuthenticatedDecisionsRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
     '/(errors)/503': {
@@ -307,6 +326,7 @@ declare module '@tanstack/react-router' {
 }
 
 interface AuthenticatedRouteRouteChildren {
+  AuthenticatedDecisionsRoute: typeof AuthenticatedDecisionsRoute
   AuthenticatedMlRoute: typeof AuthenticatedMlRoute
   AuthenticatedResearchRoute: typeof AuthenticatedResearchRoute
   AuthenticatedTradingRoute: typeof AuthenticatedTradingRoute
@@ -314,6 +334,7 @@ interface AuthenticatedRouteRouteChildren {
 }
 
 const AuthenticatedRouteRouteChildren: AuthenticatedRouteRouteChildren = {
+  AuthenticatedDecisionsRoute: AuthenticatedDecisionsRoute,
   AuthenticatedMlRoute: AuthenticatedMlRoute,
   AuthenticatedResearchRoute: AuthenticatedResearchRoute,
   AuthenticatedTradingRoute: AuthenticatedTradingRoute,

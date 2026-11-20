@@ -3,6 +3,7 @@ import { Link } from '@tanstack/react-router'
 const SECTIONS = [
   { to: '/', label: 'Overview', exact: true },
   { to: '/trading', label: 'Trading', exact: false },
+  { to: '/decisions', label: 'Decisions', exact: false },
   { to: '/research', label: 'Research', exact: false },
   { to: '/ml', label: 'ML', exact: false },
 ] as const

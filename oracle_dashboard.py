@@ -550,6 +550,48 @@ def create_app(config: "DashboardConfig" = None) -> Flask:
             return slr.compute_trade_log(limit)
         return _cached_json(f"trade-log:{limit}", provider)
 
+    # -- decisions: per-decision log from the RL episode store ------------ #
+    # Read-only SELECTs over episodes.db via decision_reports. Fail-open:
+    # missing db yields INSUFFICIENT_DATA. ?limit= is clamped 1-200 and
+    # ?filter= (traded|blocked|all) both keyed into the cache. SKIP rows carry
+    # counterfactual P/L and are flagged pnl_is_counterfactual.
+    @app.route("/api/decisions")
+    def decisions():
+        try:
+            limit = int(request.args.get("limit", "50"))
+        except (TypeError, ValueError):
+            limit = 50
+        limit = max(1, min(limit, 200))
+        scope = request.args.get("filter", "all")
+        if scope not in ("traded", "blocked", "all"):
+            scope = "all"
+
+        def provider():
+            import decision_reports as dr
+            return dr.compute_decision_log(limit=limit, scope=scope)
+        return _cached_json(f"decisions:{scope}:{limit}", provider)
+
+    # -- decision funnel: action/mode/outcome mix + block reasons ---------- #
+    # Pure SQL GROUP BYs over episodes.db (never parses features_json).
+    # Fail-open: missing db yields INSUFFICIENT_DATA.
+    @app.route("/api/decision-funnel")
+    def decision_funnel():
+        def provider():
+            import decision_reports as dr
+            return dr.compute_decision_funnel()
+        return _cached_json("decision-funnel", provider)
+
+    # -- agent contributions: per-agent vote quality on real trades -------- #
+    # Scans the newest capped window of resolved CALL/PUT episodes and scores
+    # each voting agent (agreement + hit rates). Fail-open as above; the first
+    # hit pays the JSON-parse cost, then the TTL cache absorbs it.
+    @app.route("/api/agent-contributions")
+    def agent_contributions():
+        def provider():
+            import decision_reports as dr
+            return dr.compute_agent_contributions()
+        return _cached_json("agent-contributions", provider)
+
     # -- node status: health of the trading stack ------------------------- #
     # Read-only over scheduler_status.json (heartbeat/mode/PDT), the trade
     # stores (last fill, open count), and research_ledger.db (row counts).
@@ -1006,7 +1048,8 @@ def _self_test() -> int:
         "/api/single-leg/kpis", "/api/single-leg/positions",
         "/api/single-leg/episodes", "/api/put-time-stop",
         "/api/shadow-research", "/api/node-status", "/api/trade-log",
-        "/api/oracle4",
+        "/api/oracle4", "/api/decisions", "/api/decision-funnel",
+        "/api/agent-contributions",
     )
     for path in endpoints:
         r = client.get(path)

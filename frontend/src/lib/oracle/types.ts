@@ -415,6 +415,103 @@ export type Oracle4 = ApiEnvelope & {
   }
 }
 
+// Decisions section: /api/decisions, /api/decision-funnel,
+// /api/agent-contributions (decision_reports.py over episodes.db).
+export type AgentVote = {
+  agent?: string
+  bull?: number | null
+  bear?: number | null
+  conf?: number | null
+  net?: number | null
+}
+
+export type DecisionGate = {
+  veto?: boolean | null
+  reason?: string | null
+  q?: number | null
+  visits?: number | null
+  confidence?: number | null
+}
+
+export type DecisionRow = {
+  decision_id?: string | null
+  as_of?: string | null
+  symbol?: string | null
+  underlying?: string | null
+  strat?: string | null
+  rule_action?: string | null
+  rule_confidence?: number | null
+  chosen_action?: string | null
+  qty?: number | null
+  mode?: string | null
+  gate?: DecisionGate | null
+  block_reason?: string | null
+  block_reason_full?: string | null
+  block_reason_prefix?: string | null
+  outcome?: string | null
+  net_pnl_pct?: number | null
+  net_pnl_dollars?: number | null
+  hold_days?: number | null
+  pnl_is_counterfactual?: boolean
+  regime_label?: string | null
+  regime_confidence?: number | null
+  conviction?: number | null
+  direction?: string | null
+  agent_votes?: AgentVote[] | null
+}
+
+export type DecisionScope = 'all' | 'traded' | 'blocked'
+
+export type Decisions = ApiEnvelope & {
+  scope?: string
+  limit?: number | null
+  count?: number | null
+  total?: number | null
+  rows?: DecisionRow[]
+}
+
+export type FunnelStage = {
+  stage?: string
+  count?: number | null
+}
+
+export type BlockReason = {
+  prefix?: string
+  count?: number | null
+}
+
+export type DecisionFunnel = ApiEnvelope & {
+  total?: number | null
+  completed?: number | null
+  open?: number | null
+  by_chosen_action?: Record<string, number>
+  by_mode?: Record<string, number>
+  by_outcome?: Record<string, number>
+  block_reasons?: BlockReason[]
+  funnel?: FunnelStage[]
+}
+
+export type AgentContribution = {
+  agent?: string
+  n?: number | null
+  agreement_rate?: number | null
+  hit_rate_when_agreeing?: number | null
+  hit_rate_when_bullish?: number | null
+  n_bullish?: number | null
+  hit_rate_when_bearish?: number | null
+  n_bearish?: number | null
+  mean_net_win?: number | null
+  mean_net_loss?: number | null
+  mean_conf?: number | null
+}
+
+export type AgentContributions = ApiEnvelope & {
+  cap?: number | null
+  n_trades?: number | null
+  n_with_votes?: number | null
+  agents?: AgentContribution[]
+}
+
 export type Oracle4ForwardBook = {
   file?: string | null
   book?: string | null
