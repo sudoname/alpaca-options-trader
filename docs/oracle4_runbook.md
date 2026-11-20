@@ -33,8 +33,9 @@ keep it next to the sqlite.
 ### 1.2 Train challengers (purged walk-forward, OOF predictions)
 
 ```bash
-# classical (ridge logistic etc.)
-python -m oracle.ml.train --model classical \
+# classical challenger (ridge logistic + Platt). Valid --model values:
+# logistic, naive, quantile, rv, hazard, gbm, mlp
+python -m oracle.ml.train --model logistic \
   --dataset artifacts/oracle4/dataset_v1.sqlite \
   --out artifacts/oracle4/classical.json
 

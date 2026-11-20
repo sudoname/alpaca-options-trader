@@ -678,6 +678,190 @@ def create_app(config: "DashboardConfig" = None) -> Flask:
             return data
         return _cached_json("shadow-pnl", provider)
 
+    @app.route("/api/oracle4")
+    def oracle4():
+        """Oracle4 research pipeline status: model registry, latest training
+        metrics, promotion-report verdict and forward-shadow activity. All
+        sources are research artifacts under artifacts/oracle4/ plus the
+        observe-only oracle4_shadow.jsonl — read-only and fail-open; this
+        route cannot register, approve, promote, or trade anything."""
+        def provider():
+            import glob as _glob
+            import json as _json
+
+            art = "artifacts/oracle4"
+            any_source = False
+
+            def _load(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    return _json.load(f)
+
+            # -- registry (champion/challenger governance) ----------------- #
+            registry = {"status": "offline", "champion_id": None,
+                        "n_models": None, "models": []}
+            reg_path = os.path.join(art, "registry.json")
+            if os.path.isfile(reg_path):
+                any_source = True
+                try:
+                    reg = _load(reg_path)
+                    models = reg.get("models") or {}
+                    registry["champion_id"] = reg.get("champion_id")
+                    registry["n_models"] = len(models)
+                    for mid in sorted(models):
+                        m = models[mid]
+                        if not isinstance(m, dict):
+                            continue
+                        cks = m.get("checksums") or {}
+                        head = str(cks.get("artifact")
+                                   or next(iter(sorted(cks.values())), ""))
+                        registry["models"].append({
+                            "model_id": mid,
+                            "kind": m.get("kind"),
+                            "role": m.get("role"),
+                            "approval_state": m.get("approval_state"),
+                            "approved_by": m.get("approved_by"),
+                            "registered_utc": m.get("registered_utc"),
+                            "checksum12": head[:12] or None,
+                        })
+                    registry["status"] = "online"
+                except Exception:
+                    registry["status"] = "stale"
+
+            # -- latest promotion report (read-only verdict) --------------- #
+            promotion = {"status": "offline"}
+            reports = sorted(
+                _glob.glob(os.path.join(art, "promotion_report*.json")),
+                key=os.path.getmtime)
+            if reports:
+                any_source = True
+                try:
+                    rep = _load(reports[-1])
+                    gates = [
+                        {"name": g.get("name"), "status": g.get("status"),
+                         "observed": g.get("observed"),
+                         "requirement": g.get("requirement")}
+                        for g in (rep.get("gates") or [])
+                        if isinstance(g, dict)
+                    ]
+                    promotion = {
+                        "status": "online",
+                        "file": os.path.basename(reports[-1]),
+                        "verdict": rep.get("verdict"),
+                        "verdict_reason": rep.get("verdict_reason"),
+                        "variant": rep.get("variant"),
+                        "baseline": rep.get("baseline"),
+                        "generated_utc": rep.get("generated_utc"),
+                        "n_pass": rep.get("n_pass"),
+                        "n_fail": rep.get("n_fail"),
+                        "n_insufficient": rep.get("n_insufficient"),
+                        "gates": gates[:20],
+                    }
+                except Exception:
+                    promotion = {"status": "stale"}
+
+            # -- latest training artifacts (one per --model value) --------- #
+            skip = ("manifest", "registry", "promotion", "valuation",
+                    "replay", "folds", "execution", "holdout", "dataset")
+            train_files = [
+                p for p in _glob.glob(os.path.join(art, "*.json"))
+                if not any(s in os.path.basename(p).lower() for s in skip)
+            ]
+            latest_by_model = {}
+            for p in sorted(train_files, key=os.path.getmtime):
+                try:
+                    doc = _load(p)
+                except Exception:
+                    continue
+                if not isinstance(doc, dict) or "report_fingerprint" not in doc:
+                    continue
+                latest_by_model[str(doc.get("model"))] = (p, doc)
+            training = {"status": "offline", "models": []}
+            if latest_by_model:
+                any_source = True
+                training["status"] = "online"
+            for name in sorted(latest_by_model):
+                p, doc = latest_by_model[name]
+                res = doc.get("result") or {}
+                # pooled metrics live in different places per model family
+                pooled = (((res.get("challenger") or {}).get("pooled"))
+                          or ((res.get("heads") or {}).get("direction") or {})
+                          .get("pooled") or {})
+                comp = (res.get("comparators")
+                        or ((res.get("heads") or {}).get("direction") or {})
+                        .get("comparators") or {})
+                const = comp.get("constant") or {}
+                sess = doc.get("sessions") or {}
+                folds = sess.get("folds") if isinstance(sess, dict) else None
+                training["models"].append({
+                    "file": os.path.basename(p),
+                    "model": doc.get("model"),
+                    "horizon": doc.get("horizon"),
+                    "label_type": doc.get("label_type"),
+                    "device": (doc.get("device")
+                               or (res.get("device") if isinstance(
+                                   res.get("device"), str) else None)),
+                    "fingerprint12": str(
+                        doc.get("report_fingerprint") or "")[:12] or None,
+                    "dataset_hash12": str(
+                        doc.get("dataset_hash") or "")[:12] or None,
+                    "n": pooled.get("n"),
+                    "accuracy": pooled.get("accuracy"),
+                    "log_loss": pooled.get("log_loss"),
+                    "brier": pooled.get("brier"),
+                    "ece": pooled.get("ece"),
+                    "baseline_accuracy": const.get("accuracy"),
+                    "baseline_log_loss": const.get("log_loss"),
+                    "n_folds": len(folds) if isinstance(folds, list) else None,
+                    "holdout": sess.get("holdout")
+                    if isinstance(sess, dict) else None,
+                })
+
+            # -- forward shadow log (observe-only JSONL) ------------------- #
+            shadow = {"status": "offline", "n_scans": None, "n_trade": None,
+                      "n_abstain": None, "last_scan_utc": None}
+            shadow_path = os.getenv("ORACLE4_SHADOW_JSONL",
+                                    "oracle4_shadow.jsonl")
+            if os.path.isfile(shadow_path):
+                any_source = True
+                try:
+                    n_scans = n_trade = n_abstain = 0
+                    last_ts = None
+                    with open(shadow_path, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            n_scans += 1
+                            try:
+                                rec = _json.loads(line)
+                            except ValueError:
+                                continue
+                            dec = (rec.get("challenger") or {}).get("decision")
+                            if dec == "trade":
+                                n_trade += 1
+                            elif dec == "abstain":
+                                n_abstain += 1
+                            ts = rec.get("at") or rec.get("timestamp")
+                            if ts:
+                                last_ts = ts
+                    shadow.update({"status": "online", "n_scans": n_scans,
+                                   "n_trade": n_trade,
+                                   "n_abstain": n_abstain,
+                                   "last_scan_utc": last_ts})
+                except Exception:
+                    shadow["status"] = "stale"
+
+            verdict = "OK" if any_source else VERDICT_INSUFFICIENT
+            out = {"verdict": verdict, "registry": registry,
+                   "promotion": promotion, "training": training,
+                   "shadow": shadow}
+            if not any_source:
+                out["hint"] = ("no Oracle4 artifacts found — run "
+                               "scripts/train_oracle4.sh or deploy the "
+                               "oracle4-research branch")
+            return out
+        return _cached_json("oracle4", provider)
+
     # -- static frontend ------------------------------------------------- #
     @app.route("/")
     def index():
@@ -735,6 +919,7 @@ def _self_test() -> int:
         "/api/single-leg/kpis", "/api/single-leg/positions",
         "/api/single-leg/episodes", "/api/put-time-stop",
         "/api/shadow-research", "/api/node-status", "/api/trade-log",
+        "/api/oracle4",
     )
     for path in endpoints:
         r = client.get(path)

@@ -10,6 +10,7 @@ import { Hypotheses } from './components/hypotheses'
 import { KpiRow } from './components/kpi-row'
 import { NodeStatus } from './components/node-status'
 import { OpenPositions } from './components/open-positions'
+import { Oracle4Status } from './components/oracle4-status'
 import { ProbabilityCalibration } from './components/probability-calibration'
 import { PutTimeStop } from './components/put-time-stop'
 import { RegimeCard } from './components/regime-card'
@@ -74,6 +75,10 @@ export function Dashboard() {
 
         <div className='mt-4'>
           <ShadowResearch />
+        </div>
+
+        <div className='mt-4'>
+          <Oracle4Status />
         </div>
 
         <div className='mt-4'>

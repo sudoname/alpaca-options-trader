@@ -332,3 +332,74 @@ export type ShadowPnl = ApiEnvelope & {
   age_s?: number | null
   stale?: boolean
 }
+
+// Oracle4 research pipeline (registry / training / promotion / shadow): /api/oracle4
+export type Oracle4RegistryModel = {
+  model_id?: string | null
+  kind?: string | null
+  role?: string | null
+  approval_state?: string | null
+  approved_by?: string | null
+  registered_utc?: string | null
+  checksum12?: string | null
+}
+
+export type Oracle4Gate = {
+  name?: string | null
+  status?: string | null
+  observed?: string | number | null
+  requirement?: string | null
+}
+
+export type Oracle4TrainedModel = {
+  file?: string | null
+  model?: string | null
+  horizon?: string | null
+  label_type?: string | null
+  device?: string | null
+  fingerprint12?: string | null
+  dataset_hash12?: string | null
+  n?: number | null
+  accuracy?: number | null
+  log_loss?: number | null
+  brier?: number | null
+  ece?: number | null
+  baseline_accuracy?: number | null
+  baseline_log_loss?: number | null
+  n_folds?: number | null
+  holdout?: string[] | null
+}
+
+export type Oracle4 = ApiEnvelope & {
+  hint?: string | null
+  registry?: {
+    status?: NodeHealth
+    champion_id?: string | null
+    n_models?: number | null
+    models?: Oracle4RegistryModel[]
+  }
+  promotion?: {
+    status?: NodeHealth
+    file?: string | null
+    verdict?: string | null
+    verdict_reason?: string | null
+    variant?: string | null
+    baseline?: string | null
+    generated_utc?: string | null
+    n_pass?: number | null
+    n_fail?: number | null
+    n_insufficient?: number | null
+    gates?: Oracle4Gate[]
+  }
+  training?: {
+    status?: NodeHealth
+    models?: Oracle4TrainedModel[]
+  }
+  shadow?: {
+    status?: NodeHealth
+    n_scans?: number | null
+    n_trade?: number | null
+    n_abstain?: number | null
+    last_scan_utc?: string | null
+  }
+}

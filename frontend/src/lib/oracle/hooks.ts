@@ -18,6 +18,7 @@ import {
   type Hypotheses,
   type Kpis,
   type NodeStatus,
+  type Oracle4,
   type Positions,
   type Probability,
   type PutTimeStop,
@@ -77,6 +78,8 @@ export const useNodeStatus = () =>
   useOracleQuery<NodeStatus>('node-status', 'node-status')
 export const useTradeLog = () =>
   useOracleQuery<TradeLog>('trade-log', 'trade-log')
+export const useOracle4 = () =>
+  useOracleQuery<Oracle4>('oracle4', 'oracle4')
 
 // Explain-a-Ticker: lazy, enabled only when a validated ticker is provided.
 export function useExplain(ticker: string | null) {
