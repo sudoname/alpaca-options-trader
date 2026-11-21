@@ -1105,7 +1105,9 @@ def run_valuation(dataset_path: str, sessions: Sequence[str],
                   config: ValuationConfig, seed: int,
                   bars_db: Optional[str] = None,
                   registry_path: Optional[str] = None,
-                  model_id: Optional[str] = None) -> Dict[str, Any]:
+                  model_id: Optional[str] = None,
+                  forecast_max_staleness_days: Optional[int] = None
+                  ) -> Dict[str, Any]:
     """Value every candidate over *sessions*.
 
     4.0.1-A: when ``bars_db`` is given, per-scan history comes from the
@@ -1138,7 +1140,11 @@ def run_valuation(dataset_path: str, sessions: Sequence[str],
     if registry_path and model_id:
         try:
             from oracle.ml.forecast import get_provider
-            provider = get_provider(registry_path, model_id)
+            provider_kw: Dict[str, Any] = {}
+            if forecast_max_staleness_days is not None:
+                provider_kw["max_staleness_days"] = \
+                    forecast_max_staleness_days
+            provider = get_provider(registry_path, model_id, **provider_kw)
         except Exception as e:  # ForecastUnavailable or import failure
             forecast_note = (e.to_dict() if hasattr(e, "to_dict")
                              else {"available": False,
@@ -1307,6 +1313,7 @@ def run_valuation(dataset_path: str, sessions: Sequence[str],
         "forecast": {
             "registry": registry_path,
             "model_id": model_id,
+            "max_staleness_days_override": forecast_max_staleness_days,
             "provider_note": forecast_note,
             "scan_modes": dict(sorted(scan_modes.items())),
         },
@@ -1355,6 +1362,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         "forecasts, falling open to the labeled baseline")
     p.add_argument("--model-id", default=None,
                    help="registered model id to forecast with")
+    p.add_argument("--forecast-max-staleness-days", type=int, default=None,
+                   help="override the provider MODEL_STALE window (days "
+                        "past the model's train_end before forecasts are "
+                        "refused); default: provider default")
     args = p.parse_args(argv)
 
     config = ValuationConfig(n_paths=args.n_paths,
@@ -1385,10 +1396,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "bars_db": args.bars_db,
         "registry": args.registry,
         "model_id": args.model_id,
-        "result": run_valuation(args.dataset, sessions, config, args.seed,
-                                bars_db=args.bars_db,
-                                registry_path=args.registry,
-                                model_id=args.model_id),
+        "result": run_valuation(
+            args.dataset, sessions, config, args.seed,
+            bars_db=args.bars_db,
+            registry_path=args.registry,
+            model_id=args.model_id,
+            forecast_max_staleness_days=args.forecast_max_staleness_days),
     }
     clean = _py(report)
     from oracle.lab.purged_validation import metrics_fingerprint

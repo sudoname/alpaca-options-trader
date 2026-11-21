@@ -30,6 +30,8 @@ SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519_1}"
 REMOTE_LEDGER="${REMOTE_LEDGER:-/var/www/alps/research_ledger.db}"
 ART="${ART:-artifacts/oracle4}"
 SEED="${SEED:-42}"
+N_PATHS="${N_PATHS:-512}"
+REGISTRY="${REGISTRY:-${ART}/registry.json}"
 
 TAG="$(date +%Y%m%d)"
 SKIP_FETCH=0
@@ -97,15 +99,87 @@ print("REVIEW the per-fold negative-control metrics above manually before trusti
 sys.exit(1 if bad else 0)
 PYEOF
 
+# ---- 3b. walk-forward forecaster -----------------------------------------------
+# The standard MLP trains on ALL fold sessions, so its train window covers every
+# session the valuation step scans -> forecasts would be refused (TRAIN_OVERLAP)
+# and the run silently degrades to all-baseline. Train a second MLP with an
+# enlarged holdout so the later ~40% of sessions are genuinely out-of-sample for
+# it; valuation over those sessions can then use real forecast conditioning.
+step "3b/6 train walk-forward forecaster MLP (earlier train window so valuation sessions are OOS)"
+FC_HOLDOUT="$("${PY}" - "${DATASET}" <<'PYEOF'
+import sys
+from oracle.lab.purged_validation import HORIZON_EMBARGO_SESSIONS, load_samples, make_folds
+samples = load_samples(sys.argv[1], "60m", "direction")
+_f, fold_sessions, holdout = make_folds(
+    samples, test_block_sessions=1, min_train_sessions=2,
+    embargo_sessions=HORIZON_EMBARGO_SESSIONS.get("60m", 1), holdout_sessions=2)
+total = len(fold_sessions) + len(holdout)
+print(max(3, int(round(total * 0.4))))
+PYEOF
+)"
+echo "  forecaster holdout_sessions=${FC_HOLDOUT}"
+"${PY}" -m oracle.ml.train --model mlp \
+  --dataset "${DATASET}" \
+  --out "${ART}/mlp_fc_${TAG}.json" \
+  --fold-config "{\"holdout_sessions\": ${FC_HOLDOUT}}" \
+  --device auto --seed "${SEED}"
+
+# ---- 3c. auto-register challengers ----------------------------------------------
+# Every trained model is registered as an UNAPPROVED challenger. Registration
+# never changes what production uses; approval + champion promotion stay manual.
+# Model ids carry an artifact-checksum suffix so reruns are idempotent and a
+# retrain under the same tag gets a fresh id (registry artifacts are immutable).
+step "3c/6 auto-register challengers (unapproved; registry governs promotion)"
+sfx() { "${PY}" -c "import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest()[:8])" "$1"; }
+LOG_ID="logistic_${TAG}_$(sfx "${ART}/logistic_${TAG}.json")"
+"${PY}" -m oracle.ml.registry --registry "${REGISTRY}" register \
+  --model-id "${LOG_ID}" --kind classical \
+  --artifact "${ART}/logistic_${TAG}.json" \
+  --notes "auto-registered challenger (train_oracle4.sh, tag ${TAG})"
+MLP_ID="mlp_${TAG}_$(sfx "${ART}/mlp_${TAG}_manifest.json")"
+"${PY}" -m oracle.ml.registry --registry "${REGISTRY}" register \
+  --model-id "${MLP_ID}" --kind neural \
+  --artifact "${ART}/mlp_${TAG}_model.pt" \
+  --manifest "${ART}/mlp_${TAG}_manifest.json" \
+  --notes "auto-registered challenger (train_oracle4.sh, tag ${TAG})"
+FC_MODEL_ID="mlp_fc_${TAG}_$(sfx "${ART}/mlp_fc_${TAG}_manifest.json")"
+"${PY}" -m oracle.ml.registry --registry "${REGISTRY}" register \
+  --model-id "${FC_MODEL_ID}" --kind neural \
+  --artifact "${ART}/mlp_fc_${TAG}_model.pt" \
+  --manifest "${ART}/mlp_fc_${TAG}_manifest.json" \
+  --notes "walk-forward forecaster (holdout_sessions=${FC_HOLDOUT}) for forecast-conditioned valuation, tag ${TAG}"
+
 # ---- 4. valuation ---------------------------------------------------------------
-step "4/6 scenario valuation"
+step "4/6 scenario valuation (baseline, no forecast model)"
 "${PY}" -m oracle.ml.valuation \
   --dataset "${DATASET}" \
   --out "${ART}/valuation_${TAG}.json" \
-  --n-paths 512 --step-minutes 5 --seed "${SEED}"
+  --n-paths "${N_PATHS}" --step-minutes 5 --seed "${SEED}"
+
+# ---- 4b. forecast-conditioned valuation -------------------------------------------
+step "4b/6 forecast-conditioned valuation (model ${FC_MODEL_ID})"
+"${PY}" -m oracle.ml.valuation \
+  --dataset "${DATASET}" \
+  --out "${ART}/valuation_fc_${TAG}.json" \
+  --registry "${REGISTRY}" --model-id "${FC_MODEL_ID}" \
+  --n-paths "${N_PATHS}" --step-minutes 5 --seed "${SEED}"
+"${PY}" - "${ART}/valuation_fc_${TAG}.json" <<'PYEOF'
+import json, sys
+rep = json.load(open(sys.argv[1], encoding="utf-8"))
+fc = rep.get("result", rep).get("forecast") or {}
+modes = fc.get("scan_modes") or {}
+n_fc = sum(v for k, v in modes.items() if k == "forecast_conditioned")
+print(f"  forecast scan_modes: {modes}")
+print(f"  model_id: {fc.get('model_id')}  provider_note: {fc.get('provider_note')}")
+if n_fc == 0:
+    print("  WARNING: zero forecast_conditioned scans — every forecast was "
+          "refused (TRAIN_OVERLAP/MODEL_STALE) or the provider failed to load. "
+          "The fc valuation is effectively baseline; do NOT read it as "
+          "model-conditioned evidence.")
+PYEOF
 
 # ---- 5. replay -------------------------------------------------------------------
-step "5/6 paired replay vs frozen baseline"
+step "5/6 paired replay vs frozen baseline (baseline valuation)"
 EXEC_CAL=""
 [[ -f "${ART}/execution_calibration.json" ]] && EXEC_CAL="--execution-calibration ${ART}/execution_calibration.json"
 "${PY}" -m oracle.ml.replay \
@@ -114,27 +188,45 @@ EXEC_CAL=""
   ${EXEC_CAL} \
   --out "${ART}/replay_${TAG}.json" --seed "${SEED}"
 
+# ---- 5b. replay on the forecast-conditioned valuation ------------------------------
+step "5b/6 paired replay vs frozen baseline (forecast-conditioned valuation)"
+"${PY}" -m oracle.ml.replay \
+  --dataset "${DATASET}" \
+  --valuation "${ART}/valuation_fc_${TAG}.json" \
+  ${EXEC_CAL} \
+  --out "${ART}/replay_fc_${TAG}.json" --seed "${SEED}"
+
 # ---- 6. promotion report ----------------------------------------------------------
-step "6/6 promotion report (read-only; never auto-promotes)"
+step "6/6 promotion reports (read-only; never auto-promotes)"
 "${PY}" -m oracle.ml.promotion \
   --replay "${ART}/replay_${TAG}.json" \
   --execution "${ART}/execution_calibration.json" \
   --out "${ART}/promotion_report_${TAG}.json"
+"${PY}" -m oracle.ml.promotion \
+  --replay "${ART}/replay_fc_${TAG}.json" \
+  --execution "${ART}/execution_calibration.json" \
+  --out "${ART}/promotion_report_fc_${TAG}.json"
 
 step "DONE"
 cat <<EOF
 
 Artifacts (tag ${TAG}) in ${ART}/:
   dataset_${TAG}.sqlite / _manifest.json
-  logistic_${TAG}.json, mlp_${TAG}.json (+ _model.pt, _manifest.json)
-  valuation_${TAG}.json, replay_${TAG}.json, promotion_report_${TAG}.json
+  logistic_${TAG}.json, mlp_${TAG}.json, mlp_fc_${TAG}.json (+ _model.pt, _manifest.json)
+  valuation_${TAG}.json, valuation_fc_${TAG}.json
+  replay_${TAG}.json, replay_fc_${TAG}.json
+  promotion_report_${TAG}.json, promotion_report_fc_${TAG}.json
+
+Registered challengers (unapproved; in ${REGISTRY}):
+  ${LOG_ID}
+  ${MLP_ID}
+  ${FC_MODEL_ID}
 
 Next steps (all manual, by design):
-  * inspect the promotion report verdict:
+  * inspect the promotion verdicts:
       ${PY} -c "import json;print(json.load(open('${ART}/promotion_report_${TAG}.json'))['verdict'])"
-  * register the MLP under a NEW model id (artifacts are immutable):
-      ${PY} -m oracle.ml.registry register --model-id mlp_${TAG} --kind neural \\
-        --artifact ${ART}/mlp_${TAG}.json --notes "trained ${STAMP}"
-  * promotion to champion always requires a human:
-      ${PY} -m oracle.ml.registry approve --model-id mlp_${TAG} --approved-by <your-name>
+      ${PY} -c "import json;print(json.load(open('${ART}/promotion_report_fc_${TAG}.json'))['verdict'])"
+  * approval always requires a human (nothing here auto-promotes):
+      ${PY} -m oracle.ml.registry --registry ${REGISTRY} approve --model-id ${FC_MODEL_ID} --approved-by <your-name>
+      ${PY} -m oracle.ml.registry --registry ${REGISTRY} set-champion --model-id ${FC_MODEL_ID} --approved-by <your-name>
 EOF
