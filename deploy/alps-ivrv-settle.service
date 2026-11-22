@@ -1,0 +1,11 @@
+[Unit]
+Description=Oracle IV/RV paper intrinsic settlement
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/var/www/alps
+ExecStart=/var/www/alps/venv/bin/python iv_rv_experiment.py --settle
+StandardOutput=journal
+StandardError=journal

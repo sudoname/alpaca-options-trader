@@ -1,0 +1,11 @@
+[Unit]
+Description=Oracle read-only broker activity capture (paper account)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/var/www/alps
+ExecStart=/var/www/alps/venv/bin/python broker_activity_capture.py --account paper --once --db evidence_capture/broker_activities.sqlite --csv evidence_capture/account_activities.csv
+StandardOutput=journal
+StandardError=journal

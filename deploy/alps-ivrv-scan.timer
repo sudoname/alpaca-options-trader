@@ -1,0 +1,9 @@
+[Unit]
+Description=Scan IV/RV paper candidates at 11:00 New York time
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 11:00:00 America/New_York
+Unit=alps-ivrv-scan.service
+
+[Install]
+WantedBy=timers.target

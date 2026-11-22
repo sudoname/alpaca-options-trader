@@ -1,0 +1,10 @@
+[Unit]
+Description=Settle IV/RV paper positions after New York close
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 17:00:00 America/New_York
+Persistent=true
+Unit=alps-ivrv-settle.service
+
+[Install]
+WantedBy=timers.target

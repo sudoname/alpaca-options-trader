@@ -1,0 +1,16 @@
+[Unit]
+Description=Oracle observe-only option quote capture
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/var/www/alps
+ExecStart=/var/www/alps/venv/bin/python quote_capture.py --interval 5 --observations --market-hours-only --db research_ledger.db --paper-positions iv_rv_paper_positions.json --out-dir evidence_capture/quote_ticks
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
