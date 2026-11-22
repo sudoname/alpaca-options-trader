@@ -44,6 +44,12 @@ def tick(ts, bid, ask, **kw):
 
 
 class TriggerVsExecutionTest(unittest.TestCase):
+    def test_collector_provenance_is_indicative_not_synthetic(self):
+        r = replay_exit_path(TRADE, LEVELS, [
+            tick("2026-11-20T14:30:01+00:00", 0.80, 0.82,
+                 provenance="indicative_latest")], trigger_source="bid")
+        self.assertEqual(r["provenance"], "indicative")
+
     def test_take_profit_triggers_at_mid_fills_at_bid_minus_slippage(self):
         r = replay_exit_path(TRADE, LEVELS, [
             tick("2026-01-02T10:00:00", 1.04, 1.06),

@@ -257,6 +257,16 @@ def open_one(tmp_path):
     return cfg
 
 
+def test_scan_records_iv_source_and_all_spread_leg_quotes(tmp_path):
+    cfg = open_one(tmp_path)
+    row = [json.loads(x) for x in open(cfg.scan_ledger, encoding="utf-8")][0]
+    assert row["atm_contract"] == "SPY_C100"
+    assert row["rv_close_count"] == 21
+    assert row["underlying_price"] == 100.0
+    assert len(row["proposal"]["legs"]) == 2
+    assert row["entry_quotes"]
+
+
 class TestSettlement:
     def test_pinned_above_short_keeps_full_crossed_credit(self, tmp_path):
         cfg = open_one(tmp_path)
@@ -318,14 +328,26 @@ class TestSummarize:
 
     def test_mean_and_t_math(self, tmp_path):
         cfg = make_cfg(tmp_path)
+        cfg.fee_per_contract_side = 0.01
         pt = build_paper_trader(cfg)
         # Synthetic settled trades: returns per $ max-loss of +0.10 and -0.05.
         pt.save_trades([
-            {"pnl": 42.5, "max_loss": 425.0},
-            {"pnl": -21.25, "max_loss": 425.0},
+            {"pnl": 42.5, "max_loss": 425.0, "legs": [{}, {}]},
+            {"pnl": -21.25, "max_loss": 425.0, "legs": [{}, {}]},
         ])
         s = summarize_results(cfg)
         assert s["n_settled"] == 2
-        assert abs(s["mean_ret_per_maxloss"] - 0.025) < 1e-9
+        assert abs(s["mean_ret_per_maxloss"] - round(0.025 - 0.04 / 425, 6)) < 1e-9
         assert s["win_rate"] == 0.5
         assert s["gate_passed"] is False
+
+    def test_costs_are_charged_per_leg_entry_and_exit(self, tmp_path):
+        cfg = make_cfg(tmp_path)
+        pt = build_paper_trader(cfg)
+        pt.save_trades([{"pnl": 10, "max_loss": 100, "legs": [{}, {}]}] * 40)
+        assert summarize_results(cfg)["status"] == "INSUFFICIENT_COST_DATA"
+        cfg.fee_per_contract_side = 3.0
+        result = summarize_results(cfg)
+        assert result["n_costed"] == 40
+        assert result["mean_ret_per_maxloss"] == -0.02
+        assert result["gate_passed"] is False

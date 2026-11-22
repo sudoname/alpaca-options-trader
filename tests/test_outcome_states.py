@@ -208,6 +208,43 @@ def test_record_trade_outcome_mark_fallback(fake_tracker):
     assert fake_tracker == [(pytest.approx(-135.0), "XYZ")]
 
 
+def test_research_exit_never_reuses_entry_order_identity(fake_tracker):
+    ledger = ResearchLedger(":memory:")
+    trader = _make_trader(ledger)
+    did = ledger.record_snapshot(accepted=True,
+                                 symbol="KO260116C00060000", direction="CALL")
+    trade = {"symbol": "KO260116C00060000", "entry_time": "t1",
+             "entry_price": 1.0, "quantity": 1,
+             "decision_id": did, "order_id": "entry-order", "exit_price": 1.2}
+    trader.record_trade_outcome(trade, "take_profit", 20.0,
+                                exit_order_id="sell-order")
+    events = ledger.get_decision(did)["events"]
+    assert {e["broker_order_id"] for e in events if e["event_type"] == "exit"} == {"sell-order"}
+    did2 = ledger.record_snapshot(accepted=True,
+                                  symbol="KO260116C00060000", direction="CALL")
+    trade["decision_id"] = did2
+    trader.record_trade_outcome(trade, "no_id", 0.0)
+    assert next(e for e in ledger.get_decision(did2)["events"]
+                if e["event_type"] == "exit")["broker_order_id"] is None
+
+
+def test_filled_close_threads_sell_order_identity(fake_tracker):
+    ledger = ResearchLedger(":memory:")
+    trader = _make_trader(ledger)
+    trader._await_fill = lambda oid: {"status": "filled", "filled_avg_price": "2.0",
+                                      "filled_qty": "1"}
+    did = ledger.record_snapshot(accepted=True,
+                                 symbol="KO260116C00060000", direction="CALL")
+    trade = {"symbol": "KO260116C00060000", "entry_time": "t1",
+             "entry_price": 1.0, "quantity": 1,
+             "decision_id": did, "order_id": "buy-order"}
+    trader.record_close_with_fills(trade, "take_profit", 100,
+                                   exit_order_id="sell-order")
+    exit_event = next(e for e in ledger.get_decision(did)["events"]
+                      if e["event_type"] == "exit")
+    assert exit_event["broker_order_id"] == "sell-order"
+
+
 def test_record_trade_outcome_bad_net_degrades_to_mark(fake_tracker):
     ledger = ResearchLedger(":memory:")
     trader = _make_trader(ledger)
