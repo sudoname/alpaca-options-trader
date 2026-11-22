@@ -68,26 +68,22 @@ def resolve_outcomes_from_history(
     *,
     source: str = "mark_derived",
     fees_known: bool = True,
+    allow_heuristic: bool = False,
 ) -> List[Dict[str, Any]]:
     """Join shadow scans to realized closed trades, per strategy book.
 
-    For every scan whose challenger decided ``trade``, look for a closed
-    trade on the challenger's selected symbol AND one on the baseline's top
-    symbol, entered on the same session at or after the scan time.  Both
-    legs must resolve for cohort pairing; otherwise the outcome row stays
-    ``unresolved`` with a reason.  P&L figures come straight from the
-    history rows under their true ``source`` label — nothing is invented.
+    Both legs require exact broker/client order IDs by default.  Legacy
+    symbol/time matching requires ``allow_heuristic=True`` and is labeled in
+    the attribution; an unknown supplied ID never falls back.  Unmatched
+    rows remain unresolved, never assigned another trade's P&L.
 
-    Attribution is exact (P0-3): duplicate trade records are dropped by
-    identity before matching, joins prefer broker ``order_id`` identity
-    when scan arms carry one, and each realized trade can be claimed by at
-    most ONE outcome row — repeated scans can never attribute the same
-    trade twice.  Claims are rolled back when a row fails cohort pairing,
-    so unresolved rows never consume evidence, and unknown outcomes stay
-    unresolved rather than being coerced to zero.
+    Duplicate records are deduplicated, each realized trade can be claimed
+    at most once, and one-sided claims are rolled back.
     """
     if source not in ev.FILL_SOURCES_KNOWN:
         raise ValueError(f"unknown outcome source {source!r}")
+    if allow_heuristic and source in ev.FILL_SOURCES_ACTUAL:
+        raise ValueError("live fills require exact order attribution")
 
     unique_trades, _n_dup = att.dedupe_trades(list(trades))
     matcher = att.ExclusiveTradeMatcher(unique_trades)
@@ -119,17 +115,23 @@ def resolve_outcomes_from_history(
             "challenger_symbol": sel,
             "baseline_symbol": top,
         }
+        ch_id = ch.get("order_id") or ch.get("client_order_id")
+        base_id = base.get("order_id") or base.get("client_order_id")
         ch_claim = matcher.claim(
             sel, session, at,
-            order_id=ch.get("order_id") or ch.get("client_order_id"))
-        if ch_claim is not None and sel and top and str(sel) == str(top):
+            order_id=ch_id, allow_heuristic=allow_heuristic)
+        same_order = (sel and top and str(sel) == str(top)
+                      and matcher.same_order(ch_id, base_id))
+        legacy_same_symbol = (allow_heuristic and not ch_id and not base_id
+                              and sel and top and str(sel) == str(top))
+        if ch_claim is not None and (same_order or legacy_same_symbol):
             # both arms picked the same contract: one realized trade
             # explains both arms of this ONE comparison, consumed once
             base_claim: Optional[Dict[str, Any]] = att.shared_claim(ch_claim)
         else:
             base_claim = matcher.claim(
                 top, session, at,
-                order_id=base.get("order_id") or base.get("client_order_id"))
+                order_id=base_id, allow_heuristic=allow_heuristic)
         if ch_claim is None or base_claim is None:
             # roll back any one-sided claim: an unresolved row must not
             # consume evidence another scan could legitimately resolve
@@ -209,6 +211,13 @@ def build_forward_evidence(
                 raise ValueError(
                     f"outcomes[{i}]: unknown fill_source "
                     f"{r.get('fill_source')!r}")
+            if r["fill_source"] in ev.FILL_SOURCES_ACTUAL:
+                attribution = r.get("attribution") or {}
+                if any((attribution.get(arm) or {}).get("match_basis")
+                       == att.MATCH_SYMBOL_TIME
+                       for arm in ("challenger", "baseline")):
+                    raise ValueError(
+                        f"outcomes[{i}]: heuristic match cannot be a live fill")
             if r.get("fees_known") is not True:
                 raise ValueError(
                     f"outcomes[{i}]: fees_known must be True for a "
@@ -246,13 +255,16 @@ def build_forward_evidence(
             "n_fills": len(srows),
         })
         for r in srows:
-            fills.append({
+            fill = {
                 "source": r["fill_source"],
                 "session": sid,
                 "symbol": r.get("challenger_symbol"),
                 "net_pnl": float(r["challenger_net_pnl"]),
                 "fees_known": True,
-            })
+            }
+            if r.get("attribution"):
+                fill["attribution"] = r["attribution"]
+            fills.append(fill)
 
     # comparison coverage per candidate group (resolved vs total)
     group_total: Dict[str, int] = {}
@@ -368,13 +380,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--capital-base", type=float, default=100_000.0)
     ap.add_argument("--source", default="mark_derived",
                     choices=sorted(ev.FILL_SOURCES_KNOWN))
+    ap.add_argument("--allow-heuristic-legacy", action="store_true",
+                    help="opt into labeled symbol/time joins for old scans "
+                         "without order IDs; never fall back for unknown IDs")
     args = ap.parse_args(argv)
 
     records = _load_jsonl(args.log)
     with open(args.history, encoding="utf-8") as fh:
         trades = (json.load(fh) or {}).get("trades", [])
     outcomes = resolve_outcomes_from_history(records, trades,
-                                             source=args.source)
+                                             source=args.source,
+                                             allow_heuristic=args.allow_heuristic_legacy)
     cost = {"friction_multiplier": 1.0,
             "basis": f"history net P&L as recorded ({args.source})"}
     n_written = 0

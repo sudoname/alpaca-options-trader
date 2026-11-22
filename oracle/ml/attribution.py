@@ -154,10 +154,9 @@ class ExclusiveTradeMatcher:
     """Exclusive-claim join from outcome rows to realized trades.
 
     Each realized trade can be claimed at most once; claims are released
-    (rolled back) when the caller's row fails to pair, so an unresolved row
-    never consumes evidence.  Joins prefer exact ``order_id`` identity and
-    fall back to (symbol, session, entry_at >= scan_at) with the earliest
-    unclaimed trade.
+    (rolled back) when the caller's row fails to pair.  Exact broker/client
+    order identity is required by default.  Legacy symbol/time attribution
+    must be explicitly enabled and is never used for an unknown order id.
     """
 
     def __init__(self, trades: Iterable[Dict[str, Any]]):
@@ -179,8 +178,10 @@ class ExclusiveTradeMatcher:
                 "session": at.date().isoformat(), "entry_at": at,
                 "pnl": float(pnl), "claimed": False,
             })
-            if kind == ID_ORDER and tid not in self._by_order:
-                self._by_order[tid] = idx
+            for order_key in ("order_id", "client_order_id"):
+                order_id = t.get(order_key)
+                if order_id and str(order_id) not in self._by_order:
+                    self._by_order[str(order_id)] = idx
             self._by_sym_session.setdefault(
                 (sym, at.date().isoformat()), []).append(idx)
         for idxs in self._by_sym_session.values():
@@ -192,23 +193,33 @@ class ExclusiveTradeMatcher:
         return {"pnl": e["pnl"], "trade_id": e["trade_id"],
                 "match_basis": basis, "_idx": idx}
 
+    def same_order(self, first_id: Any, second_id: Any) -> bool:
+        """Whether two supplied broker/client ids name the same trade."""
+        if not first_id or not second_id:
+            return False
+        first = self._by_order.get(str(first_id))
+        return first is not None and first == self._by_order.get(str(second_id))
+
     def claim(self, symbol: Any, session: str, after: datetime, *,
-              order_id: Any = None) -> Optional[Dict[str, Any]]:
+              order_id: Any = None,
+              allow_heuristic: bool = False) -> Optional[Dict[str, Any]]:
         """Claim one unclaimed trade; return claim dict or None.
 
-        An ``order_id`` hint is authoritative identity: if that trade exists
-        it is claimed directly (or None if already claimed -- never silently
-        re-attributed via the time heuristic).  Without a known order id,
-        the earliest unclaimed trade on (symbol, session) entered at or
-        after ``after`` is claimed.
+        An order id is authoritative: missing or already-claimed ids never
+        fall back to another trade.  An exact id must also match the contract,
+        session and scan time.  The legacy heuristic is opt-in and applies
+        only to scans without any order id.
         """
         if order_id:
             idx = self._by_order.get(str(order_id))
-            if idx is not None:
-                if self._entries[idx]["claimed"]:
-                    return None
-                return self._take(idx, MATCH_ORDER_ID)
-        if not symbol:
+            if idx is None:
+                return None
+            e = self._entries[idx]
+            if (e["claimed"] or e["symbol"] != str(symbol)
+                    or e["session"] != session or e["entry_at"] < after):
+                return None
+            return self._take(idx, MATCH_ORDER_ID)
+        if not allow_heuristic or not symbol:
             return None
         for idx in self._by_sym_session.get((str(symbol), session), []):
             e = self._entries[idx]
