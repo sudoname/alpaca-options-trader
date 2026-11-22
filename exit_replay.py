@@ -248,7 +248,10 @@ def replay_exit_path(
 
     def _consume(tick: QuoteTick) -> None:
         nonlocal prov_rank
-        r = PROVENANCE_RANK.get(str(tick.provenance), 1)
+        label = str(tick.provenance)
+        if label in ("indicative_latest", "decision_snapshot"):
+            label = "indicative"
+        r = PROVENANCE_RANK.get(label, 1)
         prov_rank = r if prov_rank is None else min(prov_rank, r)
 
     def _attempt_fill(i: int, tick: QuoteTick, quote: Dict) -> None:

@@ -1853,7 +1853,9 @@ class SmartOptionsTrader:
         option = option or {}
         extra = {k: option.get(k)
                  for k in ('greeks_quality', 'quote_ts', 'thesis_review',
-                           'scan_id', 'group_id', 'candidate_id')
+                           'scan_id', 'group_id', 'candidate_id',
+                           'gross_expected_value', 'round_trip_costs',
+                           'executable_ev')
                  if option.get(k) is not None}
         return extra or None
 
@@ -4443,10 +4445,12 @@ class SmartOptionsTrader:
         return self.record_trade_outcome(
             trade, outcome, pnl_percent,
             net_pnl_dollars=net_dollars,
-            pnl_source='fills' if net_dollars is not None else None)
+            pnl_source='fills' if net_dollars is not None else None,
+            exit_order_id=exit_order_id)
 
     def record_trade_outcome(self, trade: Dict, outcome: str, pnl_percent: float = 0,
-                             *, net_pnl_dollars=None, pnl_source=None):
+                             *, net_pnl_dollars=None, pnl_source=None,
+                             exit_order_id=None):
         """Record trade outcome for learning.
 
         `pnl_percent` keeps its legacy mark-derived meaning (gross %). When the
@@ -4622,7 +4626,7 @@ class SmartOptionsTrader:
                         net_pct = None
                 self.research_capture.on_exit(
                     trade['decision_id'],
-                    order_id=trade.get('order_id'),
+                    order_id=exit_order_id,
                     qty=trade.get('quantity', 1) or 1,
                     exit_price=trade.get('exit_price'),
                     reason=outcome,

@@ -8,8 +8,8 @@ path. Every position is simulated by `spread_paper_trader.SpreadPaperTrader`
 
 Defined-risk CREDIT spreads (bull put / bear call / iron condor), opened only
 when ATM implied volatility is RICH versus trailing realized volatility
-(IV/RV >= 1.25), have positive expected net P&L per dollar of max loss —
-net of paying the FULL quoted spread at entry.
+(IV/RV >= 1.25), have positive expected after-fee P&L per dollar of max loss —
+paying the FULL quoted spread at entry and explicit per-leg fees.
 
 Why this and not something else — the literature triangulates here:
 - Goyal & Saretto (JFE 2009): the RV−IV cross-section predicts option
@@ -40,6 +40,11 @@ Why this and not something else — the literature triangulates here:
 - **Exit**: held to expiration; every leg settles at INTRINSIC value from the
   official raw daily close of the underlying on expiration day. No early
   management (a management overlay would be a separate, later hypothesis).
+- **Fees**: set `IVRV_FEE_PER_CONTRACT_SIDE` to an observed or conservative
+  dollar cost per contract leg per side. Two legs pay four fee sides at entry
+  and expiration; four legs pay eight. Without this input or complete leg
+  records the evidence summary says `INSUFFICIENT_COST_DATA` and cannot pass.
+  The paper fill itself remains modeled, not a broker execution.
 - **Recording**: one JSONL row per SCANNED symbol per run
   (`iv_rv_scan_ledger.jsonl`), opened or not, so evaluation runs over the
   full candidate set — no survivorship in the ledger. Positions/trades live
@@ -50,7 +55,7 @@ Why this and not something else — the literature triangulates here:
 
 The hypothesis is SUPPORTED only when ALL of:
 1. **n >= 40 settled trades** (not open MTM — settled at intrinsic only);
-2. **mean net P&L per $ max-loss > 0**;
+2. **mean after-fee P&L per $ max-loss > 0**, with every settled trade costed;
 3. **t-stat >= 2** on that mean (se from the settled-trade sample).
 
 Until then every number this experiment produces is labeled UNTESTED.
@@ -82,6 +87,7 @@ python iv_rv_experiment.py --status
 Env (all optional; defaults shown):
 `ENABLE_IVRV_CREDIT_PAPER=0`, `IVRV_MIN_RATIO=1.25`, `IVRV_RV_WINDOW=252`,
 `IVRV_MIN_RV_OBS=60`, `IVRV_MAX_OPENS_PER_RUN=3`, `IVRV_MIN_ORACLE_SCORE=0`,
+`IVRV_FEE_PER_CONTRACT_SIDE=<measured or conservative dollars>`,
 `IVRV_UNIVERSE=SPY,QQQ,AAPL,MSFT,NVDA,AMZN,META,GOOGL,TSLA,AMD`
 (liquid names with tight chains, per the execution literature).
 

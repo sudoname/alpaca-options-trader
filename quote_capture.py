@@ -33,12 +33,22 @@ Keys come from .env / environment (ALPACA_API_KEY / ALPACA_SECRET_KEY).
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 _PROVENANCE = "indicative_latest"
 _BATCH = 100
+_NEW_YORK = ZoneInfo("America/New_York")
+
+
+def _market_window(now):
+    """Coarse weekday window; exchange holidays/early closes remain explicit gaps."""
+    et = now.astimezone(_NEW_YORK)
+    minute = et.hour * 60 + et.minute
+    return et.weekday() < 5 and 9 * 60 + 30 <= minute <= 16 * 60 + 5
 
 
 def _load_env(path=".env"):
@@ -54,13 +64,14 @@ def _load_env(path=".env"):
 
 
 def discover_symbols(active_trades_path="active_trades.json",
-                     ledger=None, lookback_hours=6, limit=200):
-    """Open positions + recently considered candidate-group contracts."""
+                     ledger=None, lookback_hours=6, limit=200,
+                     paper_positions_path=None):
+    """Open positions, paper legs, and recent decision/candidate contracts."""
     symbols = []
     seen = set()
 
     def _add(sym):
-        if sym and sym not in seen:
+        if isinstance(sym, str) and re.fullmatch(r"[A-Z0-9]{1,32}", sym) and sym not in seen:
             seen.add(sym)
             symbols.append(sym)
 
@@ -73,11 +84,26 @@ def discover_symbols(active_trades_path="active_trades.json",
         except (ValueError, OSError):
             pass
 
+    if paper_positions_path and os.path.exists(paper_positions_path):
+        try:
+            with open(paper_positions_path, encoding="utf-8") as fh:
+                for pos in json.load(fh) or []:
+                    if isinstance(pos, dict) and pos.get("status") == "open":
+                        for leg in pos.get("legs") or []:
+                            if isinstance(leg, dict):
+                                _add(leg.get("symbol"))
+        except (ValueError, OSError, TypeError):
+            pass
+
     if ledger is not None:
         since = (datetime.now(timezone.utc)
                  - timedelta(hours=lookback_hours)).isoformat()
         try:
-            for snap in ledger.snapshots(since=since, kind="group_candidate"):
+            recent = []
+            for kind in ("candidate", "shadow_candidate", "group_candidate"):
+                recent.extend(ledger.snapshots(since=since, kind=kind))
+            for snap in sorted(recent, key=lambda s: str(s.get("event_at_utc") or ""),
+                               reverse=True):
                 _add(snap.get("symbol"))
                 if len(symbols) >= limit:
                     break
@@ -102,33 +128,46 @@ def _last_ts(path):
     return None
 
 
-def capture_once(client, symbols, out_dir, now=None):
+def capture_once(client, symbols, out_dir, now=None, observation_mode=False,
+                 request_factory=None):
     """One poll: fetch latest quotes in batches, append fresh ticks.
 
     Returns {"polled": n, "written": n, "skipped_dup": n, "errors": [...]}.
     """
-    from alpaca.data.requests import OptionLatestQuoteRequest
-    from alpaca.data.enums import OptionsFeed
+    if request_factory is None:
+        from alpaca.data.requests import OptionLatestQuoteRequest
+        from alpaca.data.enums import OptionsFeed
+        request_factory = lambda chunk: OptionLatestQuoteRequest(
+            symbol_or_symbols=chunk, feed=OptionsFeed.INDICATIVE)
 
     os.makedirs(out_dir, exist_ok=True)
-    now = now or datetime.now(timezone.utc)
-    stats = {"polled": 0, "written": 0, "skipped_dup": 0, "errors": []}
+    stats = {"polled": 0, "written": 0, "skipped_dup": 0,
+             "skipped_future": 0, "errors": []}
 
     for i in range(0, len(symbols), _BATCH):
         chunk = symbols[i:i + _BATCH]
         try:
-            resp = client.get_option_latest_quote(OptionLatestQuoteRequest(
-                symbol_or_symbols=chunk, feed=OptionsFeed.INDICATIVE))
+            resp = client.get_option_latest_quote(request_factory(chunk))
         except Exception as exc:
             stats["errors"].append(f"{type(exc).__name__}: {exc}")
             continue
+        poll_time = now if now is not None else datetime.now(timezone.utc)
         for sym in chunk:
             q = resp.get(sym) if hasattr(resp, "get") else None
             if q is None:
                 continue
             stats["polled"] += 1
             qts = getattr(q, "timestamp", None)
-            ts_iso = qts.isoformat() if qts is not None else now.isoformat()
+            quote_ts_iso = qts.isoformat() if qts is not None else None
+            if observation_mode and qts is not None:
+                try:
+                    if qts > poll_time:
+                        stats["skipped_future"] += 1
+                        continue
+                except TypeError:
+                    stats["skipped_future"] += 1
+                    continue
+            ts_iso = poll_time.isoformat() if observation_mode else (quote_ts_iso or poll_time.isoformat())
             path = os.path.join(out_dir, f"{sym}.jsonl")
             if _last_ts(path) == ts_iso:
                 stats["skipped_dup"] += 1
@@ -136,11 +175,12 @@ def capture_once(client, symbols, out_dir, now=None):
             age = None
             if qts is not None:
                 try:
-                    age = max(0.0, (now - qts).total_seconds())
+                    age = max(0.0, (poll_time - qts).total_seconds())
                 except TypeError:
                     age = None
             tick = {
                 "ts": ts_iso,
+                "quote_ts_utc": quote_ts_iso,
                 "bid": getattr(q, "bid_price", None),
                 "ask": getattr(q, "ask_price", None),
                 "bid_size": getattr(q, "bid_size", None),
@@ -148,7 +188,7 @@ def capture_once(client, symbols, out_dir, now=None):
                 "quote_age_s": age,
                 "provenance": _PROVENANCE,
                 "symbol": sym,
-                "captured_at_utc": now.isoformat(),
+                "captured_at_utc": poll_time.isoformat(),
             }
             with open(path, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(tick, default=str) + "\n")
@@ -217,19 +257,22 @@ def _selftest():
 
         client = _FakeClient()
         out = os.path.join(tmp, "ticks")
-        now = datetime(2026, 11, 13, 15, 32, tzinfo=timezone.utc)
-        s1 = capture_once(client, syms, out, now=now)
+        now = datetime(2026, 11, 13, 15, 35, tzinfo=timezone.utc)
+        def req(chunk):
+            return type("Request", (), {"symbol_or_symbols": chunk})()
+
+        s1 = capture_once(client, syms, out, now=now, request_factory=req)
         check("first poll writes one tick per symbol",
               s1["written"] == 2 and s1["skipped_dup"] == 0)
 
         # same quote ts again -> dedupe (fake bumps ts per call, so replay
         # the dedupe path by polling twice with a frozen client call count)
         client.calls -= 1
-        s2 = capture_once(client, syms, out, now=now)
+        s2 = capture_once(client, syms, out, now=now, request_factory=req)
         check("unchanged quote ts is skipped, not duplicated",
               s2["written"] == 0 and s2["skipped_dup"] == 2)
 
-        s3 = capture_once(client, syms, out, now=now)
+        s3 = capture_once(client, syms, out, now=now, request_factory=req)
         check("fresh quote ts appends", s3["written"] == 2)
 
         path = os.path.join(out, "SPG270617C00240000.jsonl")
@@ -254,10 +297,16 @@ def main(argv=None):
                     help="loop every N seconds")
     ap.add_argument("--out-dir", default="quote_ticks")
     ap.add_argument("--active-trades", default="active_trades.json")
+    ap.add_argument("--paper-positions", default=None,
+                    help="optional IV/RV open paper spreads to watch")
     ap.add_argument("--db", default="research_ledger.db")
     ap.add_argument("--lookback-hours", type=float, default=6.0,
                     help="group-candidate discovery window")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--observations", action="store_true",
+                    help="retain each poll time, even if latest quote is unchanged")
+    ap.add_argument("--market-hours-only", action="store_true",
+                    help="poll only weekdays 09:30–16:05 New York time")
     args = ap.parse_args(argv)
 
     if args.selftest:
@@ -265,14 +314,23 @@ def main(argv=None):
     if not args.once and args.interval is None:
         ap.error("choose --once, --interval, or --selftest")
 
+    os.umask(0o077)
     _load_env()
     client = _real_client()
     ledger = _open_ledger(args.db)
     while True:
+        if args.market_hours_only and not _market_window(datetime.now(timezone.utc)):
+            if args.once:
+                print(json.dumps({"n_symbols": 0, "status": "outside_market_window"}))
+                return 0
+            time.sleep(args.interval)
+            continue
         symbols = discover_symbols(active_trades_path=args.active_trades,
                                    ledger=ledger,
-                                   lookback_hours=args.lookback_hours)
-        stats = capture_once(client, symbols, args.out_dir)
+                                   lookback_hours=args.lookback_hours,
+                                   paper_positions_path=args.paper_positions)
+        stats = capture_once(client, symbols, args.out_dir,
+                             observation_mode=args.observations)
         print(json.dumps({"at": datetime.now(timezone.utc).isoformat(),
                           "n_symbols": len(symbols), **stats}))
         if args.once:

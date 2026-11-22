@@ -77,6 +77,7 @@ class IVRVConfig:
     scan_ledger: str = "iv_rv_scan_ledger.jsonl"        # IVRV_SCAN_LEDGER
     positions_file: str = "iv_rv_paper_positions.json"  # IVRV_POSITIONS_FILE
     trades_file: str = "iv_rv_paper_trades.json"        # IVRV_TRADES_FILE
+    fee_per_contract_side: Optional[float] = None  # all-in fee per leg, per side
 
     @staticmethod
     def from_env(path: str = ".env",
@@ -98,6 +99,9 @@ class IVRVConfig:
                                        "iv_rv_paper_positions.json"),
             trades_file=cfg.get_str("IVRV_TRADES_FILE",
                                     "iv_rv_paper_trades.json"),
+            fee_per_contract_side=(cfg.get_float("IVRV_FEE_PER_CONTRACT_SIDE", 0.0)
+                if cfg.get_str("IVRV_FEE_PER_CONTRACT_SIDE", "").strip()
+                else None),
         )
 
 
@@ -268,6 +272,10 @@ def fetch_expiry_close(symbol: str, expiry: date) -> Optional[float]:
 
 
 def _atm_iv(trader, symbol: str, price: float) -> Optional[float]:
+    return _atm_iv_with_source(trader, symbol, price)[0]
+
+
+def _atm_iv_with_source(trader, symbol: str, price: float) -> tuple:
     """ATM-call implied vol via the nearest expiration snapshot (fail-open).
 
     Mirrors the IV source used by ``smart_trader.propose_spread`` so the gate
@@ -278,7 +286,7 @@ def _atm_iv(trader, symbol: str, price: float) -> Optional[float]:
         expirations = sorted({c.get("expiration_date") for c in contracts
                               if c.get("expiration_date")})
         if not expirations:
-            return None
+            return None, None, None
         calls = {}
         for c in contracts:
             if c.get("expiration_date") != expirations[0] or c.get("type") != "call":
@@ -288,13 +296,17 @@ def _atm_iv(trader, symbol: str, price: float) -> Optional[float]:
             except (TypeError, ValueError):
                 continue
         if not calls:
-            return None
+            return None, None, None
         atm = min(calls, key=lambda s: abs(s - price))
-        snap = trader.get_option_snapshot(calls[atm].get("symbol", "")) or {}
-        return snap.get("iv")
+        occ = calls[atm].get("symbol", "")
+        snap = trader.get_option_snapshot(occ) or {}
+        stamp = snap.get("timestamp") or snap.get("quote_ts")
+        return snap.get("iv"), occ, (
+            stamp.isoformat() if hasattr(stamp, "isoformat") else
+            str(stamp) if stamp is not None else None)
     except Exception as exc:
         print(f"{LOG_TAG} atm iv failed {symbol}: {exc}")
-        return None
+        return None, None, None
 
 
 # --------------------------------------------------------------------------- #
@@ -348,14 +360,21 @@ def scan_once(cfg: Optional[IVRVConfig] = None,
     for symbol in cfg.universe:
         row = {"type": "ivrv_scan", "recorded_at": _now_iso(),
                "symbol": symbol, "rv": None, "atm_iv": None, "ratio": None,
+               "underlying_price": None, "rv_close_count": None,
+               "rv_closes": None, "rv_adjustment": "all",
+               "atm_contract": None, "iv_quote_ts": None,
+               "proposal": None, "entry_quotes": None,
                "verdict": UNKNOWN, "action": "skipped", "reason": None,
                "position_id": None, "strategy": None, "oracle_score": None,
                "net_credit": None, "max_loss": None, "entry_mark": None}
         try:
             trader = trader_factory(symbol)
 
+            closes = closes_by_symbol.get(symbol) or []
+            row["rv_close_count"] = len(closes)
+            row["rv_closes"] = closes[-(cfg.rv_window + 1):]
             rv = annualized_realized_vol(
-                closes_by_symbol.get(symbol) or [],
+                closes,
                 window=cfg.rv_window, min_obs=cfg.min_rv_obs)
             row["rv"] = rv
 
@@ -363,9 +382,12 @@ def scan_once(cfg: Optional[IVRVConfig] = None,
             if not price or price <= 0:
                 row["reason"] = "no_underlying_price"
                 continue
+            row["underlying_price"] = float(price)
 
-            iv = _atm_iv(trader, symbol, float(price))
+            iv, iv_contract, iv_ts = _atm_iv_with_source(trader, symbol, float(price))
             row["atm_iv"] = iv
+            row["atm_contract"] = iv_contract
+            row["iv_quote_ts"] = iv_ts
             ratio = iv_rv_ratio(iv, rv)
             row["ratio"] = round(ratio, 4) if ratio is not None else None
             verdict = classify_richness(ratio, cfg.min_iv_rv_ratio)
@@ -383,6 +405,12 @@ def scan_once(cfg: Optional[IVRVConfig] = None,
             proposal = trader.propose_spread(symbol)
             strategy = getattr(proposal, "strategy_name", NO_TRADE)
             row["strategy"] = strategy
+            row["proposal"] = {
+                "strategy": strategy,
+                "legs": [l.as_dict() for l in getattr(proposal, "legs", [])],
+                "max_loss": getattr(proposal, "max_loss", None),
+                "oracle_score": getattr(proposal, "oracle_score", None),
+            }
             if strategy == NO_TRADE:
                 row["reason"] = (f"builder_no_trade: "
                                  f"{getattr(proposal, 'reason', '')}")
@@ -397,6 +425,7 @@ def scan_once(cfg: Optional[IVRVConfig] = None,
             if quotes is None:
                 row["reason"] = "missing_crossed_quote"
                 continue
+            row["entry_quotes"] = quotes
 
             expiry = earliest_expiration(legs)
             context = {
@@ -502,23 +531,38 @@ def settle_expired(cfg: Optional[IVRVConfig] = None,
 # --------------------------------------------------------------------------- #
 def summarize_results(cfg: Optional[IVRVConfig] = None,
                       paper_trader: Optional[SpreadPaperTrader] = None) -> dict:
-    """Mean net P&L per $ max-loss over settled trades, with se and t-stat.
+    """Mean after-fee paper P&L per $ max-loss, with se and t-stat.
 
     This is the number the evidence gate in IVRV_EXPERIMENT.md is written
-    against: n >= 40 settled trades AND mean > 0 with |t| >= 2.
+    against: n >= 40 settled trades AND mean > 0 with t >= 2.
+    A trade without an explicit per-leg fee allowance is uncosted and cannot
+    pass the gate. Intrinsic settlement/assignment risk is still unmodeled.
     """
     cfg = cfg or IVRVConfig.from_env()
     pt = paper_trader or build_paper_trader(cfg)
     rets = []
+    raw_rets = []
+    uncosted = 0
+    fee = cfg.fee_per_contract_side
+    fee_valid = isinstance(fee, (int, float)) and math.isfinite(fee) and fee > 0
     for t in pt.load_trades():
         pnl = t.get("pnl")
         max_loss = t.get("max_loss")
         if isinstance(pnl, (int, float)) and isinstance(max_loss, (int, float)) \
                 and max_loss > 0:
-            rets.append(pnl / max_loss)
-    out = {"n_settled": len(rets), "n_open": len(pt.get_open_positions()),
+            raw_rets.append(pnl / max_loss)
+            legs = t.get("legs")
+            if fee_valid and isinstance(legs, list) and len(legs) >= 2:
+                rets.append((pnl - len(legs) * 2 * fee) / max_loss)
+            else:
+                uncosted += 1
+    out = {"n_settled": len(raw_rets), "n_costed": len(rets),
+           "n_uncosted": uncosted, "n_open": len(pt.get_open_positions()),
+           "fee_per_contract_side": fee if fee_valid else None,
            "mean_ret_per_maxloss": None, "se": None, "t_stat": None,
-           "win_rate": None, "gate_passed": False}
+           "win_rate": None, "gate_passed": False,
+           "status": ("INSUFFICIENT_DATA" if not raw_rets else
+                      "COSTED" if not uncosted else "INSUFFICIENT_COST_DATA")}
     n = len(rets)
     if n >= 2:
         mean = sum(rets) / n
@@ -529,7 +573,7 @@ def summarize_results(cfg: Optional[IVRVConfig] = None,
         out["t_stat"] = round(mean / se, 3) if se > 0 else None
         out["win_rate"] = round(sum(1 for r in rets if r > 0) / n, 4)
         out["gate_passed"] = bool(
-            n >= 40 and mean > 0 and out["t_stat"] is not None
+            n >= 40 and not uncosted and mean > 0 and out["t_stat"] is not None
             and out["t_stat"] >= 2.0)
     return out
 

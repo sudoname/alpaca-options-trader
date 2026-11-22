@@ -99,3 +99,8 @@ shadow_pnl.json
 export_decisions.jsonl
 export_groups.jsonl
 research_vwap/
+evidence_capture/
+quote_ticks/
+iv_rv_scan_ledger.jsonl
+iv_rv_paper_positions.json
+iv_rv_paper_trades.json
