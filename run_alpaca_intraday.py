@@ -1068,7 +1068,7 @@ class IntradayScheduler:
         # shadow so it sees the freshest completed bars. Env-gated and
         # fail-open; research-path only, never alters baseline behavior.
         async_research = os.getenv(
-            "ENABLE_ORACLE4_ASYNC_RESEARCH", "").strip().lower() == "true"
+            "ENABLE_ORACLE4_ASYNC_RESEARCH", "").strip().lower() in {"true", "1"}
 
         if os.getenv("ENABLE_ORACLE4_BARS_FEED", "").strip().lower() == "true":
             if async_research:
