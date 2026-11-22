@@ -28,8 +28,9 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional
 
+from . import attribution as att
 from . import books as bk
 from . import evidence as ev
 from . import valuation as val
@@ -76,31 +77,20 @@ def resolve_outcomes_from_history(
     legs must resolve for cohort pairing; otherwise the outcome row stays
     ``unresolved`` with a reason.  P&L figures come straight from the
     history rows under their true ``source`` label — nothing is invented.
+
+    Attribution is exact (P0-3): duplicate trade records are dropped by
+    identity before matching, joins prefer broker ``order_id`` identity
+    when scan arms carry one, and each realized trade can be claimed by at
+    most ONE outcome row — repeated scans can never attribute the same
+    trade twice.  Claims are rolled back when a row fails cohort pairing,
+    so unresolved rows never consume evidence, and unknown outcomes stay
+    unresolved rather than being coerced to zero.
     """
     if source not in ev.FILL_SOURCES_KNOWN:
         raise ValueError(f"unknown outcome source {source!r}")
 
-    # index trades by (symbol, session) -> list of (entry_at, pnl)
-    by_key: Dict[Tuple[str, str], List[Tuple[datetime, float]]] = {}
-    for t in trades:
-        sym = str(t.get("symbol") or "")
-        at = _parse_utc(t.get("entry_time"))
-        pnl = t.get("pnl")
-        if not sym or at is None or not _finite(pnl):
-            continue
-        by_key.setdefault((sym, at.date().isoformat()), []).append(
-            (at, float(pnl)))
-    for rows in by_key.values():
-        rows.sort(key=lambda r: r[0])
-
-    def _match(sym: Optional[str], session: str,
-               after: datetime) -> Optional[float]:
-        if not sym:
-            return None
-        for at, pnl in by_key.get((str(sym), session), []):
-            if at >= after:
-                return pnl
-        return None
+    unique_trades, _n_dup = att.dedupe_trades(list(trades))
+    matcher = att.ExclusiveTradeMatcher(unique_trades)
 
     out: List[Dict[str, Any]] = []
     for rec in scan_records:
@@ -129,13 +119,26 @@ def resolve_outcomes_from_history(
             "challenger_symbol": sel,
             "baseline_symbol": top,
         }
-        ch_pnl = _match(sel, session, at)
-        base_pnl = _match(top, session, at)
-        if ch_pnl is None or base_pnl is None:
+        ch_claim = matcher.claim(
+            sel, session, at,
+            order_id=ch.get("order_id") or ch.get("client_order_id"))
+        if ch_claim is not None and sel and top and str(sel) == str(top):
+            # both arms picked the same contract: one realized trade
+            # explains both arms of this ONE comparison, consumed once
+            base_claim: Optional[Dict[str, Any]] = att.shared_claim(ch_claim)
+        else:
+            base_claim = matcher.claim(
+                top, session, at,
+                order_id=base.get("order_id") or base.get("client_order_id"))
+        if ch_claim is None or base_claim is None:
+            # roll back any one-sided claim: an unresolved row must not
+            # consume evidence another scan could legitimately resolve
+            matcher.release(ch_claim)
+            matcher.release(base_claim)
             missing = []
-            if ch_pnl is None:
+            if ch_claim is None:
                 missing.append("challenger")
-            if base_pnl is None:
+            if base_claim is None:
                 missing.append("baseline")
             row.update({
                 "resolution_state": UNRESOLVED,
@@ -144,10 +147,16 @@ def resolve_outcomes_from_history(
         else:
             row.update({
                 "resolution_state": RESOLVED,
-                "challenger_net_pnl": ch_pnl,
-                "baseline_net_pnl": base_pnl,
+                "challenger_net_pnl": ch_claim["pnl"],
+                "baseline_net_pnl": base_claim["pnl"],
                 "fill_source": source,
                 "fees_known": bool(fees_known),
+                "attribution": {
+                    "challenger": {"trade_id": ch_claim["trade_id"],
+                                   "match_basis": ch_claim["match_basis"]},
+                    "baseline": {"trade_id": base_claim["trade_id"],
+                                 "match_basis": base_claim["match_basis"]},
+                },
             })
         out.append(row)
     return out
