@@ -19,23 +19,20 @@ Hard guarantees:
   printed) — production ranking and entry are byte-identical with the flag
   on or off.
 
-History sources (4.0.1-A):
+History source (4.0.2 P0-2: real bars only):
 
-* ``ORACLE4_BARS_DB`` set — per-underlying history is read from the
-  read-only bars cache (:mod:`oracle.ml.bars`): actual timestamped
-  completed 1-minute bars under the completed-bar PIT rule.  When the
-  store cannot serve an underlying the scan **abstains for it with the
-  structured ``BarsUnavailable`` reason** — daily closes are never
-  rescaled onto an intraday grid as a substitute.
-* ``ORACLE4_BARS_DB`` unset (legacy, documented approximation; recorded
-  per record as ``history_grid_minutes`` / ``history_grid_assumed``):
-  live underlying history arrives as a plain list of consecutive closes
-  with no timestamps (``SmartTrader.get_price_history`` returns daily
-  closes), so observations are placed on a synthetic uniform grid at the
-  configured step.  Returns are real consecutive observations; only the
-  grid timing is assumed, which inflates the scenario vol scale when
-  daily closes are mapped onto an intraday grid.  Records carry the flag
-  so downstream analysis can filter or re-scale.
+* Per-underlying history is read exclusively from the read-only bars
+  cache (:mod:`oracle.ml.bars`) configured via ``ORACLE4_BARS_DB``:
+  actual timestamped completed 1-minute bars under the completed-bar
+  PIT rule, bounded by a freshness requirement
+  (``ORACLE4_BARS_MAX_STALENESS_MIN``, default 15 minutes).  When the
+  store cannot serve an underlying — store missing, symbol unknown, no
+  coverage, stale, insufficient history — the scan **abstains for that
+  underlying with the structured ``BarsUnavailable`` reason**.  When
+  ``ORACLE4_BARS_DB`` is unset every underlying abstains with
+  ``BARS_DB_UNSET``.  Daily closes are never placed on an assumed
+  intraday grid: the legacy synthetic-grid fallback was removed in
+  4.0.2 (P0-2) and untimestamped close lists are no longer accepted.
 
 Flags (all optional):
 
@@ -50,7 +47,9 @@ Flags (all optional):
 * ``ORACLE4_SHADOW_JSONL``     — output path (default oracle4_shadow.jsonl)
 * ``ORACLE4_REGISTRY``         — registry path for model identity lookup
 * ``ORACLE4_BARS_DB``          — read-only bars cache path (default unset:
-  legacy synthetic-grid history)
+  every underlying abstains with ``BARS_DB_UNSET``)
+* ``ORACLE4_BARS_MAX_STALENESS_MIN`` — max age in minutes of the newest
+  completed bar before the underlying abstains as ``STALE`` (default 15)
 """
 from __future__ import annotations
 
@@ -61,7 +60,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from oracle.ml import books as bk
 from oracle.ml import valuation as val
@@ -83,7 +82,8 @@ class ShadowConfig:
     max_scenarios: int = 512
     jsonl_path: str = DEFAULT_JSONL
     registry_path: str = os.path.join("artifacts", "oracle4", "registry.json")
-    bars_db: str = ""   # 4.0.1-A: read-only bars cache; unset = legacy grid
+    bars_db: str = ""   # read-only bars cache; unset = abstain (BARS_DB_UNSET)
+    bars_max_staleness_min: float = 15.0  # newest completed bar max age
 
     @classmethod
     def from_env(cls) -> "ShadowConfig":
@@ -92,6 +92,13 @@ class ShadowConfig:
                 return int(os.getenv(name, "") or default)
             except (TypeError, ValueError):
                 return default
+
+        def _pos_float(name: str, default: float) -> float:
+            try:
+                v = float(os.getenv(name, "") or default)
+            except (TypeError, ValueError):
+                return default
+            return v if v > 0 else default
         return cls(
             enabled=_truthy(os.getenv("ENABLE_ORACLE4_SHADOW")),
             model_id=(os.getenv("ORACLE4_MODEL_ID") or "").strip(),
@@ -101,6 +108,8 @@ class ShadowConfig:
             registry_path=(os.getenv("ORACLE4_REGISTRY")
                            or cls.registry_path),
             bars_db=(os.getenv("ORACLE4_BARS_DB") or "").strip(),
+            bars_max_staleness_min=_pos_float(
+                "ORACLE4_BARS_MAX_STALENESS_MIN", 15.0),
         )
 
 
@@ -157,20 +166,6 @@ def freeze_candidate(cand: Dict[str, Any], i: int, scan_id: str,
         },
         contract=contract,
     )
-
-
-def _history_obs(closes: Sequence[Any], now: datetime,
-                 step_minutes: float) -> List[Any]:
-    """Place a plain close series on a synthetic uniform grid ending at now.
-
-    The timestamps are assumed (documented as ``history_grid_minutes``);
-    the consecutive returns themselves are real observations.
-    """
-    pts = [_flt(c) for c in closes]
-    pts = [p for p in pts if p is not None and p > 0]
-    n = len(pts)
-    step = timedelta(minutes=float(step_minutes))
-    return [(now - step * (n - 1 - k), pts[k]) for k in range(n)]
 
 
 # --------------------------------------------------------------------------- #
@@ -304,12 +299,12 @@ def _run_forecasts(cfg: ShadowConfig,
     })
 
     if not bars_mode:
-        # Legacy synthetic-grid history has no real timestamps: refusing to
-        # fabricate timestamped features (4.0.1-A/B) — abstain per candidate.
+        # 4.0.2 P0-2: no bars store configured means no genuine timestamped
+        # history exists — abstain per candidate rather than fabricate.
         e = fcmod.ForecastUnavailable(
-            "HISTORY_UNTIMESTAMPED",
-            "legacy synthetic-grid history: refusing to fabricate "
-            "timestamped features", model_id=cfg.model_id)
+            "BARS_DB_UNSET",
+            "ORACLE4_BARS_DB unset: no timestamped bar history to build "
+            "features on", model_id=cfg.model_id)
         for c in cands:
             forecasts[c.decision_id] = e.to_dict()
         info["n_abstained"] = len(cands)
@@ -351,7 +346,6 @@ def _run_forecasts(cfg: ShadowConfig,
 
 def shadow_scan(candidates: Sequence[Dict[str, Any]], *,
                 scan_id: Optional[str] = None,
-                price_history_fn: Optional[Callable[..., Sequence[float]]] = None,
                 step_minutes: float = 5.0,
                 now: Optional[datetime] = None,
                 cfg: Optional[ShadowConfig] = None,
@@ -394,6 +388,14 @@ def shadow_scan(candidates: Sequence[Dict[str, Any]], *,
         except Exception as e:  # store missing/unreadable: abstain per-underlying
             bars_note = (e.to_dict() if hasattr(e, "to_dict")
                          else {"reason": "STORE_ERROR", "detail": str(e)})
+    else:
+        # 4.0.2 P0-2: real bars are the ONLY history source.  With no store
+        # configured every underlying abstains -- the legacy synthetic-grid
+        # fallback (daily closes on an assumed intraday grid) was removed.
+        bars_note = {
+            "reason": "BARS_DB_UNSET",
+            "detail": ("ORACLE4_BARS_DB unset: no timestamped bar history; "
+                       "synthetic-grid fallback was removed (4.0.2 P0-2)")}
 
     scen_by_u: Dict[str, Any] = {}
     scen_meta: Dict[str, Dict[str, Any]] = {}
@@ -407,41 +409,27 @@ def shadow_scan(candidates: Sequence[Dict[str, Any]], *,
             continue
         s0 = c.features.get("underlying_price")
         obs: List[Any] = []
-        hist_error = None
-        history_source: Optional[str] = None
         bars_unavailable: Optional[Dict[str, Any]] = None
-        if bars_mode:
-            # 4.0.1-A: real completed bars only.  On unavailability abstain
-            # with the structured reason -- never fall back to a synthetic
-            # grid while bars mode is on.
-            history_source = "bars"
-            if bar_store is None:
-                bars_unavailable = bars_note or {"reason": "STORE_MISSING"}
-            else:
-                try:
-                    from oracle.ml import bars as barsmod
-                    bar_rows = bar_store.load_bars(
-                        u, 60,
-                        start=now - timedelta(days=7), end=now, as_of=now,
-                        rth_only=True, min_bars=vcfg.min_history_returns)
-                    obs = [(b.ts_utc, b.end_utc, b.close) for b in bar_rows]
-                    bar_rows_by_u[u] = list(bar_rows)
-                except barsmod.BarsUnavailable as e:
-                    bars_unavailable = e.to_dict()
+        # 4.0.2 P0-2: real completed bars are the only history source.  On
+        # unavailability (store unset/missing, stale, thin coverage) abstain
+        # with the structured reason -- never fabricate a synthetic grid.
+        if bar_store is None:
+            bars_unavailable = bars_note or {"reason": "STORE_MISSING"}
         else:
-            history_source = "synthetic_grid"
-            closes: Sequence[float] = []
-            if callable(price_history_fn):
-                try:
-                    try:
-                        closes = price_history_fn(u, 90)  # long window
-                    except TypeError:
-                        closes = price_history_fn(u)
-                except Exception as e:
-                    hist_error = str(e)
-            obs = _history_obs(closes or [], now, step_minutes)
-        hist_by_u[u] = {"obs": obs, "s0": s0, "hist_error": hist_error,
-                        "history_source": history_source,
+            try:
+                from oracle.ml import bars as barsmod
+                bar_rows = bar_store.load_bars(
+                    u, 60,
+                    start=now - timedelta(days=7), end=now, as_of=now,
+                    rth_only=True, min_bars=vcfg.min_history_returns,
+                    max_staleness=timedelta(
+                        minutes=cfg.bars_max_staleness_min))
+                obs = [(b.ts_utc, b.end_utc, b.close) for b in bar_rows]
+                bar_rows_by_u[u] = list(bar_rows)
+            except barsmod.BarsUnavailable as e:
+                bars_unavailable = e.to_dict()
+        hist_by_u[u] = {"obs": obs, "s0": s0,
+                        "history_source": "bars",
                         "bars_unavailable": bars_unavailable}
 
     if bar_store is not None:
@@ -492,7 +480,7 @@ def shadow_scan(candidates: Sequence[Dict[str, Any]], *,
         scen_by_u[u] = scen
         meta = dict(scen.meta) if scen is not None else {}
         meta.update({"status": reason, "n_history_points": len(h["obs"]),
-                     "history_error": h["hist_error"],
+                     "history_error": None,
                      "history_source": h["history_source"]})
         scen_meta[u] = meta
 
@@ -528,7 +516,7 @@ def shadow_scan(candidates: Sequence[Dict[str, Any]], *,
     try:
         book_assignments = bk.assign_books(
             cands, now=now, scan_id=scan_id,
-            bars_mode="bars" if bars_mode else "synthetic_grid")
+            bars_mode="bars" if bars_mode else "bars_db_unset")
         books_summary = bk.summarize_books(book_assignments)
     except Exception:  # pragma: no cover - defensive fail-open
         book_assignments, books_summary = {}, {}
@@ -547,10 +535,9 @@ def shadow_scan(candidates: Sequence[Dict[str, Any]], *,
             "ORACLE4_MAX_CANDIDATES": cfg.max_candidates,
             "ORACLE4_MAX_SCENARIOS": cfg.max_scenarios,
             "ORACLE4_BARS_DB": cfg.bars_db or None,
+            "ORACLE4_BARS_MAX_STALENESS_MIN": cfg.bars_max_staleness_min,
         },
         "inference_ms": inference_ms,
-        "history_grid_minutes": float(step_minutes),
-        "history_grid_assumed": not bars_mode,
         "bars_db": cfg.bars_db or None,
         "input": {
             "n_candidates_in": n_in,

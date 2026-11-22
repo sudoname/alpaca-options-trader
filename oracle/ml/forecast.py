@@ -85,6 +85,8 @@ class ForecastUnavailable(Exception):
         "TRAIN_OVERLAP",             # as_of inside/before the train window
         "FEATURES_ALL_MISSING",      # no usable feature values at all
         "HISTORY_UNTIMESTAMPED",     # inputs built on an assumed time grid
+        "BARS_DB_UNSET",             # no bars store configured: no genuine
+                                     # timestamped history to build features on
         "INFERENCE_ERROR",           # unexpected failure during inference
     )
 

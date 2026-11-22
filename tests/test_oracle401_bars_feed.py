@@ -278,21 +278,14 @@ class TestEndToEndShadow:
         res, _ = _feed(db_path, pages, monkeypatch, now=now)
         assert res["inserted"] == 41
 
-        calls = []
-
-        def hist(u, days=90):
-            calls.append(u)
-            return []
-
         cfg = shmod.ShadowConfig(enabled=True, max_scenarios=64,
                                  bars_db=db_path)
         rec = shmod.shadow_scan(
-            [_cand()], scan_id="feed-e2e", price_history_fn=hist,
+            [_cand()], scan_id="feed-e2e",
             step_minutes=1.0, now=now, cfg=cfg,
             out_path=str(tmp_path / "out.jsonl"))
         meta = rec["scenarios"]["SPY"]
-        assert rec["history_grid_assumed"] is False
+        assert "history_grid_assumed" not in rec   # 4.0.2: key removed
         assert meta["history_source"] == "bars"
         assert meta["status"] == "ok"
         assert meta["n_history_points"] == 41
-        assert calls == []       # untimestamped legacy path never consulted

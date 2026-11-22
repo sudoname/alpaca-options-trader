@@ -404,21 +404,22 @@ class TestShadowIntegration:
             on_disk = json.loads(f.readline())
         assert on_disk["forecasts"]["sb1:SPY:0"]["available"] is True
 
-    def test_legacy_grid_refuses_untimestamped_features(self, rig, tmp_path):
+    def test_no_bars_db_refuses_with_bars_db_unset(self, rig, tmp_path):
+        # 4.0.2 P0-2: the synthetic-grid path is gone.  Without a bars store
+        # the model may load, but every candidate abstains -- no features are
+        # ever built on fabricated history.
         regpath, _pt, _man = rig
         cfg = shmod.ShadowConfig(enabled=True, model_id="fix_a",
                                  registry_path=regpath, max_scenarios=32)
         rec = shmod.shadow_scan(
             [_cand()], scan_id="sb2",
-            price_history_fn=lambda u, days=90: [100.0 + (i % 7) * 0.1
-                                                 for i in range(80)],
             now=AS_OF, cfg=cfg, out_path=str(tmp_path / "out.jsonl"))
         inf = rec["model"]["inference"]
         assert inf["loaded"] is True
         assert inf["n_forecasts"] == 0 and inf["n_abstained"] == 1
         fc = rec["forecasts"]["sb2:SPY:0"]
         assert fc["available"] is False
-        assert fc["reason"] == "HISTORY_UNTIMESTAMPED"
+        assert fc["reason"] == "BARS_DB_UNSET"
 
     def test_identity_metadata_alone_never_counts_as_inference(
             self, rig, tmp_path):

@@ -1099,7 +1099,6 @@ class IntradayScheduler:
                 maybe_shadow_scan(
                     candidates,
                     scan_id=getattr(self.trader, "current_scan_id", None),
-                    price_history_fn=self.trader.get_price_history,
                     step_minutes=float(getattr(self.cfg, "scan_interval_min", 5) or 5),
                 )
             except Exception as e:

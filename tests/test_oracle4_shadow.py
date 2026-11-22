@@ -1,4 +1,9 @@
-"""Phase 7b tests: observe-only shadow — default OFF, fail-open, no orders."""
+"""Phase 7b tests: observe-only shadow — default OFF, fail-open, no orders.
+
+4.0.2 P0-2: history comes exclusively from a real bars store.  No bars store
+configured means structured abstention (``BARS_DB_UNSET``); daily closes are
+never placed on an assumed intraday grid.
+"""
 import inspect
 import json
 import os
@@ -6,9 +11,15 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from oracle.ml import bars as barsmod
 from oracle.ml import shadow as sh
+from oracle.ml.bars import Bar, BarStore
 
-NOW = datetime(2026, 11, 18, 15, 0, tzinfo=timezone.utc)
+# 2026-11-18 is a Wednesday under EST: RTH = 14:30-21:00 UTC.
+OPEN = datetime(2026, 11, 18, 14, 30, tzinfo=timezone.utc)
+# 41 one-minute bars from the open end 14:30+41m = 15:11; at NOW the newest
+# completed bar is 9 minutes old -- inside the 15-minute staleness default.
+NOW = OPEN + timedelta(minutes=50)
 
 
 def _occ(underlying="SPY", exp="261219", cp="C", strike_milli="00600000"):
@@ -32,16 +43,38 @@ def _cand(sym="SPY", score=80.0, price=600.0, bid=5.0, ask=5.2, dte=31.0,
     }
 
 
-def _history(n=60, s0=600.0):
-    # gentle deterministic wiggle; > min_history_returns (30) observations
-    return [s0 * (1.0 + 0.001 * ((k * 37) % 7 - 3)) for k in range(n)]
+def _bar(ts, close, sym="SPY", res=60):
+    return Bar(symbol=sym, resolution_s=res, ts_utc=ts, open=close,
+               high=close, low=close, close=close, volume=1.0,
+               session_date=barsmod.session_date_of(ts),
+               rth=barsmod.is_rth(ts), source="test")
+
+
+def _bars_db(tmp_path, syms=("SPY",), n=41, start=OPEN):
+    """Real minute-bar store: n completed bars per symbol from the open."""
+    path = str(tmp_path / "bars.sqlite")
+    st = BarStore(path, readonly=False)
+    for sym in syms:
+        base = {"SPY": 600.0, "QQQ": 500.0}.get(sym, 100.0)
+        st.insert_bars([_bar(start + timedelta(minutes=i),
+                             base + (i % 5) * 0.2, sym=sym)
+                        for i in range(n)])
+    st.close()
+    return path
+
+
+def _cfg(bars_db="", **kw):
+    kw.setdefault("enabled", True)
+    kw.setdefault("max_scenarios", 256)
+    return sh.ShadowConfig(bars_db=bars_db, **kw)
 
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     for k in ("ENABLE_ORACLE4_SHADOW", "ORACLE4_MODEL_ID",
               "ORACLE4_MAX_CANDIDATES", "ORACLE4_MAX_SCENARIOS",
-              "ORACLE4_SHADOW_JSONL", "ORACLE4_REGISTRY"):
+              "ORACLE4_SHADOW_JSONL", "ORACLE4_REGISTRY",
+              "ORACLE4_BARS_DB", "ORACLE4_BARS_MAX_STALENESS_MIN"):
         monkeypatch.delenv(k, raising=False)
 
 
@@ -81,27 +114,43 @@ def test_env_parsing(monkeypatch):
     assert cfg.model_id == "mlp_v1"
     assert cfg.max_candidates == 1
     assert cfg.max_scenarios == 512
+    assert cfg.bars_max_staleness_min == 15.0  # default
+
+
+def test_staleness_env_parsing(monkeypatch):
+    monkeypatch.setenv("ORACLE4_BARS_MAX_STALENESS_MIN", "7.5")
+    assert sh.ShadowConfig.from_env().bars_max_staleness_min == 7.5
+    monkeypatch.setenv("ORACLE4_BARS_MAX_STALENESS_MIN", "-3")
+    assert sh.ShadowConfig.from_env().bars_max_staleness_min == 15.0
+    monkeypatch.setenv("ORACLE4_BARS_MAX_STALENESS_MIN", "bogus")
+    assert sh.ShadowConfig.from_env().bars_max_staleness_min == 15.0
 
 
 # --------------------------------------------------------------------------- #
-# record shape & semantics
+# record shape & semantics (real bars store)
 # --------------------------------------------------------------------------- #
 
 def test_record_shape_and_baseline_order(tmp_path):
     out = str(tmp_path / "shadow.jsonl")
+    db = _bars_db(tmp_path, syms=("SPY", "QQQ"))
     cands = [_cand("SPY", score=50.0), _cand("QQQ", score=90.0, price=500.0,
                                              symbol=_occ("QQQ"))]
-    rec = sh.shadow_scan(cands, scan_id="scan-1", now=NOW,
-                         price_history_fn=lambda u, d=90: _history(
-                             s0=600.0 if u == "SPY" else 500.0),
-                         cfg=sh.ShadowConfig(enabled=True, max_scenarios=256),
-                         out_path=out)
+    rec = sh.shadow_scan(cands, scan_id="scan-1", now=NOW, step_minutes=1.0,
+                         cfg=_cfg(bars_db=db), out_path=out)
     for key in ("schema_version", "type", "at", "scan_id", "model", "flags",
-                "inference_ms", "history_grid_minutes", "history_grid_assumed",
-                "input", "scenarios", "challenger", "baseline", "note"):
+                "inference_ms", "bars_db", "input", "scenarios", "challenger",
+                "baseline", "note"):
         assert key in rec
     assert rec["type"] == sh.RECORD_TYPE
-    assert rec["history_grid_assumed"] is True
+    # the synthetic-grid record keys were removed in 4.0.2 (P0-2)
+    assert "history_grid_assumed" not in rec
+    assert "history_grid_minutes" not in rec
+    assert rec["bars_db"] == db
+    assert rec["flags"]["ORACLE4_BARS_MAX_STALENESS_MIN"] == 15.0
+    for u in ("SPY", "QQQ"):
+        assert rec["scenarios"][u]["history_source"] == "bars"
+        assert rec["scenarios"][u]["status"] == "ok"
+        assert rec["scenarios"][u]["n_history_points"] == 41
     # baseline view preserves production's score ordering (QQQ first)
     assert rec["baseline"]["top_sym"] == "QQQ"
     assert rec["baseline"]["order"][0]["score"] == 90.0
@@ -116,12 +165,11 @@ def test_record_shape_and_baseline_order(tmp_path):
 
 def test_truncation_counted(tmp_path):
     out = str(tmp_path / "shadow.jsonl")
+    db = _bars_db(tmp_path, syms=("SPY",))
     cands = [_cand("SPY", score=90.0), _cand("QQQ", score=80.0),
              _cand("IWM", score=70.0)]
-    rec = sh.shadow_scan(cands, now=NOW,
-                         price_history_fn=lambda u, d=90: _history(),
-                         cfg=sh.ShadowConfig(enabled=True, max_candidates=1,
-                                             max_scenarios=256),
+    rec = sh.shadow_scan(cands, now=NOW, step_minutes=1.0,
+                         cfg=_cfg(bars_db=db, max_candidates=1),
                          out_path=out)
     assert rec["input"]["n_candidates_in"] == 3
     assert rec["input"]["n_candidates_truncated"] == 2
@@ -130,25 +178,52 @@ def test_truncation_counted(tmp_path):
 
 def test_missing_quote_lands_in_missingness(tmp_path):
     out = str(tmp_path / "shadow.jsonl")
+    db = _bars_db(tmp_path, syms=("SPY",))
     bad = _cand("SPY")
     bad["opt"]["bid"] = None
     bad["opt"]["ask"] = None
-    rec = sh.shadow_scan([bad], now=NOW,
-                         price_history_fn=lambda u, d=90: _history(),
-                         cfg=sh.ShadowConfig(enabled=True, max_scenarios=256),
-                         out_path=out)
+    rec = sh.shadow_scan([bad], now=NOW, step_minutes=1.0,
+                         cfg=_cfg(bars_db=db), out_path=out)
     assert sum(rec["input"]["missingness"].values()) == 1
     assert any("quote" in r for r in rec["input"]["missingness"])
 
 
-def test_no_history_means_abstain_not_crash(tmp_path):
+# --------------------------------------------------------------------------- #
+# bars-only history: structured abstentions, never a synthetic grid
+# --------------------------------------------------------------------------- #
+
+def test_no_bars_db_abstains_with_bars_db_unset(tmp_path):
     out = str(tmp_path / "shadow.jsonl")
     rec = sh.shadow_scan([_cand("SPY")], now=NOW,
-                         price_history_fn=lambda u, d=90: [],
-                         cfg=sh.ShadowConfig(enabled=True, max_scenarios=256),
-                         out_path=out)
+                         cfg=_cfg(bars_db=""), out_path=out)
+    assert rec["challenger"]["decision"] == "abstain"
+    meta = rec["scenarios"]["SPY"]
+    assert meta["history_source"] == "bars"
+    assert meta["bars_unavailable"]["reason"] == "BARS_DB_UNSET"
+    assert any("BARS_DB_UNSET" in r for r in rec["input"]["missingness"])
+    assert rec["flags"]["ORACLE4_BARS_DB"] is None
+
+
+def test_missing_store_abstains_not_crash(tmp_path):
+    out = str(tmp_path / "shadow.jsonl")
+    rec = sh.shadow_scan(
+        [_cand("SPY")], now=NOW,
+        cfg=_cfg(bars_db=str(tmp_path / "nope.sqlite")), out_path=out)
     assert rec["challenger"]["decision"] == "abstain"
     assert any(r.startswith("no_scenarios") for r in rec["input"]["missingness"])
+
+
+def test_stale_bars_abstain(tmp_path):
+    out = str(tmp_path / "shadow.jsonl")
+    db = _bars_db(tmp_path, syms=("SPY",))
+    # newest completed bar ends 15:11; two hours later it is far beyond the
+    # 15-minute freshness bound -> structured STALE abstention
+    late = OPEN + timedelta(minutes=170)
+    rec = sh.shadow_scan([_cand("SPY")], now=late, step_minutes=1.0,
+                         cfg=_cfg(bars_db=db), out_path=out)
+    assert rec["challenger"]["decision"] == "abstain"
+    assert rec["scenarios"]["SPY"]["bars_unavailable"]["reason"] == "STALE"
+    assert any("STALE" in r for r in rec["input"]["missingness"])
 
 
 def test_freeze_candidate_maps_production_keys():
@@ -160,13 +235,6 @@ def test_freeze_candidate_maps_production_keys():
     assert c.features["spread_abs"] == pytest.approx(0.2, abs=1e-9)
     assert c.features["dte_days"] == 31.0
     assert c.contract and c.contract["underlying"] == "SPY"
-
-
-def test_history_obs_synthetic_grid():
-    obs = sh._history_obs([1.0, 2.0, 3.0], NOW, step_minutes=5.0)
-    assert [p for _, p in obs] == [1.0, 2.0, 3.0]
-    assert obs[-1][0] == NOW
-    assert obs[1][0] == NOW - timedelta(minutes=5)
 
 
 def test_model_identity_fail_open_and_registry_lookup(tmp_path):
@@ -194,13 +262,13 @@ def test_model_identity_fail_open_and_registry_lookup(tmp_path):
 
 def test_summarize_log(tmp_path):
     out = str(tmp_path / "shadow.jsonl")
-    hist = lambda u, d=90: _history()
-    cfg = sh.ShadowConfig(enabled=True, max_scenarios=256)
-    sh.shadow_scan([_cand("SPY", score=90.0)], now=NOW,
-                   price_history_fn=hist, cfg=cfg, out_path=out)
+    db = _bars_db(tmp_path, syms=("SPY", "QQQ"))
+    cfg = _cfg(bars_db=db)
+    sh.shadow_scan([_cand("SPY", score=90.0)], now=NOW, step_minutes=1.0,
+                   cfg=cfg, out_path=out)
     sh.shadow_scan([_cand("QQQ", score=80.0, price=500.0,
-                          symbol=_occ("QQQ"))], now=NOW,
-                   price_history_fn=hist, cfg=cfg, out_path=out)
+                          symbol=_occ("QQQ"))], now=NOW, step_minutes=1.0,
+                   cfg=cfg, out_path=out)
     with open(out, "a", encoding="utf-8") as f:
         f.write("not json\n")
     rep = sh.summarize_log(out)

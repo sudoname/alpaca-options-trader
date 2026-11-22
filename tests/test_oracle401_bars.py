@@ -298,65 +298,57 @@ def _cand(i: int = 0):
 
 class TestShadowBarsMode:
     def test_missing_store_abstains_no_synthetic_fallback(self, tmp_path):
-        calls = []
-
-        def hist(u, days=90):
-            calls.append(u)
-            return [100.0 + i * 0.1 for i in range(80)]
-
         cfg = shmod.ShadowConfig(enabled=True, max_scenarios=32,
                                  bars_db=str(tmp_path / "missing.sqlite"))
         rec = shmod.shadow_scan(
-            [_cand()], scan_id="t1", price_history_fn=hist,
+            [_cand()], scan_id="t1",
             now=S1_OPEN + timedelta(hours=1), cfg=cfg,
             out_path=str(tmp_path / "out.jsonl"))
-        assert rec["history_grid_assumed"] is False
         meta = rec["scenarios"]["SPY"]
         assert meta["status"].startswith("bars_unavailable:STORE_MISSING")
         assert meta["bars_unavailable"]["reason"] == "STORE_MISSING"
         assert meta["history_source"] == "bars"
-        assert calls == []        # synthetic-grid path never consulted
+        assert "history_grid_assumed" not in rec   # 4.0.2: key removed
 
     def test_bars_mode_uses_real_completed_bars(self, tmp_path, store_path):
         _write(store_path, _minute_bars(S1_OPEN, 41))
-        calls = []
-
-        def hist(u, days=90):
-            calls.append(u)
-            return []
-
         cfg = shmod.ShadowConfig(enabled=True, max_scenarios=64,
                                  bars_db=store_path)
         now = S1_OPEN + timedelta(minutes=50)
         rec = shmod.shadow_scan(
-            [_cand()], scan_id="t2", price_history_fn=hist,
+            [_cand()], scan_id="t2",
             step_minutes=1.0, now=now, cfg=cfg,
             out_path=str(tmp_path / "out.jsonl"))
         meta = rec["scenarios"]["SPY"]
-        assert rec["history_grid_assumed"] is False
         assert meta["history_source"] == "bars"
         assert meta["status"] == "ok"
         assert meta["n_history_points"] == 41
-        assert calls == []
 
-    def test_legacy_mode_unchanged_and_labeled(self, tmp_path):
-        def hist(u, days=90):
-            return [100.0 + (i % 7) * 0.1 for i in range(80)]
-
+    def test_no_bars_db_abstains_with_bars_db_unset(self, tmp_path):
+        # 4.0.2 P0-2: the synthetic-grid fallback is gone; without a bars
+        # store every underlying abstains with a structured reason.
         cfg = shmod.ShadowConfig(enabled=True, max_scenarios=32)  # no bars_db
         rec = shmod.shadow_scan(
-            [_cand()], scan_id="t3", price_history_fn=hist,
+            [_cand()], scan_id="t3",
             now=S1_OPEN + timedelta(hours=1), cfg=cfg,
             out_path=str(tmp_path / "out.jsonl"))
-        assert rec["history_grid_assumed"] is True
-        assert rec["scenarios"]["SPY"]["history_source"] == "synthetic_grid"
+        meta = rec["scenarios"]["SPY"]
+        assert meta["history_source"] == "bars"
+        assert meta["bars_unavailable"]["reason"] == "BARS_DB_UNSET"
+        assert meta["status"].startswith("bars_unavailable:BARS_DB_UNSET")
+        assert "history_grid_assumed" not in rec
 
     def test_env_flag_round_trip(self, monkeypatch):
         monkeypatch.setenv("ORACLE4_BARS_DB", r"artifacts\oracle4\b.sqlite")
-        assert shmod.ShadowConfig.from_env().bars_db == \
-            r"artifacts\oracle4\b.sqlite"
+        monkeypatch.setenv("ORACLE4_BARS_MAX_STALENESS_MIN", "30")
+        cfg = shmod.ShadowConfig.from_env()
+        assert cfg.bars_db == r"artifacts\oracle4\b.sqlite"
+        assert cfg.bars_max_staleness_min == 30.0
         monkeypatch.delenv("ORACLE4_BARS_DB")
-        assert shmod.ShadowConfig.from_env().bars_db == ""
+        monkeypatch.delenv("ORACLE4_BARS_MAX_STALENESS_MIN")
+        cfg = shmod.ShadowConfig.from_env()
+        assert cfg.bars_db == ""
+        assert cfg.bars_max_staleness_min == 15.0
 
 
 # --------------------------------------------------------------------------- #

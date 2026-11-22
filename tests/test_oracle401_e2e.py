@@ -21,7 +21,8 @@ NOW = datetime(2026, 11, 18, 15, 0, tzinfo=timezone.utc)
 def _clean_env(monkeypatch):
     for k in ("ENABLE_ORACLE4_SHADOW", "ORACLE4_MODEL_ID",
               "ORACLE4_MAX_CANDIDATES", "ORACLE4_MAX_SCENARIOS",
-              "ORACLE4_SHADOW_JSONL", "ORACLE4_REGISTRY"):
+              "ORACLE4_SHADOW_JSONL", "ORACLE4_REGISTRY",
+              "ORACLE4_BARS_DB", "ORACLE4_BARS_MAX_STALENESS_MIN"):
         monkeypatch.delenv(k, raising=False)
 
 
@@ -43,10 +44,6 @@ def _cand(sym="SPY", score=80.0, price=600.0, bid=5.0, ask=5.2, dte=31.0,
             "expiration": "2026-12-19", "type": "call",
         },
     }
-
-
-def _history(n=60, s0=600.0):
-    return [s0 * (1.0 + 0.001 * ((k * 37) % 7 - 3)) for k in range(n)]
 
 
 # --------------------------------------------------------------------------- #
@@ -111,9 +108,8 @@ def _build(rows, book="swing", **over):
 def test_shadow_record_has_books_and_outcome(tmp_path):
     out = str(tmp_path / "shadow.jsonl")
     cfg = sh.ShadowConfig(enabled=True, max_scenarios=256)
-    hist = lambda u, d=90: _history()
     rec = sh.shadow_scan([_cand("SPY")], scan_id="g-1", now=NOW,
-                         price_history_fn=hist, cfg=cfg, out_path=out)
+                         cfg=cfg, out_path=out)
     assert rec["outcome"] == {"state": "unresolved", "resolved_at": None,
                               "resolver": None}
     by_dec = rec["books"]["by_decision"]
@@ -122,7 +118,7 @@ def test_shadow_record_has_books_and_outcome(tmp_path):
 
     sh.shadow_scan([_cand("QQQ", score=70.0, price=500.0,
                           symbol=_occ("QQQ"))], scan_id="g-2", now=NOW,
-                   price_history_fn=hist, cfg=cfg, out_path=out)
+                   cfg=cfg, out_path=out)
     rep = sh.summarize_log(out)
     assert rep["n_scans"] == 2
     assert rep["outcome_states"] == {"unresolved": 2}
