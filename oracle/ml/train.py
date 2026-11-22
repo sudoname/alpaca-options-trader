@@ -80,6 +80,7 @@ from oracle.ml.baselines import (
     fit_platt,
     fit_temperature_np,
     interval_coverage,
+    load_classical,
     macro_f1,
     momentum_class_probs,
     momentum_rule_probs,
@@ -91,8 +92,9 @@ from oracle.ml.baselines import (
     reliability_bins,
     rv_ewma_forecast,
     rv_persistence_forecast,
+    save_classical,
 )
-from oracle.ml.mlp import direction_class
+from oracle.ml.mlp import direction_class, standardizer_state
 
 MODELS = ("logistic", "naive", "quantile", "rv", "hazard", "gbm", "mlp")
 
@@ -1182,6 +1184,61 @@ def run_gbm(samples: Sequence[Sample], folds: Sequence[Fold],
     return report
 
 
+def run_classical_artifact(samples: Sequence[Sample], dataset_path: str,
+                           horizon: str, out_stem: str,
+                           fold_sessions: Sequence[str],
+                           holdout: Sequence[str]) -> Dict[str, Any]:
+    """Save a deployable multinomial-logistic artifact (P1-7).
+
+    Fits on the purged fold sessions only (holdout excluded upstream),
+    temperature-calibrates on the chronological validation tail, saves via
+    :func:`save_classical` and proves reload parity, so the forecast
+    provider loads exactly what was trained.
+    """
+    artifact: Dict[str, Any] = {"status": "skipped",
+                                "why": "no usable folds"}
+    all_ok = [s for s in samples
+              if _ok(s) and s.session in set(fold_sessions)]
+    if not all_ok or len({_direction_cls(s) for s in all_ok}) < 2:
+        return artifact
+    fitp, val, acct = _availability_split(all_ok)
+    y_fit = [_direction_cls(s) for s in fitp]
+    if len(set(y_fit)) < 2:
+        fitp, y_fit, val = list(all_ok), \
+            [_direction_cls(s) for s in all_ok], []
+    y_val = [_direction_cls(s) for s in val]
+    names = _feature_names(all_ok)
+    std = Standardizer().fit([s.features for s in fitp], names)
+    dm_fit = build_design(fitp, std, std.feature_names)
+    model = MultinomialLogisticModel().fit(dm_fit.x, y_fit)
+    temperature = 1.0
+    if val:
+        dm_val = build_design(val, std, std.feature_names)
+        temperature = fit_temperature_np(
+            model.decision_scores(dm_val.x), y_val)
+    path = f"{out_stem}_classical.json"
+    meta = {"git_sha": _git_sha(),
+            "dataset_hash": dataset_meta(dataset_path).get("dataset_hash"),
+            "horizon": horizon,
+            "standardizer": standardizer_state(std),
+            "train_sessions": sorted({s.session for s in fitp}),
+            "val_session": sorted({s.session for s in val}),
+            "holdout_excluded": list(holdout)}
+    digest = save_classical(path, model, dm_fit.columns, temperature,
+                            meta=meta)
+    re_model, _re_cols, re_temp, _re_meta = load_classical(path)
+    probe = dm_fit.x[: min(64, len(dm_fit.x))]
+    parity = float(np.max(np.abs(
+        model.decision_scores(probe)
+        - re_model.decision_scores(probe)))) if len(probe) else 0.0
+    return {"status": "saved", "path": path,
+            "checksum_sha256": digest,
+            "n_features": len(dm_fit.columns),
+            "temperature": float(re_temp),
+            "purge_accounting": acct,
+            "reload_parity_max_abs_diff": parity}
+
+
 def _torch_ready() -> bool:
     """Call-time torch check (tests may monkeypatch mlp.TORCH_AVAILABLE)."""
     import oracle.ml.mlp as mlp_mod
@@ -1735,6 +1792,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.model == "logistic":
             report["result"] = run_direction(samples, folds, args.seed,
                                              args.n_boot, "logistic")
+            out_stem = (args.out[:-5] if args.out.endswith(".json")
+                        else args.out)
+            # top-level (not under "result"): the artifact block carries the
+            # run-specific output path, while "result" must stay identical
+            # across reruns (pinned by the CLI determinism test)
+            report["artifact"] = run_classical_artifact(
+                samples, args.dataset, args.horizon, out_stem,
+                fold_sessions, holdout)
         elif args.model == "naive":
             report["result"] = run_direction(samples, folds, args.seed,
                                              args.n_boot, "naive")

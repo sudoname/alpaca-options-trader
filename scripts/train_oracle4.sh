@@ -131,11 +131,23 @@ echo "  forecaster holdout_sessions=${FC_HOLDOUT}"
 # retrain under the same tag gets a fresh id (registry artifacts are immutable).
 step "3c/6 auto-register challengers (unapproved; registry governs promotion)"
 sfx() { "${PY}" -c "import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest()[:8])" "$1"; }
-LOG_ID="logistic_${TAG}_$(sfx "${ART}/logistic_${TAG}.json")"
-"${PY}" -m oracle.ml.registry --registry "${REGISTRY}" register \
-  --model-id "${LOG_ID}" --kind classical \
-  --artifact "${ART}/logistic_${TAG}.json" \
-  --notes "auto-registered challenger (train_oracle4.sh, tag ${TAG})"
+# The loadable logistic weights live in the *_classical.json artifact (the
+# plain logistic_${TAG}.json is a training report, not a model). The classical
+# artifact doubles as its own manifest: provider_from_registry requires a
+# pinned manifest checksum and loads classical weights from
+# artifact_path-or-manifest_path.
+LOG_ART="${ART}/logistic_${TAG}_classical.json"
+LOG_ID="(logistic classical artifact skipped -- not registered)"
+if [[ -f "${LOG_ART}" ]]; then
+  LOG_ID="logistic_${TAG}_$(sfx "${LOG_ART}")"
+  "${PY}" -m oracle.ml.registry --registry "${REGISTRY}" register \
+    --model-id "${LOG_ID}" --kind classical \
+    --artifact "${LOG_ART}" \
+    --manifest "${LOG_ART}" \
+    --notes "auto-registered challenger (train_oracle4.sh, tag ${TAG})"
+else
+  echo "  logistic classical artifact skipped (no usable folds) -- not registered"
+fi
 MLP_ID="mlp_${TAG}_$(sfx "${ART}/mlp_${TAG}_manifest.json")"
 "${PY}" -m oracle.ml.registry --registry "${REGISTRY}" register \
   --model-id "${MLP_ID}" --kind neural \

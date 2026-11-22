@@ -260,10 +260,18 @@ class TestVerificationChain:
         assert _reason(regpath, "fix_a").reason == "MANIFEST_NOT_PINNED"
 
     def test_non_neural_kind_refused_not_mislabeled(self, rig, tmp_path):
-        # a classical entry must refuse, never be served as neural inference
+        # a classical entry pointing at torch weights must refuse with an
+        # integrity error (the classical loader rejects the .pt binary) --
+        # it is never served as neural inference
         regpath, pt, man = rig
         _register(regpath, "classical_x", pt, man, kind="classical")
-        assert _reason(regpath, "classical_x").reason == "KIND_UNSUPPORTED"
+        assert _reason(regpath, "classical_x").reason == "MODEL_INTEGRITY"
+
+    def test_unloadable_kind_refused(self, rig):
+        # kinds with no loadable forecast weights (e.g. valuation) refuse
+        regpath, pt, man = rig
+        _register(regpath, "valuation_x", pt, man, kind="valuation")
+        assert _reason(regpath, "valuation_x").reason == "KIND_UNSUPPORTED"
 
     def test_registry_missing(self, tmp_path):
         assert _reason(str(tmp_path / "none.json"), "x").reason == \
