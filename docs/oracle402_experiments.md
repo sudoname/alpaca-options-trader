@@ -1,5 +1,10 @@
 # Oracle 4.0.2 — Experiments and Results
 
+**Historical snapshot:** The results and fingerprints below were produced
+before the strict missing-prediction gate was added. They cannot be used to
+evaluate the corrected GBM/ensemble variants. Re-run the backtest and
+promotion report on the original inputs before claiming a new result.
+
 Every number below comes from a fingerprinted artifact; reproduction commands
 are in `docs/oracle402_runbook.md`.
 

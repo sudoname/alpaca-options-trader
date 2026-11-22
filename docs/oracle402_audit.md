@@ -1,5 +1,9 @@
 # Oracle 4.0.2 — Gap Audit and Closure Report
 
+**Historical snapshot:** The GBM/ensemble replay numbers below predate the
+strict missing-prediction gate. The corrected variants require a fresh
+backtest and promotion report; no profitability claim carries forward.
+
 Branch: `oracle4.0.2` (base: `oracle4.0.1` @ `a373a36`)
 Scope: close the eight architectural/profitability gaps identified after the 4.0.1
 forward-evidence period, then prove (or honestly refuse to claim) positive
