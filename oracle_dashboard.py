@@ -980,6 +980,33 @@ def create_app(config: "DashboardConfig" = None) -> Flask:
             return out
         return _cached_json("oracle4", provider)
 
+    @app.route("/api/research-worker")
+    def research_worker():
+        """Oracle4 P1-8 async research worker health. Reads the atomic
+        status JSON the worker writes after every task; read-only and
+        fail-open — this route cannot start, stop, or feed the worker."""
+        def provider():
+            import json as _json
+            path = os.getenv("ORACLE4_RESEARCH_STATUS",
+                             "artifacts/oracle4/research_worker_status.json")
+            if not os.path.isfile(path):
+                return {"verdict": VERDICT_INSUFFICIENT,
+                        "hint": ("research worker status file not found — "
+                                 "scheduler not started with "
+                                 "ENABLE_ORACLE4_ASYNC_RESEARCH=true, or no "
+                                 "task has completed yet")}
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = _json.load(f)
+            except Exception as e:
+                return {"verdict": VERDICT_ERROR, "error": str(e)}
+            if not isinstance(data, dict):
+                return {"verdict": VERDICT_INSUFFICIENT,
+                        "hint": "unexpected research worker status shape"}
+            data.setdefault("verdict", "OK")
+            return data
+        return _cached_json("research-worker", provider)
+
     # -- static frontend ------------------------------------------------- #
     @app.route("/")
     def index():

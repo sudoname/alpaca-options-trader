@@ -1067,26 +1067,55 @@ class IntradayScheduler:
         # bars mode can produce timestamped feature rows. Runs BEFORE the
         # shadow so it sees the freshest completed bars. Env-gated and
         # fail-open; research-path only, never alters baseline behavior.
+        async_research = os.getenv(
+            "ENABLE_ORACLE4_ASYNC_RESEARCH", "").strip().lower() == "true"
+
         if os.getenv("ENABLE_ORACLE4_BARS_FEED", "").strip().lower() == "true":
-            try:
-                from oracle.ml.bars_feed import feed_bars
-                res = feed_bars(
-                    list(self.symbols),
-                    headers=self.trader.headers,
-                    data_url=self.trader.data_url,
-                    db_path=os.getenv(
-                        "ORACLE4_BARS_DB", "artifacts/oracle4/bars/bars.sqlite"),
-                    lookback_min=float(
-                        os.getenv("ORACLE4_BARS_FEED_LOOKBACK_MIN", "480")),
-                )
-                log(f"[ORACLE4-BARS] inserted={res['inserted']} "
-                    f"dup={res['dropped_duplicate_ts']} "
-                    f"fetched={res['fetched']} "
-                    f"forming_skipped={res['skipped_forming']} "
-                    f"bad_close={res['skipped_bad_close']} "
-                    f"pages={res['pages']}")
-            except Exception as e:
-                log(f"[ORACLE4-BARS] failed (ignored): {e}")
+            if async_research:
+                # P1-8: hand the feed to the research worker so a slow or
+                # failing fetch can never delay ranking/exits/entries.
+                try:
+                    from oracle.ml.research_worker import submit_research
+
+                    def _bars_task(p):
+                        from oracle.ml.bars_feed import feed_bars
+                        feed_bars(p["symbols"], **p["kwargs"])
+
+                    ok = submit_research("bars_feed", _bars_task, {
+                        "symbols": list(self.symbols),
+                        "kwargs": {
+                            "headers": dict(self.trader.headers or {}),
+                            "data_url": self.trader.data_url,
+                            "db_path": os.getenv(
+                                "ORACLE4_BARS_DB",
+                                "artifacts/oracle4/bars/bars.sqlite"),
+                            "lookback_min": float(os.getenv(
+                                "ORACLE4_BARS_FEED_LOOKBACK_MIN", "480")),
+                        },
+                    })
+                    log(f"[ORACLE4-BARS] async {'queued' if ok else 'dropped'}")
+                except Exception as e:
+                    log(f"[ORACLE4-BARS] async submit failed (ignored): {e}")
+            else:
+                try:
+                    from oracle.ml.bars_feed import feed_bars
+                    res = feed_bars(
+                        list(self.symbols),
+                        headers=self.trader.headers,
+                        data_url=self.trader.data_url,
+                        db_path=os.getenv(
+                            "ORACLE4_BARS_DB", "artifacts/oracle4/bars/bars.sqlite"),
+                        lookback_min=float(
+                            os.getenv("ORACLE4_BARS_FEED_LOOKBACK_MIN", "480")),
+                    )
+                    log(f"[ORACLE4-BARS] inserted={res['inserted']} "
+                        f"dup={res['dropped_duplicate_ts']} "
+                        f"fetched={res['fetched']} "
+                        f"forming_skipped={res['skipped_forming']} "
+                        f"bad_close={res['skipped_bad_close']} "
+                        f"pages={res['pages']}")
+                except Exception as e:
+                    log(f"[ORACLE4-BARS] failed (ignored): {e}")
 
         # Oracle4 Phase 7: observe-only challenger shadow (disabled by default).
         # Env-gated so the disabled path costs one getenv; fail-open so a
@@ -1094,15 +1123,40 @@ class IntradayScheduler:
         # logs its own ranking next to the frozen baseline order; it submits
         # nothing.
         if os.getenv("ENABLE_ORACLE4_SHADOW", "").strip().lower() == "true":
-            try:
-                from oracle.ml.shadow import maybe_shadow_scan
-                maybe_shadow_scan(
-                    candidates,
-                    scan_id=getattr(self.trader, "current_scan_id", None),
-                    step_minutes=float(getattr(self.cfg, "scan_interval_min", 5) or 5),
-                )
-            except Exception as e:
-                log(f"[ORACLE4-SHADOW] failed (ignored): {e}")
+            if async_research:
+                # P1-8: shadow scan runs on the research worker against a
+                # deep-copied candidate snapshot; the entry loop below starts
+                # immediately regardless of shadow latency or failures.
+                try:
+                    from oracle.ml.research_worker import submit_research
+
+                    def _shadow_task(p):
+                        from oracle.ml.shadow import maybe_shadow_scan
+                        maybe_shadow_scan(
+                            p["candidates"], scan_id=p["scan_id"],
+                            step_minutes=p["step_minutes"])
+
+                    ok = submit_research("shadow_scan", _shadow_task, {
+                        "candidates": candidates,
+                        "scan_id": getattr(
+                            self.trader, "current_scan_id", None),
+                        "step_minutes": float(
+                            getattr(self.cfg, "scan_interval_min", 5) or 5),
+                    })
+                    log(f"[ORACLE4-SHADOW] async "
+                        f"{'queued' if ok else 'dropped'}")
+                except Exception as e:
+                    log(f"[ORACLE4-SHADOW] async submit failed (ignored): {e}")
+            else:
+                try:
+                    from oracle.ml.shadow import maybe_shadow_scan
+                    maybe_shadow_scan(
+                        candidates,
+                        scan_id=getattr(self.trader, "current_scan_id", None),
+                        step_minutes=float(getattr(self.cfg, "scan_interval_min", 5) or 5),
+                    )
+                except Exception as e:
+                    log(f"[ORACLE4-SHADOW] failed (ignored): {e}")
 
         for cand in candidates:
             if self.cfg.armed and self.trades_today >= self.cfg.max_new_trades_per_day:
