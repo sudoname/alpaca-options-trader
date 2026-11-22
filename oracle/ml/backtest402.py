@@ -6,8 +6,7 @@ Extends the frozen phase-6 replay engine (``oracle.ml.replay``) with:
     native-NaN missingness) alongside the classical logistic and MLP;
   * an **ensemble gate** (renormalized mean of classical + GBM
     probabilities, computed only on the intersection of covered
-    decisions -- uncovered trades pass through ungated, same as every
-    other gate here);
+    decisions -- uncovered trades are excluded from challenger gates);
   * **9 variants** on the identical trade universe: baseline_frozen,
     baseline_quality, valuation_ranked, classical_gated, neural_gated,
     combined, gbm_gated, ensemble_gated, gbm_combined;
@@ -173,9 +172,8 @@ def ensemble_preds(classical: Dict[str, Pred],
                    gbm: Dict[str, Pred]) -> Dict[str, Pred]:
     """Renormalized mean of two probability maps on their intersection.
 
-    Decisions covered by only one model are NOT included -- the gate's
-    no-prediction passthrough handles them, so the ensemble never
-    silently degrades to a single model.
+    Decisions covered by only one model are NOT included -- the gate excludes
+    them, so the ensemble never silently degrades to a single model.
     """
     out: Dict[str, Pred] = {}
     for d in set(classical) & set(gbm):
@@ -189,9 +187,11 @@ def ensemble_preds(classical: Dict[str, Pred],
 
 def gate_trades(trades: Sequence[Trade], preds: Dict[str, Pred]
                 ) -> Tuple[List[Trade], Dict[str, int]]:
-    """Directional gate over a trade list (same semantics as replay's
-    internal ``_gated``): trades without a prediction are KEPT -- the
-    gate only acts where evidence exists."""
+    """Directional challenger gate: missing predictions cannot authorize trades.
+
+    The frozen 4.0.1 replay retains its historical semantics; this function
+    applies only to the new GBM and ensemble challengers.
+    """
     kept: List[Trade] = []
     acct = {"gated_out": 0, "no_prediction": 0,
             "gate_passed": 0, "abstained": 0}
@@ -199,7 +199,6 @@ def gate_trades(trades: Sequence[Trade], preds: Dict[str, Pred]
         p = preds.get(t.decision_id)
         if p is None:
             acct["no_prediction"] += 1
-            kept.append(t)
             continue
         verdict = gate_direction(t.option_type, p[0], p[1], p[2])
         if verdict == "pass":

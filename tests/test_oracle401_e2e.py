@@ -131,7 +131,8 @@ def test_shadow_record_has_books_and_outcome(tmp_path):
 
 def test_resolve_then_build_swing_forward_evidence():
     scans, trades = _swing_fixture()
-    rows = fwd.resolve_outcomes_from_history(scans, trades)
+    rows = fwd.resolve_outcomes_from_history(scans, trades,
+                                             allow_heuristic=True)
     assert len(rows) == 3
     resolved = [r for r in rows if r["resolution_state"] == fwd.RESOLVED]
     unresolved = [r for r in rows if r["resolution_state"] == fwd.UNRESOLVED]
@@ -163,7 +164,8 @@ def test_resolve_then_build_swing_forward_evidence():
 
 def test_build_rejects_book_mixing_and_bad_inputs():
     scans, trades = _swing_fixture()
-    rows = fwd.resolve_outcomes_from_history(scans, trades)
+    rows = fwd.resolve_outcomes_from_history(scans, trades,
+                                             allow_heuristic=True)
 
     mixed = [dict(r) for r in rows]
     mixed[0]["book"] = "0dte"
@@ -179,7 +181,8 @@ def test_build_rejects_book_mixing_and_bad_inputs():
         fwd.resolve_outcomes_from_history(scans, trades, source="bogus")
 
     rows_nofee = fwd.resolve_outcomes_from_history(scans, trades,
-                                                   fees_known=False)
+                                                   fees_known=False,
+                                                   allow_heuristic=True)
     with pytest.raises(ValueError):
         _build([r for r in rows_nofee
                 if r["resolution_state"] == fwd.RESOLVED])
@@ -197,7 +200,8 @@ def test_modeled_nov18_0dte_book_evidence():
     scans = [_scan("2026-11-18T15:00:00Z", "z-1", sel=call, top=put)]
     trades = [_trade(call, "2026-11-18T15:05:00Z", 18.0),
               _trade(put, "2026-11-18T15:05:00Z", -6.0)]
-    rows = fwd.resolve_outcomes_from_history(scans, trades)
+    rows = fwd.resolve_outcomes_from_history(scans, trades,
+                                             allow_heuristic=True)
     assert len(rows) == 1
     assert rows[0]["book"] == "0dte"
     assert rows[0]["resolution_state"] == fwd.RESOLVED
@@ -217,7 +221,8 @@ def test_modeled_nov18_0dte_book_evidence():
 
 def test_write_and_dashboard_forward_section(tmp_path, monkeypatch):
     scans, trades = _swing_fixture()
-    rows = fwd.resolve_outcomes_from_history(scans, trades)
+    rows = fwd.resolve_outcomes_from_history(scans, trades,
+                                             allow_heuristic=True)
     doc = _build(rows)
 
     monkeypatch.chdir(tmp_path)

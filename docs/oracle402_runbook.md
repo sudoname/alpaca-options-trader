@@ -115,6 +115,21 @@ feeding/shadow scans onto the bounded worker. Health: the worker writes an
 atomic status JSON (submitted/completed/failed/dropped/slow counters) surfaced
 on the dashboard. Leave unset to keep 4.0.1 behavior exactly.
 
+The scheduler accepts `1` or `true` (case insensitive) as enabled. Both
+`ENABLE_ORACLE4_BARS_FEED` and `ENABLE_ORACLE4_SHADOW` have their own flags;
+set those to `true` to run their respective research tasks asynchronously.
+
+Forward outcome resolution requires matching broker or client order IDs on
+both arms by default. Old scans without IDs remain unresolved. The explicit
+research-only `python -m oracle.ml.forward --allow-heuristic-legacy ...` option
+permits labeled symbol/time matching for such old scans; a supplied unknown ID
+never falls back to a different trade.
+
+The GBM and ensemble replay gates now exclude decisions with missing model
+predictions. Reports and fingerprints created before this correction describe
+the former pass-through rule. Rebuild the backtest and promotion artifacts
+before using their figures or comparing candidate variants.
+
 ## 5. Tests
 
 ```bash

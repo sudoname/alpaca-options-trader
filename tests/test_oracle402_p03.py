@@ -4,7 +4,7 @@ Acceptance covered here:
 * deterministic decision -> client_order_id (retries distinct, broker-safe length)
 * duplicate realized-trade records never double-count P&L
 * repeated scans cannot claim the same realized trade (exclusive claims)
-* order_id identity is preferred over the time heuristic
+* order IDs are required by default; unknown IDs never fall back
 * one-sided claims roll back so unresolved rows never consume evidence
 * unknown outcomes stay unresolved -- never coerced to zero profit
 """
@@ -112,7 +112,8 @@ def test_repeated_scans_cannot_claim_same_trade():
         _trade(CH, "2026-11-17T15:05:00Z", 25.0),
         _trade(BL, "2026-11-17T15:05:00Z", -10.0),
     ]
-    rows = fwd.resolve_outcomes_from_history(scans, trades)
+    rows = fwd.resolve_outcomes_from_history(scans, trades,
+                                             allow_heuristic=True)
     assert len(rows) == 2
     states = [r["resolution_state"] for r in rows]
     assert states == [fwd.RESOLVED, fwd.UNRESOLVED]
@@ -132,7 +133,8 @@ def test_duplicate_trade_records_do_not_double_count():
     one_bl = _trade(BL, "2026-11-17T15:05:00Z", -10.0, order_id="ord-bl")
     # history re-ingested twice: duplicates must collapse to one event each
     trades = [one_ch, one_bl, dict(one_ch), dict(one_bl)]
-    rows = fwd.resolve_outcomes_from_history(scans, trades)
+    rows = fwd.resolve_outcomes_from_history(scans, trades,
+                                             allow_heuristic=True)
     resolved = [r for r in rows if r["resolution_state"] == fwd.RESOLVED]
     assert len(resolved) == 1
     assert resolved[0]["challenger_net_pnl"] == 25.0
@@ -167,7 +169,8 @@ def test_one_sided_claim_rolls_back_for_later_scan():
         _trade(CH, "2026-11-17T15:05:00Z", 25.0),
         _trade(BL, "2026-11-17T15:05:00Z", -10.0),
     ]
-    rows = fwd.resolve_outcomes_from_history(scans, trades)
+    rows = fwd.resolve_outcomes_from_history(scans, trades,
+                                             allow_heuristic=True)
     assert rows[0]["resolution_state"] == fwd.UNRESOLVED
     assert rows[0]["reason"] == "no realized trade for: baseline"
     # s-1's tentative challenger claim was released, so s-2 resolves fully
@@ -184,7 +187,8 @@ def test_same_symbol_both_arms_shares_one_trade_once():
         _scan("2026-11-17T15:01:00Z", "s-2", sel=CH, top=CH),
     ]
     trades = [_trade(CH, "2026-11-17T15:05:00Z", 25.0)]
-    rows = fwd.resolve_outcomes_from_history(scans, trades)
+    rows = fwd.resolve_outcomes_from_history(scans, trades,
+                                             allow_heuristic=True)
     assert rows[0]["resolution_state"] == fwd.RESOLVED
     assert rows[0]["challenger_net_pnl"] == 25.0
     assert rows[0]["baseline_net_pnl"] == 25.0
@@ -234,6 +238,92 @@ def test_claimed_order_id_is_not_silently_reattributed():
     assert rows[1]["reason"] == "no realized trade for: challenger"
 
 
+def test_default_requires_ids_on_both_arms():
+    scans = [_scan("2026-11-17T15:00:00Z", "s-1",
+                   ch_order_id="ord-ch")]
+    trades = [
+        _trade(CH, "2026-11-17T15:05:00Z", 25.0, order_id="ord-ch"),
+        _trade(BL, "2026-11-17T15:05:00Z", -10.0, order_id="ord-bl"),
+    ]
+    rows = fwd.resolve_outcomes_from_history(scans, trades)
+    assert rows[0]["resolution_state"] == fwd.UNRESOLVED
+    assert rows[0]["reason"] == "no realized trade for: baseline"
+    assert "challenger_net_pnl" not in rows[0]
+
+
+def test_unknown_id_never_falls_back_even_in_legacy_mode():
+    scans = [_scan("2026-11-17T15:00:00Z", "s-1",
+                   ch_order_id="absent", bl_order_id="ord-bl")]
+    trades = [
+        _trade(CH, "2026-11-17T15:05:00Z", 25.0, order_id="other"),
+        _trade(BL, "2026-11-17T15:05:00Z", -10.0, order_id="ord-bl"),
+    ]
+    for legacy in (False, True):
+        row = fwd.resolve_outcomes_from_history(
+            scans, trades, allow_heuristic=legacy)[0]
+        assert row["resolution_state"] == fwd.UNRESOLVED
+        assert row["reason"] == "no realized trade for: challenger"
+
+
+def test_client_order_id_alias_matches_with_broker_id_present():
+    client_id = att.make_client_order_id("dec-1")
+    scans = [_scan("2026-11-17T15:00:00Z", "s-1",
+                   ch_order_id=client_id, bl_order_id="ord-bl")]
+    trade = _trade(CH, "2026-11-17T15:05:00Z", 25.0,
+                   order_id="broker-ch")
+    trade["client_order_id"] = client_id
+    rows = fwd.resolve_outcomes_from_history(scans, [
+        trade, _trade(BL, "2026-11-17T15:05:00Z", -10.0,
+                      order_id="ord-bl")])
+    assert rows[0]["resolution_state"] == fwd.RESOLVED
+    assert rows[0]["attribution"]["challenger"] == {
+        "trade_id": "broker-ch", "match_basis": att.MATCH_ORDER_ID}
+
+
+def test_exact_id_must_match_contract_session_and_scan_time():
+    from datetime import datetime, timezone
+    trade = _trade(CH, "2026-11-17T15:05:00Z", 25.0,
+                   order_id="ord-ch")
+    matcher = att.ExclusiveTradeMatcher([trade])
+    after = datetime(2026, 11, 17, 15, 0, tzinfo=timezone.utc)
+    assert matcher.claim(BL, "2026-11-17", after,
+                         order_id="ord-ch") is None
+    assert matcher.claim(CH, "2026-11-18", after,
+                         order_id="ord-ch") is None
+    assert matcher.claim(CH, "2026-11-17", datetime(
+        2026, 11, 17, 16, tzinfo=timezone.utc),
+        order_id="ord-ch") is None
+    assert matcher.claim(CH, "2026-11-17", after,
+                         order_id="ord-ch") is not None
+
+
+def test_same_symbol_different_order_ids_do_not_share_pnl():
+    scans = [_scan("2026-11-17T15:00:00Z", "s-1", sel=CH, top=CH,
+                   ch_order_id="ord-1", bl_order_id="ord-2")]
+    trades = [_trade(CH, "2026-11-17T15:05:00Z", 25.0,
+                     order_id="ord-1")]
+    row = fwd.resolve_outcomes_from_history(scans, trades)[0]
+    assert row["resolution_state"] == fwd.UNRESOLVED
+
+
+def test_same_trade_broker_and_client_ids_share_exactly_once():
+    scans = [_scan("2026-11-17T15:00:00Z", "s-1", sel=CH, top=CH,
+                   ch_order_id="ord-1", bl_order_id="client-1")]
+    trade = _trade(CH, "2026-11-17T15:05:00Z", 25.0,
+                   order_id="ord-1")
+    trade["client_order_id"] = "client-1"
+    row = fwd.resolve_outcomes_from_history(scans, [trade])[0]
+    assert row["resolution_state"] == fwd.RESOLVED
+    assert row["challenger_net_pnl"] == row["baseline_net_pnl"] == 25.0
+    assert row["attribution"]["baseline"]["match_basis"] == att.MATCH_SHARED
+
+
+def test_legacy_heuristic_cannot_be_labeled_live():
+    with pytest.raises(ValueError, match="exact order attribution"):
+        fwd.resolve_outcomes_from_history([], [], source="live_order",
+                                          allow_heuristic=True)
+
+
 # --------------------------------------------------------------------------- #
 # matcher unit behaviour
 # --------------------------------------------------------------------------- #
@@ -243,13 +333,13 @@ def test_matcher_release_makes_trade_claimable_again():
     m = att.ExclusiveTradeMatcher(
         [_trade(CH, "2026-11-17T15:05:00Z", 25.0)])
     after = datetime(2026, 11, 17, 15, 0, tzinfo=timezone.utc)
-    c1 = m.claim(CH, "2026-11-17", after)
+    c1 = m.claim(CH, "2026-11-17", after, allow_heuristic=True)
     assert c1 is not None and c1["pnl"] == 25.0
-    assert m.claim(CH, "2026-11-17", after) is None
+    assert m.claim(CH, "2026-11-17", after, allow_heuristic=True) is None
     m.release(c1)
-    c2 = m.claim(CH, "2026-11-17", after)
+    c2 = m.claim(CH, "2026-11-17", after, allow_heuristic=True)
     assert c2 is not None and c2["trade_id"] == c1["trade_id"]
     # releasing None / shared aliases is a no-op
     m.release(None)
     m.release(att.shared_claim(c2))
-    assert m.claim(CH, "2026-11-17", after) is None
+    assert m.claim(CH, "2026-11-17", after, allow_heuristic=True) is None
