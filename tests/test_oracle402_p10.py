@@ -71,7 +71,7 @@ class TestEnsemblePreds:
 
 
 class TestGateTrades:
-    def test_accounting_and_passthrough(self):
+    def test_missing_prediction_excluded(self):
         t_pass = _trade("pass", SESSIONS[0])
         t_block = _trade("block", SESSIONS[0], minute=1)
         t_abstain = _trade("abstain", SESSIONS[0], minute=2)
@@ -85,8 +85,7 @@ class TestGateTrades:
             [t_pass, t_block, t_abstain, t_nopred], preds)
         assert acct == {"gated_out": 1, "no_prediction": 1,
                         "gate_passed": 1, "abstained": 1}
-        # no-prediction trades are KEPT (gate only acts where evidence is)
-        assert [t.decision_id for t in kept] == ["pass", "nopred"]
+        assert [t.decision_id for t in kept] == ["pass"]
 
 
 class TestDteBucket:
@@ -149,7 +148,9 @@ class TestBuildVariants402:
         v = bt.build_variants_402(trades, None, {}, {}, "unavailable",
                                   {}, "ok")
         acct = v["gbm_gated"]["accounting"]
-        assert acct["n"] == 1 and acct["no_prediction"] == 1
+        assert acct["n"] == 0 and acct["no_prediction"] == 1
+        assert v["gbm_gated"]["trades"] == []
+        assert v["ensemble_gated"]["trades"] == []
         assert v["ensemble_gated"]["accounting"]["ensemble_covered"] == 0
         assert v["ensemble_gated"]["accounting"]["members"] == [
             "multinomial_logistic", "lightgbm_direction"]
@@ -162,12 +163,11 @@ class TestBuildVariants402:
         t2 = _trade("b", SESSIONS[0], minute=1)
         v = bt.build_variants_402([t1, t2], {"a"}, {}, {}, "unavailable",
                                   {"b": (0.1, 0.2, 0.7)}, "ok")
-        # gbm gate keeps both (a=no_prediction passthrough, b=pass);
-        # intersection with valuation {a} keeps only a.
+        # GBM has no prediction for a, so the valuation intersection is empty.
         kept = [t.decision_id for t in v["gbm_combined"]["trades"]]
-        assert kept == ["a"]
+        assert kept == []
         acct = v["gbm_combined"]["accounting"]
-        assert acct["n"] == 1
+        assert acct["n"] == 0
         assert acct["and_valuation_selected"] is True
         assert acct["note"] == rp.COUNTERFACTUAL_NOTE
 
@@ -368,7 +368,8 @@ class TestEndToEndWithGbm:
         acct = g["accounting"]
         assert (acct["gate_passed"] + acct["abstained"]
                 + acct["gated_out"] + acct["no_prediction"]) == N_TRADES
-        assert acct["n"] == N_TRADES - acct["abstained"] - acct["gated_out"]
+        assert acct["n"] == (N_TRADES - acct["abstained"]
+                             - acct["gated_out"] - acct["no_prediction"])
 
         e = art["variants"]["ensemble_gated"]
         assert e["status"] == "ok"
