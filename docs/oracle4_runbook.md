@@ -297,8 +297,9 @@ python -m pytest tests/test_oracle4_dataset.py tests/test_oracle4_validation.py 
   tests/test_oracle401_books.py tests/test_oracle401_e2e.py -q
 ```
 
-Repo-wide runs: always `--ignore=tests/test_safety.py` (hangs in this
-environment).
+Repo-wide runs: `python -m pytest -q --tb=short`. The root-level
+`test_safety.py` is included; pytest blocks network connections during
+collection and execution.
 
 ---
 

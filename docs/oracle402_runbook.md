@@ -13,7 +13,7 @@ here touches the production trading path.
   `unavailable` stubs, never failures or fake numbers.
 * Windows/pytest gotcha: remove any stray `nul` file first (`rm -f nul`),
   and always exclude the hanging safety suite:
-  `python -m pytest --ignore=tests/test_safety.py -q`
+  `python -m pytest -q --tb=short`
   (expect exactly 4 known pre-existing failures unrelated to 4.0.2).
 
 ## 1. Rebuild training data (P1-5)
@@ -141,7 +141,7 @@ python -m pytest tests/test_oracle402_p01.py tests/test_oracle402_p03.py \
     tests/test_oracle402_p18.py tests/test_oracle402_p10.py \
     tests/test_oracle402_p11.py -q
 # Full suite (expect only the 4 known pre-existing failures)
-python -m pytest --ignore=tests/test_safety.py -q
+python -m pytest -q --tb=short
 ```
 
 ## 6. Deployment notes

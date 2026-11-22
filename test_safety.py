@@ -22,8 +22,7 @@ from risk_engine import RiskEngine, RiskLimits, load_risk_limits_from_env
 from smart_trader import SmartOptionsTrader
 
 
-# Risk/limit keys that some other test modules (e.g. test_telegram, which calls
-# python-dotenv's load_dotenv at import) leak into os.environ from the real
+# Risk/limit keys that other test modules may leak into os.environ from a real
 # .env. ConfigLoader treats os.environ as the highest-priority layer, so a
 # leaked value would shadow the code defaults these tests assert. We scrub them
 # for the duration of the env-default tests below.
@@ -164,8 +163,8 @@ class TestRiskEngineCheck(unittest.TestCase):
 
 class TestPerUnderlyingCap(unittest.TestCase):
     def setUp(self):
-        # Scrub risk-limit keys that sibling modules (e.g. test_telegram's
-        # load_dotenv) may have leaked into os.environ, so the .env-default
+        # Scrub risk-limit keys that sibling modules may have leaked into
+        # os.environ, so the .env-default
         # assertions below see the code defaults, not the real .env values.
         self._env_patch = mock.patch.dict(os.environ, {}, clear=False)
         self._env_patch.start()
@@ -677,6 +676,9 @@ class TestEVEntryGate(unittest.TestCase):
         t.news_service = None
         t.sentiment_service = None
         t.use_portfolio_greek_limits = False
+        # This suite isolates the EV entry gate. The independent profitability
+        # gate is enabled by default in production and needs its own fixtures.
+        t.use_profitability_gate = False
         t.max_budget_per_trade = 100000.0
         t._has_open_or_pending = lambda sym: False
         t._quote_is_fresh = lambda q: True
@@ -691,6 +693,8 @@ class TestEVEntryGate(unittest.TestCase):
         # order POST.
         t._risk_check = lambda total_cost, qty=1: {
             "allowed": False, "reason": "test-stop"}
+        # Never fall through to broker reads if a new pre-risk gate is added.
+        t._get_positions_checked = lambda retries=2: []
         return t
 
     _OPT = {"symbol": "AAPL260821C00150000", "type": "call",
@@ -1282,7 +1286,7 @@ class TestPhase4GreekFallback(unittest.TestCase):
                                              max_abs_vega=10.0, max_theta_loss=10.0,
                                              max_same_direction=99,
                                              max_per_underlying=99)
-        t.get_positions = lambda: []                 # empty book
+        t._get_positions_checked = lambda retries=2: []  # empty book; no broker API
         t.get_option_snapshot = lambda sym: {}
         t.get_current_price = lambda sym=None: 150.0
         # New trade alone is +2.0 delta (qty 2 * 1.0) > 1.0 cap.
@@ -1321,7 +1325,7 @@ class TestPhase4RealizedKillSwitch(unittest.TestCase):
         t = _make_trader()
         t.use_realized_pnl_killswitch = True
         t.ticker = "AAPL"
-        t.get_positions = lambda: []
+        t._get_positions_checked = lambda retries=2: []
         # equity-minus-last_equity would be -5000 (a deep unrealized drawdown).
         t.get_account = lambda: {"equity": "5000", "last_equity": "10000"}
 
@@ -1341,7 +1345,7 @@ class TestPhase4RealizedKillSwitch(unittest.TestCase):
         t = _make_trader()
         t.use_realized_pnl_killswitch = True
         t.ticker = "AAPL"
-        t.get_positions = lambda: []
+        t._get_positions_checked = lambda retries=2: []
         t.get_account = lambda: {"equity": "10000", "last_equity": "10000"}
 
         big_loss = -abs(t.risk_engine.limits.kill_switch_loss) - 1.0
@@ -1362,7 +1366,7 @@ class TestPhase4RealizedKillSwitch(unittest.TestCase):
         t = _make_trader()
         t.use_realized_pnl_killswitch = False
         t.ticker = "AAPL"
-        t.get_positions = lambda: []
+        t._get_positions_checked = lambda retries=2: []
         loss = -abs(t.risk_engine.limits.kill_switch_loss) - 1.0
         t.get_account = lambda: {"equity": str(10000 + loss),
                                  "last_equity": "10000"}

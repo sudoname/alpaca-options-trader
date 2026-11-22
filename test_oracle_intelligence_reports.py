@@ -14,6 +14,7 @@ never opens, sizes, prices, blocks or alters any trade.
 """
 
 import unittest
+from unittest import mock
 
 import oracle_intelligence_reports as oir
 from oracle_intelligence_reports import (
@@ -169,10 +170,14 @@ class TestTelegramDispatch(unittest.TestCase):
             "ORACLE_WEIGHT_CHANGES", "ORACLE_HYPOTHESIS_REPORT",
             "ORACLE_REGIME_PERFORMANCE",
         ]
-        for cmd in commands:
-            out = bot.process_command(cmd, 0)
-            self.assertIsInstance(out, str, cmd)
-            self.assertIn(ANALYTICS_FOOTER, out, cmd)
+        # ORACLE_EXPLAIN invokes a live on-demand market reader. Exercise its
+        # routing with deterministic offline evidence instead of broker data.
+        with mock.patch('oracle_ondemand.analyze_symbol_text',
+                        return_value=generate_oracle_explain_text("SPY", ctx=None)):
+            for cmd in commands:
+                out = bot.process_command(cmd, 0)
+                self.assertIsInstance(out, str, cmd)
+                self.assertIn(ANALYTICS_FOOTER, out, cmd)
 
 
 class TestSelfTest(unittest.TestCase):

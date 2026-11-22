@@ -144,10 +144,9 @@ GPU box; the server is CPU-only and should not train.
 ## 4. VERIFY — tests and live checks
 
 ```bash
-# full suite (~95s). 4 known failures are expected and pre-existing:
-#   TestTelegramDispatch::test_eight_commands_dispatch, TestEVEntryGate x2,
-#   TestPhase4GreekFallback::test_portfolio_check_blocks_via_trader
-python -m pytest --ignore=tests/test_safety.py -q
+# Full suite, including root-level test_safety.py. CI also runs this command
+# under Python 3.12; conftest.py blocks network connections during each test.
+python -m pytest -q --tb=short
 ```
 
 Live smoke (replace `USER:PASS` with the dashboard basic-auth pair):
