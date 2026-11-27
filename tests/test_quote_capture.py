@@ -24,11 +24,30 @@ def test_discover_symbols_missing_inputs(tmp_path):
 
 def test_discover_symbols_respects_limit(tmp_path):
     at = tmp_path / "active_trades.json"
-    at.write_text(json.dumps([{"symbol": f"SYM{i}"} for i in range(10)]),
+    at.write_text(json.dumps([{"symbol": f"SPY26112{i}C00700000"}
+                              for i in range(10)]),
                   encoding="utf-8")
     syms = quote_capture.discover_symbols(active_trades_path=str(at),
                                           ledger=None, limit=3)
-    assert syms == ["SYM0", "SYM1", "SYM2"]
+    assert syms == ["SPY261120C00700000", "SPY261121C00700000",
+                    "SPY261122C00700000"]
+
+
+def test_discover_symbols_drops_non_occ_symbols(tmp_path):
+    # Live incident 2026-11-27: bare underlying tickers ("SNY", "IBM") from
+    # shadow_candidate ledger rows made Alpaca 400 the whole 100-symbol
+    # batch -> written=0 on every poll. They must be filtered at discovery.
+    class Ledger:
+        def snapshots(self, since, kind):
+            if kind != "shadow_candidate":
+                return []
+            return [{"symbol": "SNY"}, {"symbol": "IBM"},
+                    {"symbol": "TSLA261218C00395000"},
+                    {"symbol": "not-a-symbol"}, {"symbol": None}]
+
+    syms = quote_capture.discover_symbols(
+        active_trades_path=str(tmp_path / "none"), ledger=Ledger())
+    assert syms == ["TSLA261218C00395000"]
 
 
 def test_last_ts_reads_final_line(tmp_path):

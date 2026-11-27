@@ -70,8 +70,14 @@ def discover_symbols(active_trades_path="active_trades.json",
     symbols = []
     seen = set()
 
+    # Alpaca validates option symbols as ^[A-Z]{1,5}\d{6,7}[CP]\d{8}$ and
+    # 400s the WHOLE batch when one entry fails (seen live 2026-11-27: bare
+    # underlying tickers from shadow_candidate ledger rows, e.g. "SNY",
+    # zeroed every poll). Drop non-OCC symbols at discovery.
     def _add(sym):
-        if isinstance(sym, str) and re.fullmatch(r"[A-Z0-9]{1,32}", sym) and sym not in seen:
+        if (isinstance(sym, str)
+                and re.fullmatch(r"[A-Z]{1,5}\d{6,7}[CP]\d{8}", sym)
+                and sym not in seen):
             seen.add(sym)
             symbols.append(sym)
 
